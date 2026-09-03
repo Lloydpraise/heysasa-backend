@@ -1,0 +1,562 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HeySasa — Admin Console</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0b0f14;
+    --surface: #131922;
+    --surface-2: #1b232d;
+    --border: #26313c;
+    --text: #e6edf3;
+    --muted: #7d8b98;
+    --faint: #4b5966;
+    --info: #58a6ff;
+    --ok: #3fb950;
+    --warn: #e3b341;
+    --error: #f85149;
+    --mono: ui-monospace, "JetBrains Mono", Menlo, Consolas, "Courier New", monospace;
+    --sans: -apple-system, system-ui, "Segoe UI", Roboto, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font-family: var(--sans); font-size: 13px; }
+  header {
+    position: sticky; top: 0; z-index: 5;
+    display: flex; align-items: center; gap: 16px;
+    padding: 12px 20px; background: var(--surface);
+    border-bottom: 1px solid var(--border);
+  }
+  h1 { margin: 0; font-size: 15px; font-weight: 700; letter-spacing: 0.02em; color: var(--text); white-space: nowrap; }
+  .conn { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--faint); flex-shrink: 0; }
+  .dot.live { background: var(--ok); box-shadow: 0 0 0 0 rgba(63,185,80,0.6); animation: pulse 2s infinite; }
+  .dot.down { background: var(--error); }
+  @keyframes pulse {
+    0%   { box-shadow: 0 0 0 0 rgba(63,185,80,0.5); }
+    70%  { box-shadow: 0 0 0 6px rgba(63,185,80,0); }
+    100% { box-shadow: 0 0 0 0 rgba(63,185,80,0); }
+  }
+  .spacer { flex: 1; }
+  .error-badge {
+    display: flex; align-items: center; gap: 6px;
+    padding: 5px 10px; border-radius: 6px;
+    background: var(--surface-2); border: 1px solid var(--border);
+    font-family: var(--mono); font-size: 12px; color: var(--muted);
+    cursor: pointer; transition: background 120ms, border-color 120ms;
+  }
+  .error-badge.has-errors { color: var(--error); border-color: var(--error); }
+  .error-badge.flash { animation: flash 600ms ease; }
+  @keyframes flash { 0%, 100% { background: var(--surface-2); } 40% { background: rgba(248,81,73,0.25); } }
+  button {
+    font-family: var(--sans); font-size: 12px; font-weight: 600;
+    color: var(--text); background: var(--surface-2); border: 1px solid var(--border);
+    border-radius: 6px; padding: 6px 12px; cursor: pointer; transition: border-color 120ms, background 120ms;
+  }
+  button:hover { border-color: var(--faint); }
+  button:disabled { opacity: 0.5; cursor: wait; }
+  button.primary { background: var(--info); border-color: var(--info); color: #06111d; }
+  button.ghost { background: transparent; }
+
+  main { padding: 18px 20px 60px; max-width: 1180px; margin: 0 auto; }
+
+  .status-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; margin-bottom: 18px; }
+  .status-card {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+    padding: 12px 14px; display: flex; flex-direction: column; gap: 4px;
+  }
+  .status-card .label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); display: flex; align-items: center; gap: 6px; justify-content: space-between; }
+  .status-card .value { font-family: var(--mono); font-size: 14px; font-weight: 600; }
+  .status-card .value.ok { color: var(--ok); }
+  .status-card .value.warn { color: var(--warn); }
+  .status-card .value.error { color: var(--error); }
+  .status-card .value.idle { color: var(--muted); }
+  .status-card .sub { font-family: var(--mono); font-size: 11px; color: var(--faint); }
+
+  .panel {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+    margin-bottom: 18px; overflow: hidden;
+  }
+  .panel-head {
+    display: flex; align-items: center; gap: 10px; padding: 10px 14px;
+    border-bottom: 1px solid var(--border); background: var(--surface-2);
+  }
+  .panel-head h2 { margin: 0; font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+  .panel-body { padding: 12px 14px; display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+  .panel-body input[type=text] {
+    font-family: var(--mono); font-size: 12px; color: var(--text); background: var(--bg);
+    border: 1px solid var(--border); border-radius: 6px; padding: 7px 10px; flex: 1; min-width: 160px;
+  }
+  .panel-body label { font-size: 11px; color: var(--muted); }
+
+  #business-list { display: flex; flex-direction: column; gap: 6px; padding: 0 14px 12px; }
+  .business-row {
+    display: flex; justify-content: space-between; align-items: center; width: 100%;
+    padding: 8px 10px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg);
+    cursor: pointer; text-align: left; font-family: var(--sans); color: var(--text);
+  }
+  .business-row:hover { border-color: var(--info); }
+  .business-row .id { font-family: var(--mono); font-size: 11px; color: var(--faint); }
+
+  .filters { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 12px; }
+  .chip {
+    font-family: var(--mono); font-size: 11px; padding: 5px 10px; border-radius: 999px;
+    border: 1px solid var(--border); background: var(--surface); color: var(--muted); cursor: pointer;
+    transition: all 120ms; user-select: none;
+  }
+  .chip.active { color: var(--bg); border-color: var(--text); background: var(--text); }
+  .chip[data-level="error"].active { background: var(--error); border-color: var(--error); color: #fff; }
+  .chip[data-level="warn"].active { background: var(--warn); border-color: var(--warn); color: #1a1300; }
+  .chip[data-level="ok"].active { background: var(--ok); border-color: var(--ok); color: #06210c; }
+  .chip[data-level="info"].active { background: var(--info); border-color: var(--info); color: #06111d; }
+  .filters input[type=search] {
+    font-family: var(--mono); font-size: 12px; color: var(--text); background: var(--surface);
+    border: 1px solid var(--border); border-radius: 999px; padding: 6px 12px; flex: 1; min-width: 160px;
+  }
+
+  .feed-toolbar { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+  .feed-toolbar .count { font-size: 11px; color: var(--muted); font-family: var(--mono); }
+  .new-events-pill {
+    display: none; align-items: center; gap: 6px; padding: 5px 12px; border-radius: 999px;
+    background: var(--info); color: #06111d; font-size: 11px; font-weight: 700; cursor: pointer; border: none;
+  }
+  .new-events-pill.show { display: inline-flex; }
+
+  .lane { margin-bottom: 6px; }
+  .lane-head {
+    display: flex; align-items: center; gap: 8px; padding: 7px 12px;
+    background: var(--surface-2); border: 1px solid var(--border); border-radius: 6px;
+    cursor: pointer; user-select: none;
+  }
+  .lane-head .name { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; }
+  .lane-head .n { font-family: var(--mono); font-size: 11px; color: var(--muted); }
+  .lane-head .err-n { font-family: var(--mono); font-size: 11px; color: var(--error); }
+  .lane-head .chev { margin-left: auto; color: var(--faint); font-size: 11px; transition: transform 120ms; }
+  .lane.collapsed .chev { transform: rotate(-90deg); }
+  .lane.collapsed .lane-body { display: none; }
+  .lane-body { padding: 6px 0 2px; }
+
+  .event {
+    display: flex; gap: 10px; padding: 7px 12px 7px 10px; margin: 2px 0;
+    border-left: 3px solid var(--faint); border-radius: 4px; background: var(--surface);
+    font-family: var(--mono); font-size: 12px; cursor: pointer;
+  }
+  .event:hover { background: var(--surface-2); }
+  .event.info { border-left-color: var(--info); }
+  .event.ok { border-left-color: var(--ok); }
+  .event.warn { border-left-color: var(--warn); }
+  .event.error { border-left-color: var(--error); background: rgba(248,81,73,0.06); }
+  .event .time { color: var(--faint); flex-shrink: 0; white-space: nowrap; }
+  .event .lvl { flex-shrink: 0; width: 46px; font-weight: 700; }
+  .event.info .lvl { color: var(--info); }
+  .event.ok .lvl { color: var(--ok); }
+  .event.warn .lvl { color: var(--warn); }
+  .event.error .lvl { color: var(--error); }
+  .event .msg { color: var(--text); flex: 1; word-break: break-word; }
+  .event .step-tag { color: var(--muted); flex-shrink: 0; }
+  .event-details {
+    font-family: var(--mono); font-size: 11px; color: var(--muted);
+    background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+    padding: 8px 10px; margin: 0 12px 8px 25px; white-space: pre-wrap; word-break: break-word;
+  }
+  .empty { padding: 30px; text-align: center; color: var(--faint); font-size: 12px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>HeySasa Admin</h1>
+  <div class="conn"><span class="dot" id="conn-dot"></span><span id="conn-text">connecting…</span></div>
+  <div class="spacer"></div>
+  <div class="error-badge" id="error-badge" title="Click to show only errors">
+    <span id="error-count">0</span> errors
+  </div>
+  <button class="ghost" id="clear-btn">Clear feed</button>
+</header>
+
+<main>
+
+  <section class="status-row">
+    <div class="status-card">
+      <div class="label">Evolution API <button class="ghost" id="check-evolution" style="padding:2px 8px;font-size:10px;">check</button></div>
+      <div class="value idle" id="evolution-value">unknown</div>
+      <div class="sub" id="evolution-sub">not checked yet</div>
+    </div>
+    <div class="status-card">
+      <div class="label">Analysis worker</div>
+      <div class="value idle" id="analysis-value">idle</div>
+      <div class="sub" id="analysis-sub">&nbsp;</div>
+    </div>
+    <div class="status-card">
+      <div class="label">Follow-up engine</div>
+      <div class="value idle" id="followup-value">checking…</div>
+      <div class="sub" id="followup-sub">&nbsp;</div>
+    </div>
+    <div class="status-card">
+      <div class="label">Live events</div>
+      <div class="value ok" id="events-value">0</div>
+      <div class="sub">since page opened</div>
+    </div>
+  </section>
+
+  <div class="panel">
+    <div class="panel-head"><h2>Run a full lead analysis</h2></div>
+    <div id="business-list"><div class="empty">Loading businesses…</div></div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-head"><h2>Resync WhatsApp history for an instance</h2></div>
+    <div class="panel-body">
+      <input type="text" id="resync-instance" placeholder="instance name, e.g. lashes-by-shazz-a1b2c3">
+      <button class="primary" id="resync-btn">Resync history</button>
+    </div>
+  </div>
+
+  <div class="filters">
+    <span class="chip active" data-level="all">all</span>
+    <span class="chip" data-level="error">errors</span>
+    <span class="chip" data-level="warn">warnings</span>
+    <span class="chip" data-level="ok">ok</span>
+    <span class="chip" data-level="info">info</span>
+    <input type="search" id="search" placeholder="search messages…">
+  </div>
+
+  <div class="feed-toolbar">
+    <span class="count" id="feed-count">0 events shown</span>
+    <div class="spacer"></div>
+    <button class="new-events-pill" id="new-events-pill">↓ new events</button>
+  </div>
+
+  <div id="feed"></div>
+
+</main>
+
+<script>
+const LANES = [
+  { id: 'webhook',   name: 'Webhook',            match: s => /webhook/i.test(s) },
+  { id: 'messages',  name: 'Messages',           match: s => /(live message|contact ready|conversation ready|message parse|lead classification|db message write|db conversation update|message status|db receipt)/i.test(s) },
+  { id: 'history',   name: 'History sync',       match: s => /history/i.test(s) },
+  { id: 'contacts',  name: 'Contacts & chats',   match: s => /(db contacts|db contact upsert|db chats|db chat upsert|presence)/i.test(s) },
+  { id: 'evolution', name: 'Evolution API',      match: s => /evolution/i.test(s) },
+  { id: 'analysis',  name: 'Analysis worker',    match: s => /analysis/i.test(s) },
+  { id: 'followup',  name: 'Follow-up engine',   match: s => /follow-up/i.test(s) },
+  { id: 'other',     name: 'Other',              match: () => true },
+];
+function laneFor(step) {
+  return LANES.find(l => l.match(step || '')) || LANES[LANES.length - 1];
+}
+
+const state = {
+  events: [],
+  levelFilter: 'all',
+  search: '',
+  collapsedLanes: new Set(),
+  autoScroll: true,
+  errorCount: 0,
+};
+
+const feed = document.getElementById('feed');
+const errorBadge = document.getElementById('error-badge');
+const errorCountEl = document.getElementById('error-count');
+const eventsValueEl = document.getElementById('events-value');
+const feedCountEl = document.getElementById('feed-count');
+const newEventsPill = document.getElementById('new-events-pill');
+
+function fmtTime(iso) {
+  const d = new Date(iso);
+  return d.toLocaleTimeString(undefined, { hour12: false }) + '.' + String(d.getMilliseconds()).padStart(3, '0');
+}
+
+function passesFilter(e) {
+  if (state.levelFilter !== 'all' && e.level !== state.levelFilter) return false;
+  if (state.search) {
+    const hay = (e.message + ' ' + e.step).toLowerCase();
+    if (!hay.includes(state.search.toLowerCase())) return false;
+  }
+  return true;
+}
+
+function render() {
+  const grouped = {};
+  for (const l of LANES) grouped[l.id] = [];
+  let shown = 0;
+
+  for (const e of state.events) {
+    if (!passesFilter(e)) continue;
+    shown++;
+    grouped[laneFor(e.step).id].push(e);
+  }
+
+  feedCountEl.textContent = `${shown} event${shown === 1 ? '' : 's'} shown`;
+
+  feed.replaceChildren();
+  let any = false;
+  for (const lane of LANES) {
+    const items = grouped[lane.id];
+    if (items.length === 0) continue;
+    any = true;
+    const errCount = items.filter(e => e.level === 'error').length;
+
+    const laneEl = document.createElement('div');
+    laneEl.className = 'lane' + (state.collapsedLanes.has(lane.id) ? ' collapsed' : '');
+
+    const head = document.createElement('div');
+    head.className = 'lane-head';
+    head.innerHTML = `<span class="name">${lane.name}</span><span class="n">${items.length}</span>${errCount ? `<span class="err-n">${errCount} error${errCount === 1 ? '' : 's'}</span>` : ''}<span class="chev">▾</span>`;
+    head.onclick = () => {
+      if (state.collapsedLanes.has(lane.id)) state.collapsedLanes.delete(lane.id);
+      else state.collapsedLanes.add(lane.id);
+      render();
+    };
+    laneEl.append(head);
+
+    const body = document.createElement('div');
+    body.className = 'lane-body';
+    for (const e of items.slice().reverse()) {
+      body.append(renderEvent(e));
+    }
+    laneEl.append(body);
+    feed.append(laneEl);
+  }
+  if (!any) {
+    const empty = document.createElement('div');
+    empty.className = 'empty';
+    empty.textContent = state.events.length ? 'No events match the current filter.' : 'No events yet — waiting for the pipeline to do something.';
+    feed.append(empty);
+  }
+}
+
+function renderEvent(e) {
+  const row = document.createElement('div');
+  row.className = `event ${e.level}`;
+  row.innerHTML = `<span class="time">${fmtTime(e.time)}</span><span class="lvl">${e.level.toUpperCase()}</span><span class="msg">${escapeHtml(e.message)}</span><span class="step-tag">${escapeHtml(e.step)}</span>`;
+
+  const hasDetails = e.details && typeof e.details === 'object' && Object.keys(e.details).length > 0;
+  if (hasDetails) {
+    row.onclick = () => {
+      const existing = row.nextElementSibling;
+      if (existing && existing.classList.contains('event-details')) {
+        existing.remove();
+        return;
+      }
+      const details = document.createElement('div');
+      details.className = 'event-details';
+      details.textContent = JSON.stringify(e.details, null, 2);
+      row.after(details);
+    };
+  }
+
+  const wrap = document.createElement('div');
+  wrap.append(row);
+  return wrap;
+}
+
+function escapeHtml(str) {
+  return String(str).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+function addEvent(e) {
+  state.events.push(e);
+  if (state.events.length > 500) state.events.shift();
+  eventsValueEl.textContent = state.events.length;
+
+  if (e.level === 'error') {
+    state.errorCount++;
+    errorCountEl.textContent = state.errorCount;
+    errorBadge.classList.add('has-errors', 'flash');
+    setTimeout(() => errorBadge.classList.remove('flash'), 650);
+  }
+
+  const nearBottom = window.innerHeight + window.scrollY >= document.body.offsetHeight - 200;
+  render();
+  if (nearBottom) {
+    window.scrollTo(0, document.body.scrollHeight);
+    newEventsPill.classList.remove('show');
+  } else {
+    newEventsPill.classList.add('show');
+  }
+}
+
+// ─── SSE connection ────────────────────────────────────────────────
+function connect() {
+  const dot = document.getElementById('conn-dot');
+  const text = document.getElementById('conn-text');
+  const stream = new EventSource('/debug/events');
+  stream.onopen = () => { dot.className = 'dot live'; text.textContent = 'live'; };
+  stream.onmessage = ev => {
+    const payload = JSON.parse(ev.data);
+    if (payload.type === 'snapshot') { payload.events.forEach(addEvent); return; }
+    addEvent(payload);
+  };
+  stream.onerror = () => {
+    dot.className = 'dot down'; text.textContent = 'disconnected — retrying…';
+    stream.close();
+    setTimeout(connect, 2000);
+  };
+}
+connect();
+
+// ─── filters ───────────────────────────────────────────────────────
+document.querySelectorAll('.chip').forEach(chip => {
+  chip.onclick = () => {
+    document.querySelectorAll('.chip').forEach(c => c.classList.remove('active'));
+    chip.classList.add('active');
+    state.levelFilter = chip.dataset.level;
+    render();
+  };
+});
+document.getElementById('search').oninput = e => { state.search = e.target.value; render(); };
+
+document.getElementById('clear-btn').onclick = () => {
+  state.events = [];
+  state.errorCount = 0;
+  errorCountEl.textContent = '0';
+  errorBadge.classList.remove('has-errors');
+  eventsValueEl.textContent = '0';
+  render();
+};
+
+errorBadge.onclick = () => {
+  document.querySelectorAll('.chip').forEach(c => c.classList.remove('active'));
+  document.querySelector('.chip[data-level="error"]').classList.add('active');
+  state.levelFilter = 'error';
+  render();
+};
+
+newEventsPill.onclick = () => {
+  window.scrollTo(0, document.body.scrollHeight);
+  newEventsPill.classList.remove('show');
+};
+
+// ─── status cards ──────────────────────────────────────────────────
+async function checkEvolution() {
+  const btn = document.getElementById('check-evolution');
+  const valueEl = document.getElementById('evolution-value');
+  const subEl = document.getElementById('evolution-sub');
+  btn.disabled = true;
+  valueEl.textContent = 'checking…';
+  valueEl.className = 'value idle';
+  try {
+    const res = await fetch('/debug/evolution');
+    const body = await res.json();
+    if (body.ok) {
+      valueEl.textContent = 'reachable';
+      valueEl.className = 'value ok';
+      subEl.textContent = `status ${body.status} · ${body.durationMs}ms`;
+    } else {
+      valueEl.textContent = 'error';
+      valueEl.className = 'value error';
+      subEl.textContent = body.error || `status ${body.status}`;
+    }
+  } catch (err) {
+    valueEl.textContent = 'unreachable';
+    valueEl.className = 'value error';
+    subEl.textContent = err.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+document.getElementById('check-evolution').onclick = checkEvolution;
+checkEvolution();
+
+async function refreshAnalysis() {
+  try {
+    const r = await fetch('/debug/analysis/status').then(x => x.json());
+    const valueEl = document.getElementById('analysis-value');
+    const subEl = document.getElementById('analysis-sub');
+    if (r.running) {
+      valueEl.textContent = 'running';
+      valueEl.className = 'value warn';
+      subEl.textContent = `pid ${r.pid}${r.businessId ? ' · ' + r.businessId : ''}`;
+    } else {
+      valueEl.textContent = 'idle';
+      valueEl.className = 'value idle';
+      subEl.textContent = '\u00a0';
+    }
+  } catch {}
+}
+setInterval(refreshAnalysis, 1500); refreshAnalysis();
+
+async function refreshFollowup() {
+  try {
+    const r = await fetch('/debug/followup/status').then(x => x.json());
+    const valueEl = document.getElementById('followup-value');
+    const subEl = document.getElementById('followup-sub');
+    if (r.running) {
+      valueEl.textContent = 'live';
+      valueEl.className = 'value ok';
+      subEl.textContent = `pid ${r.pid} · port ${r.port}`;
+    } else {
+      valueEl.textContent = 'offline';
+      valueEl.className = 'value error';
+      subEl.textContent = '\u00a0';
+    }
+  } catch {
+    document.getElementById('followup-value').textContent = 'unavailable';
+  }
+}
+setInterval(refreshFollowup, 1500); refreshFollowup();
+
+// ─── businesses / analysis trigger ────────────────────────────────
+async function loadBusinesses() {
+  const list = document.getElementById('business-list');
+  try {
+    const result = await fetch('/debug/businesses').then(r => r.json());
+    if (!result.ok) throw new Error(result.error || 'Business lookup failed');
+    if (!result.businesses.length) {
+      list.innerHTML = '<div class="empty">No businesses found.</div>';
+      return;
+    }
+    list.replaceChildren(...result.businesses.map(b => {
+      const row = document.createElement('button');
+      row.className = 'business-row';
+      row.innerHTML = `<span>${escapeHtml(b.name || '(unnamed business)')}</span><span class="id">${escapeHtml(b.business_id)}</span>`;
+      row.onclick = () => startAnalysis(b);
+      return row;
+    }));
+  } catch (err) {
+    list.innerHTML = `<div class="empty">${escapeHtml(err.message)}</div>`;
+  }
+}
+async function startAnalysis(business) {
+  if (!window.confirm(`Run full lead analysis for ${business.name || business.business_id}?`)) return;
+  try {
+    const res = await fetch('/debug/analysis/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ businessId: business.business_id }),
+    });
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.message || result.error || 'Could not start analysis');
+  } catch (err) {
+    alert(err.message);
+  }
+}
+loadBusinesses();
+
+// ─── evolution resync ──────────────────────────────────────────────
+document.getElementById('resync-btn').onclick = async () => {
+  const input = document.getElementById('resync-instance');
+  const name = input.value.trim();
+  if (!name) { input.focus(); return; }
+  if (!window.confirm(`Log out "${name}" and force a history resync on next pairing?`)) return;
+  const btn = document.getElementById('resync-btn');
+  btn.disabled = true;
+  try {
+    const res = await fetch(`/debug/evolution/resync/${encodeURIComponent(name)}`, { method: 'POST' });
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || 'Resync failed');
+    alert(`Resync requested for ${name}. Reopen the WhatsApp connection flow to get a fresh QR.`);
+  } catch (err) {
+    alert(err.message);
+  } finally {
+    btn.disabled = false;
+  }
+};
+
+render();
+</script>
+</body>
+</html>
