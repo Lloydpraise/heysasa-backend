@@ -6,6 +6,7 @@ import {
     classifyLeadType, 
     extractProductInterests, 
     extractPhone,
+    extractMessageJid,
     preScanPayload 
 } from './dataCleaner.js';
 import { 
@@ -85,7 +86,7 @@ export async function processConnectionUpdate(payload, businessId) {
 // (extractMessageContent/extractAdAttribution/isGroupOrBroadcast) so both
 // paths parse a raw Baileys message identically.
 function parseMessagePayload(rawMessage) {
-    const jid = rawMessage?.key?.remoteJid;
+    const jid = extractMessageJid(rawMessage);
     if (!jid || isGroupOrBroadcast(jid) || rawMessage?.messageStubType) return null;
 
     const content = extractMessageContent(rawMessage);
@@ -253,7 +254,7 @@ export async function processHistorySync(payload, businessIdOverride) {
     // contactMap/convoMap so repeat senders in one sync batch only hit the
     // DB once each.
     for (const msg of messages) {
-        const jid = msg.key?.remoteJid;
+        const jid = extractMessageJid(msg);
         if (!jid || isGroupOrBroadcast(jid) || msg.messageStubType) continue;
 
         const content = extractMessageContent(msg);

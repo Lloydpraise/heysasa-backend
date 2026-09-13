@@ -35,6 +35,19 @@ queueRouter.get('/queue/pending', async (req, res) => {
   res.json({ items: data })
 })
 
+// GET /queue/status — delivery history and current scheduling state
+queueRouter.get('/queue/status', async (req, res) => {
+  const { data, error } = await supabase
+    .from('follow_up_queue')
+    .select('id, contact_id, campaign_id, campaign_step, sequence_step, touchpoint_type, status, approval_status, channel, final_message, scheduled_at, processed_at, dispatch_attempts, last_dispatch_error, skip_reason, created_at')
+    .eq('business_id', req.businessId)
+    .order('scheduled_at', { ascending: false })
+    .limit(100)
+
+  if (error) return res.status(500).json({ error: error.message })
+  res.json({ items: data })
+})
+
 // POST /queue/:id/approve — { text?: string } — approve as-is, or approve with an inline edit
 queueRouter.post('/queue/:id/approve', async (req, res) => {
   const item = await loadOwnedAwaitingItem(req, res)

@@ -165,7 +165,7 @@ export async function runCampaignScheduler(supabase) {
         .eq('campaign_id', enrollment.campaign_id)
         .eq('contact_id', enrollment.lead_id)
         .eq('campaign_step', step.step_number)
-        .in('status', ['pending', 'ready_to_send', 'sent'])
+        .in('status', ['pending', 'ready_to_send', 'sending', 'sent', 'failed'])
         .maybeSingle()
       if (existing) {
         console.log(`[CampaignScheduler] Skipped enrollment ${enrollment.id}: queue item already exists for step ${step.step_number}`)

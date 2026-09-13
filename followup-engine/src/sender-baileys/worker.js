@@ -5,8 +5,30 @@ import { checkAntiban, recordSend } from './antiban.js'
 import { recordSuccessfulSend, recordFailedDispatch } from './postSend.js'
 
 const BATCH_SIZE = 25
+const STALE_CLAIM_MS = 2 * 60_000
+
+async function recoverStaleClaims() {
+  const cutoff = new Date(Date.now() - STALE_CLAIM_MS).toISOString()
+  const { data, error } = await supabase
+    .from('follow_up_queue')
+    .update({
+      status: 'ready_to_send',
+      last_dispatch_error: 'recovered_stale_sending_claim'
+    })
+    .eq('status', 'sending')
+    .lte('scheduled_at', cutoff)
+    .select('id')
+
+  if (error) {
+    console.error(`[Sender] Failed to recover stale claims: ${error.message}`)
+    return
+  }
+  if (data?.length) console.warn(`[Sender] Recovered ${data.length} stale sending claim(s)`)
+}
 
 export async function processBaileysBatch() {
+  await recoverStaleClaims()
+
   const { data: items, error } = await supabase
     .from('follow_up_queue')
     .select('*')
@@ -65,10 +87,23 @@ export async function processBaileysBatch() {
       const gate = checkAntiban(item.business_id, business.followup_daily_cap)
       if (!gate.allowed) continue
 
+      const { data: claimedItem, error: claimError } = await supabase
+        .from('follow_up_queue')
+        .update({ status: 'sending' })
+        .eq('id', item.id)
+        .eq('status', 'ready_to_send')
+        .select('id')
+        .maybeSingle()
+
+      if (claimError) {
+        console.error(`[Sender] Could not mark ${item.id} as sending: ${claimError.message}`)
+        continue
+      }
+      if (!claimedItem) continue
+
       const result = await sendViaEvolution(activeSession.instance_name, contact.phone, item.final_message, contact.country_code)
 
       if (!result.ok) {
-        if (result.error === 'evolution_instance_not_open') continue
         await recordFailedDispatch(supabase, item, result.error ?? 'send_failed')
         continue
       }

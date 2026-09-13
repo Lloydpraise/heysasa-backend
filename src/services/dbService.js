@@ -75,7 +75,20 @@ export async function getOrCreateConversation(businessId, contactId, jid) {
             .select('id')
             .single();
 
-        if (createError) throw createError;
+        if (createError) {
+            if (createError.code !== '23505') throw createError;
+
+            const { data: concurrentConversation, error: retryError } = await supabase
+                .from('conversations')
+                .select('id')
+                .eq('business_id', businessId)
+                .eq('contact_id', contactId)
+                .maybeSingle();
+
+            if (retryError) throw retryError;
+            if (concurrentConversation) return concurrentConversation.id;
+            throw createError;
+        }
         return created.id;
     } catch (error) {
         logDbFailure('getOrCreateConversation', { businessId, contactId, jid }, error);

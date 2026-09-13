@@ -677,7 +677,7 @@ Starts the sender polling loop using `SENDER_POLL_INTERVAL_MS`, default five sec
 
 The follow-up queue is the handoff between scheduling, owner approval, and
 outbound sending. The queue `status` values are `pending`, `ready_to_send`,
-`sent`, `failed`, `skipped`, and `cancelled`. Approval is tracked separately
+`sending`, `sent`, `failed`, `skipped`, and `cancelled`. Approval is tracked separately
 through `approval_status`; an item awaiting owner review normally remains
 `status = pending` with `approval_status = awaiting_approval`.
 
@@ -707,6 +707,7 @@ Supabase project in filename order:
 - `20260903000200_fix_followup_queue_statuses.sql`
 - `20260903000300_normalize_campaign_queue_noise.sql`
 - `20260903000400_add_evolution_message_new_column.sql`
+- `20260904000000_add_sending_queue_status.sql`
 
 The other tables below must already exist in the target Supabase project.
 

@@ -46,7 +46,7 @@ export async function runPostSendReconciliation(supabase) {
         ?? parseInt(rules.quiet_hours_end ?? String(DEFAULT_QUIET_END))
 
       // Schedule next step
-      if (contact.follow_up_sequence_id) {
+      if (contact.follow_up_sequence_id && !item.campaign_id) {
         const nextStep = await getNextSequenceStep(supabase, contact.follow_up_sequence_id, item.sequence_step)
         if (nextStep) {
           const nextTime = calculateSendTime(nextStep.delay_hours ?? 48, contact.optimal_contact_hour, quietStart, quietEnd, timeZone)

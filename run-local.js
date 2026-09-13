@@ -8,7 +8,8 @@ dotenv.config();
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY;
 const OPENAI_KEY   = process.env.OPENAI_API_KEY;
-const BUSINESS_ID  = process.env.BUSINESS_ID || process.env.SINGLE_BUSINESS_ID;
+const REQUESTED_BUSINESS_ID = process.env.BUSINESS_ID || null;
+let BUSINESS_ID = REQUESTED_BUSINESS_ID;
 
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4.1-mini';
 
@@ -99,7 +100,31 @@ async function finishRun(counts) {
     }
 }
 
+async function resolveActiveInstance() {
+    let sessionsQuery = supabase
+        .from('whatsapp_sessions')
+        .select('business_id, instance_name, status, updated_at')
+        .eq('status', 'connected')
+        .order('updated_at', { ascending: false })
+        .limit(1);
+    if (REQUESTED_BUSINESS_ID) sessionsQuery = sessionsQuery.eq('business_id', REQUESTED_BUSINESS_ID);
+
+    const { data: session, error } = await sessionsQuery.maybeSingle();
+    if (error) throw new Error(`Active WhatsApp session lookup failed: ${error.message}`);
+    if (!session) {
+        throw new Error(REQUESTED_BUSINESS_ID
+            ? `No connected WhatsApp session found for business ${REQUESTED_BUSINESS_ID}`
+            : 'No connected WhatsApp session found');
+    }
+
+    BUSINESS_ID = session.business_id;
+    log('Scope', `Using connected instance ${session.instance_name} for business ${BUSINESS_ID}.`);
+    return session;
+}
+
 // ─── Direct Database Message Loader ───────────────────────────────────────────
+// Full-history hydration: do not cap recent messages. Ad attribution depends on
+// the first inbound message in the thread, even when the chat has hundreds of rows.
 async function fetchContactMessages(contactId) {
     const { data, error } = await supabase
         .from('messages')
@@ -297,7 +322,7 @@ async function runAdAttributionExtraction() {
 
     let contactsQuery = supabase
         .from('contacts')
-        .select('id, business_id, phone_number, is_ad_lead');
+        .select('id, business_id, is_ad_lead');
     if (BUSINESS_ID) contactsQuery = contactsQuery.eq('business_id', BUSINESS_ID);
 
     let contacts;
@@ -372,7 +397,7 @@ async function runStructuralEnrichment() {
 
     let contactsQuery = supabase
         .from('contacts')
-        .select('id, business_id, lead_state, lead_type, is_ad_lead, updated_at')
+        .select('id, business_id, lead_state, lead_type, is_ad_lead')
         .neq('lead_type', 'personal');
     if (BUSINESS_ID) contactsQuery = contactsQuery.eq('business_id', BUSINESS_ID);
 
@@ -638,7 +663,7 @@ async function runNLPPass() {
     let conversationsQuery = supabase
         .from('conversations')
         .select(`
-            id, business_id, contact_id, last_message_at, customer_intent, psychology, vibe_check,
+            id, business_id, contact_id, customer_intent, psychology, vibe_check,
             conversation_enrichment ( last_enriched_at, conv_stage, next_action_plan ),
             contacts!inner ( id, intent, follow_up_urgency, quality_score, lead_summary, awaiting_reply, hours_awaiting_reply )
         `);
@@ -814,6 +839,7 @@ async function main() {
     console.log('🚀 Executing Local Database Enrichment Run');
     console.log('--------------------------------------------------');
 
+    await resolveActiveInstance();
     await startRun('full_pass');
 
     await runAdAttributionExtraction();

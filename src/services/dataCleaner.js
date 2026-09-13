@@ -15,6 +15,12 @@ export function extractPhone(jid) {
     return `+${raw}`;
 }
 
+export function extractMessageJid(msg) {
+    const jid = msg?.key?.remoteJid;
+    if (jid?.endsWith('@lid') && msg?.key?.remoteJidAlt) return msg.key.remoteJidAlt;
+    return jid;
+}
+
 function unwrapMessage(msg) {
     let m = msg?.message;
     if (!m) return null;
@@ -63,7 +69,7 @@ export function extractMessageContent(msg) {
     if (m.interactiveResponseMessage)
         return { text: m.interactiveResponseMessage.nativeFlowResponseMessage?.paramsJson || '', type: 'interactive_response' };
 
-    return null;
+    return { text: '', type: 'unknown' };
 }
 
 export function extractAdAttribution(msg) {

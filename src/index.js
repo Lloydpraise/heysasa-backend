@@ -179,7 +179,7 @@ app.post('/debug/analysis/start', (req, res) => {
     const projectRoot = fileURLToPath(new URL('../', import.meta.url));
     const businessId = typeof req.body?.businessId === 'string' && req.body.businessId.trim()
         ? req.body.businessId.trim()
-        : process.env.SINGLE_BUSINESS_ID || null;
+        : null;
     analysisBusinessId = businessId;
     debugLog('info', 'Analysis worker', 'Starting run-local.js', { projectRoot, businessId });
     analysisProcess = spawn(process.execPath, ['run-local.js'], {
