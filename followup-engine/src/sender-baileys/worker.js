@@ -7,6 +7,38 @@ import { recordSuccessfulSend, recordFailedDispatch } from './postSend.js'
 const BATCH_SIZE = 25
 const STALE_CLAIM_MS = 2 * 60_000
 
+// Circuit breaker — if a business is racking up failures fast, stop
+// hammering it and surface that instead of grinding through the rest
+// of the batch into a possibly-flagged number.
+const recentFailures = new Map() // business_id -> [timestamp, ...]
+const CIRCUIT_WINDOW_MS = 10 * 60_000
+const CIRCUIT_THRESHOLD = 8
+
+function tooManyRecentFailures(businessId) {
+  const cutoff = Date.now() - CIRCUIT_WINDOW_MS
+  const list = (recentFailures.get(businessId) ?? []).filter(t => t > cutoff)
+  recentFailures.set(businessId, list)
+  return list.length >= CIRCUIT_THRESHOLD
+}
+
+function recordFailure(businessId) {
+  const list = recentFailures.get(businessId) ?? []
+  list.push(Date.now())
+  recentFailures.set(businessId, list)
+}
+
+async function logSendEvent(businessId, { queueId = null, contactId = null, instanceName = null, eventType, reason = null }) {
+  const { error } = await supabase.from('follow_up_send_events').insert({
+    business_id: businessId,
+    follow_up_queue_id: queueId,
+    contact_id: contactId,
+    instance_name: instanceName,
+    event_type: eventType,
+    reason
+  })
+  if (error) console.error(`[Sender] Failed to log send event: ${error.message}`)
+}
+
 async function recoverStaleClaims() {
   const cutoff = new Date(Date.now() - STALE_CLAIM_MS).toISOString()
   const { data, error } = await supabase
@@ -46,16 +78,39 @@ export async function processBaileysBatch() {
   if (!items?.length) return { dispatched: 0 }
 
   let dispatched = 0
+  const trippedBusinesses = new Set()
 
   for (const item of items) {
     try {
+      if (trippedBusinesses.has(item.business_id)) continue
+
+      if (tooManyRecentFailures(item.business_id)) {
+        trippedBusinesses.add(item.business_id)
+        console.error(`[Sender] Circuit breaker tripped for ${item.business_id} — pausing this business for the rest of the batch`)
+        await logSendEvent(item.business_id, {
+          queueId: item.id,
+          contactId: item.contact_id,
+          eventType: 'circuit_breaker_tripped',
+          reason: `${CIRCUIT_THRESHOLD}+ failures in ${CIRCUIT_WINDOW_MS / 60_000} min`
+        })
+        continue
+      }
+
       const [business, contact] = await Promise.all([
         getBusiness(supabase, item.business_id),
         getContact(supabase, item.contact_id)
       ])
 
-      if (!business) { await recordFailedDispatch(supabase, item, 'business_not_found'); continue }
-      if (!contact?.phone) { await recordFailedDispatch(supabase, item, 'contact_or_phone_not_found'); continue }
+      if (!business) {
+        await recordFailedDispatch(supabase, item, 'business_not_found')
+        await logSendEvent(item.business_id, { queueId: item.id, contactId: item.contact_id, eventType: 'business_not_found' })
+        continue
+      }
+      if (!contact?.phone) {
+        await recordFailedDispatch(supabase, item, 'contact_or_phone_not_found')
+        await logSendEvent(item.business_id, { queueId: item.id, contactId: item.contact_id, eventType: 'contact_or_phone_not_found' })
+        continue
+      }
 
       // business.evolution_instance_id is a denormalized copy that's never
       // kept in sync when a business reconnects/re-scans — only
@@ -72,7 +127,11 @@ export async function processBaileysBatch() {
         .eq('status', 'connected')
         .order('updated_at', { ascending: false })
 
-      if (sessionError) { await recordFailedDispatch(supabase, item, `session_lookup_failed: ${sessionError.message}`); continue }
+      if (sessionError) {
+        await recordFailedDispatch(supabase, item, `session_lookup_failed: ${sessionError.message}`)
+        await logSendEvent(item.business_id, { queueId: item.id, contactId: item.contact_id, eventType: 'session_lookup_failed', reason: sessionError.message })
+        continue
+      }
       let activeSession = null
       for (const candidate of session ?? []) {
         if (await isEvolutionInstanceOpen(candidate.instance_name)) {
@@ -80,7 +139,15 @@ export async function processBaileysBatch() {
           break
         }
       }
-      if (!activeSession?.instance_name) continue
+      if (!activeSession?.instance_name) {
+        await logSendEvent(item.business_id, {
+          queueId: item.id,
+          contactId: item.contact_id,
+          eventType: 'no_open_session',
+          reason: `${session?.length ?? 0} connected session(s) in DB, none actually open`
+        })
+        continue
+      }
 
       // Antiban gate — if not allowed yet, leave it ready_to_send and try
       // again next poll cycle. Don't count this as a failed attempt.
@@ -105,6 +172,14 @@ export async function processBaileysBatch() {
 
       if (!result.ok) {
         await recordFailedDispatch(supabase, item, result.error ?? 'send_failed')
+        await logSendEvent(item.business_id, {
+          queueId: item.id,
+          contactId: item.contact_id,
+          instanceName: activeSession.instance_name,
+          eventType: 'failed',
+          reason: result.error ?? 'send_failed'
+        })
+        recordFailure(item.business_id)
         continue
       }
 
@@ -120,6 +195,8 @@ export async function processBaileysBatch() {
     } catch (e) {
       console.error(`[Sender] Unexpected error for ${item.id}: ${e.message}`)
       await recordFailedDispatch(supabase, item, e.message).catch(() => {})
+      await logSendEvent(item.business_id, { queueId: item.id, contactId: item.contact_id, eventType: 'failed', reason: e.message }).catch(() => {})
+      recordFailure(item.business_id)
     }
   }
 

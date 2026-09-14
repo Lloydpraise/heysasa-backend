@@ -117,13 +117,14 @@ export async function recordSuccessfulSend(supabase, { item, contact, business, 
     }
   }
 
-  // Auto-upgrade daily cap based on lifetime sends (unchanged from original)
+  // Auto-upgrade daily cap based on lifetime sends — only ever raises,
+  // never overwrites a manually-set higher cap down to a tier default.
   const newTotal = (business.followup_total_sent ?? 0) + 1
   const tier2 = 500, tier3 = 2000
-  const newCap = newTotal >= tier3 ? 100 : newTotal >= tier2 ? 80 : business.followup_daily_cap
-  if (newCap !== business.followup_daily_cap) {
-    await supabase.from('businesses').update({ followup_daily_cap: newCap }).eq('business_id', item.business_id)
-    console.log(`[Sender] Daily cap upgraded to ${newCap} for ${item.business_id}`)
+  const tierCap = newTotal >= tier3 ? 100 : newTotal >= tier2 ? 80 : null
+  if (tierCap !== null && tierCap > business.followup_daily_cap) {
+    await supabase.from('businesses').update({ followup_daily_cap: tierCap }).eq('business_id', item.business_id)
+    console.log(`[Sender] Daily cap upgraded to ${tierCap} for ${item.business_id}`)
   }
 
   // Campaign step advancement — separate from follow_up_count/sequence_step
