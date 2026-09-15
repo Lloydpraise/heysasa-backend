@@ -8,7 +8,20 @@ dotenv.config();
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY;
 const OPENAI_KEY   = process.env.OPENAI_API_KEY;
-const REQUESTED_BUSINESS_ID = process.env.BUSINESS_ID || null;
+let requestedAnalysisConfig = {};
+try {
+    requestedAnalysisConfig = process.env.ANALYSIS_CONFIG
+        ? JSON.parse(process.env.ANALYSIS_CONFIG)
+        : {};
+} catch (error) {
+    console.error(`✗ Invalid ANALYSIS_CONFIG: ${error.message}`);
+    process.exit(1);
+}
+
+const REQUESTED_BUSINESS_ID = requestedAnalysisConfig.businessId || process.env.BUSINESS_ID || null;
+const REQUESTED_CONTACT_IDS = Array.isArray(requestedAnalysisConfig.contactIds)
+    ? requestedAnalysisConfig.contactIds
+    : [];
 let BUSINESS_ID = REQUESTED_BUSINESS_ID;
 
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4.1-mini';
@@ -126,13 +139,21 @@ async function resolveActiveInstance() {
 // Full-history hydration: do not cap recent messages. Ad attribution depends on
 // the first inbound message in the thread, even when the chat has hundreds of rows.
 async function fetchContactMessages(contactId) {
-    const { data, error } = await supabase
+    let messagesQuery = supabase
         .from('messages')
         .select('id, direction, type, content, status, raw_payload, created_at')
         .eq('contact_id', contactId)
+        .eq('business_id', BUSINESS_ID)
         .order('created_at', { ascending: true });
+    const { data, error } = await messagesQuery;
     if (error) throw new Error(`Fetch messages failed: ${error.message}`);
     return data || [];
+}
+
+function applyContactScope(query, column = 'id') {
+    return REQUESTED_CONTACT_IDS.length > 0
+        ? query.in(column, REQUESTED_CONTACT_IDS)
+        : query;
 }
 
 // ─── Pagination helper ────────────────────────────────────────────────────────
@@ -320,9 +341,9 @@ async function runAdAttributionExtraction() {
     log('AdAttribution', 'Running deterministic ad-signal extraction...');
     let matched = 0, noMatch = 0, noAdId = 0, sampledShapeLogged = false;
 
-    let contactsQuery = supabase
+    let contactsQuery = applyContactScope(supabase
         .from('contacts')
-        .select('id, business_id, is_ad_lead');
+        .select('id, business_id, is_ad_lead'));
     if (BUSINESS_ID) contactsQuery = contactsQuery.eq('business_id', BUSINESS_ID);
 
     let contacts;
@@ -395,10 +416,10 @@ async function runStructuralEnrichment() {
     log('Structural', 'Starting structural calculation pass...');
     let enriched = 0, errored = 0;
 
-    let contactsQuery = supabase
+    let contactsQuery = applyContactScope(supabase
         .from('contacts')
         .select('id, business_id, lead_state, lead_type, is_ad_lead')
-        .neq('lead_type', 'personal');
+        .neq('lead_type', 'personal'));
     if (BUSINESS_ID) contactsQuery = contactsQuery.eq('business_id', BUSINESS_ID);
 
     let contacts;
@@ -660,13 +681,13 @@ async function runNLPPass() {
     log('NLP', 'Starting AI extraction pass...');
     let enrichedCount = 0, errored = 0, skipped = 0;
 
-    let conversationsQuery = supabase
+    let conversationsQuery = applyContactScope(supabase
         .from('conversations')
         .select(`
             id, business_id, contact_id, customer_intent, psychology, vibe_check,
             conversation_enrichment ( last_enriched_at, conv_stage, next_action_plan ),
             contacts!inner ( id, intent, follow_up_urgency, quality_score, lead_summary, awaiting_reply, hours_awaiting_reply )
-        `);
+        `), 'contact_id');
     if (BUSINESS_ID) conversationsQuery = conversationsQuery.eq('business_id', BUSINESS_ID);
 
     let conversations;
@@ -783,10 +804,10 @@ async function runNLPPass() {
 async function recomputeAdAttributionRollups() {
     log('AdAttribution', 'Recomputing per-ad lead/reply/conversion counts...');
 
-    let contactsQuery = supabase
+    let contactsQuery = applyContactScope(supabase
         .from('contacts')
-        .select('business_id, ad_id, read_receipt, lead_state, product_interests')
-        .not('ad_id', 'is', null);
+        .select('id, business_id, ad_id, read_receipt, lead_state, product_interests')
+        .not('ad_id', 'is', null));
     if (BUSINESS_ID) contactsQuery = contactsQuery.eq('business_id', BUSINESS_ID);
 
     let attributedContacts;
@@ -840,7 +861,7 @@ async function main() {
     console.log('--------------------------------------------------');
 
     await resolveActiveInstance();
-    await startRun('full_pass');
+    await startRun(REQUESTED_CONTACT_IDS.length ? 'contact_pass' : 'full_pass');
 
     await runAdAttributionExtraction();
     const structuralResult = await runStructuralEnrichment();

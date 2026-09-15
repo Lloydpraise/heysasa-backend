@@ -314,12 +314,60 @@ Routes:
 | `GET` | `/health` | Health check |
 | `GET` | `/debug/analysis/status` | Analysis worker status |
 | `POST` | `/debug/analysis/start` | Starts `run-local.js`; optional body `{ "businessId": "..." }` |
+| `POST` | `/analysis/start` | Authenticated scoped analysis; accepts optional `businessId` and `contactIds` |
+| `GET` | `/analysis/status` | Authenticated status for the caller's analysis |
 | `GET` | `/debug/followup/status` | Follow-up child-process status |
 | `GET` | `/debug/events` | Server-Sent Events debug stream |
 | `GET` | `/debug/evolution` | Checks `EVOLUTION_URL` |
 | `POST` | `/webhook/evolution` | Evolution event receiver |
 
-The server acknowledges valid webhooks before dispatching event processing. It starts `run-local.js` only when requested and passes the selected business through `BUSINESS_ID`.
+The server acknowledges valid webhooks before dispatching event processing. It starts `run-local.js` only when requested and passes the authenticated business plus optional contact scope through `ANALYSIS_CONFIG`.
+
+### Analysis API
+
+`POST /analysis/start` requires the Supabase access token:
+
+```http
+Authorization: Bearer SUPABASE_ACCESS_TOKEN
+Content-Type: application/json
+```
+
+Analyze the whole authenticated business:
+
+```json
+{}
+```
+
+Analyze one or more contacts. `contacts.id` is a `bigint`, so send positive integer values (JSON numbers or numeric strings):
+
+```json
+{
+  "contactIds": [12345, 12346]
+}
+```
+
+The optional `businessId` must match the authenticated owner's `businesses.business_id`; it is validated server-side and is not trusted for authorization:
+
+```json
+{
+  "businessId": "lashesbyshazz",
+  "contactIds": [12345]
+}
+```
+
+Successful requests return `202 Accepted`:
+
+```json
+{
+  "ok": true,
+  "message": "Analysis started",
+  "running": true,
+  "businessId": "lashesbyshazz",
+  "contactIds": [12345]
+}
+```
+
+An omitted or empty `contactIds` array means the complete business. The backend verifies every requested contact belongs to that business before starting the worker.
 
 ### `src/config/evolution.js`
 

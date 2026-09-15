@@ -112,11 +112,11 @@ startFollowupEngine();
 
 function analysisStatus() {
     return analysisProcess
-        ? { running: true, pid: analysisProcess.pid, businessId: analysisBusinessId }
-        : { running: false, businessId: null };
+    ? { running: true, pid: analysisProcess.pid, ...analysisBusinessId }
+    : { running: false, businessId: null, contactIds: [] };
 }
 
-app.get('/debug/analysis/status', (_req, res) => res.json(analysisStatus()));
+app.get('/debug/analysis/status', (_req, res) => res.json({ running: !!analysisProcess }));
 
 app.get('/debug/businesses', async (_req, res) => {
     const { data, error } = await supabase
@@ -170,7 +170,30 @@ app.post('/debug/evolution/resync/:instanceName', async (req, res) => {
     }
 });
 
-app.post('/debug/analysis/start', (req, res) => {
+async function startAnalysis(req, res) {
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : null;
+    if (!token) {
+        res.status(401).json({ ok: false, error: 'missing_auth_token' });
+        return;
+    }
+
+    const { data: userData, error: userError } = await supabase.auth.getUser(token);
+    if (userError || !userData?.user?.email) {
+        res.status(401).json({ ok: false, error: 'invalid_auth_token' });
+        return;
+    }
+
+    const { data: ownedBusiness, error: businessError } = await supabase
+        .from('businesses')
+        .select('business_id')
+        .eq('owner_email', userData.user.email)
+        .single();
+    if (businessError || !ownedBusiness) {
+        res.status(403).json({ ok: false, error: 'no_business_for_user' });
+        return;
+    }
+
     if (analysisProcess) {
         res.status(409).json({ ok: false, message: 'Analysis is already running', ...analysisStatus() });
         return;
@@ -179,12 +202,51 @@ app.post('/debug/analysis/start', (req, res) => {
     const projectRoot = fileURLToPath(new URL('../', import.meta.url));
     const businessId = typeof req.body?.businessId === 'string' && req.body.businessId.trim()
         ? req.body.businessId.trim()
-        : null;
-    analysisBusinessId = businessId;
-    debugLog('info', 'Analysis worker', 'Starting run-local.js', { projectRoot, businessId });
+        : ownedBusiness.business_id;
+    if (businessId !== ownedBusiness.business_id) {
+        res.status(403).json({ ok: false, error: 'business_not_owned' });
+        return;
+    }
+
+    const rawContactIds = req.body?.contactIds ?? [];
+    if (!Array.isArray(rawContactIds)) {
+        res.status(400).json({ ok: false, error: 'contactIds_must_be_array' });
+        return;
+    }
+    const contactIds = [...new Set(rawContactIds.map((value) => {
+        const normalized = typeof value === 'number' ? value : Number(value);
+        return Number.isSafeInteger(normalized) && normalized > 0 ? normalized : null;
+    }))].filter(Boolean);
+    if (contactIds.length !== rawContactIds.length) {
+        res.status(400).json({ ok: false, error: 'contactIds_must_contain_positive_integers' });
+        return;
+    }
+
+    if (contactIds.length > 0) {
+        const { data: contacts, error: contactsError } = await supabase
+            .from('contacts')
+            .select('id')
+            .eq('business_id', businessId)
+            .in('id', contactIds);
+        if (contactsError) {
+            res.status(500).json({ ok: false, error: contactsError.message });
+            return;
+        }
+        const ownedContactIds = new Set((contacts || []).map((contact) => Number(contact.id)));
+        if (ownedContactIds.size !== contactIds.length || contactIds.some((id) => !ownedContactIds.has(id))) {
+            res.status(400).json({ ok: false, error: 'one_or_more_contacts_not_in_business' });
+            return;
+        }
+    }
+
+    analysisBusinessId = { businessId, contactIds };
+    debugLog('info', 'Analysis worker', 'Starting run-local.js', { projectRoot, businessId, contactIds });
     analysisProcess = spawn(process.execPath, ['run-local.js'], {
         cwd: projectRoot,
-        env: { ...process.env, ...(businessId ? { BUSINESS_ID: businessId } : {}) },
+        env: {
+            ...process.env,
+            ANALYSIS_CONFIG: JSON.stringify({ businessId, contactIds }),
+        },
         stdio: ['ignore', 'pipe', 'pipe'],
     });
 
@@ -206,6 +268,40 @@ app.post('/debug/analysis/start', (req, res) => {
     });
 
     res.status(202).json({ ok: true, message: 'Analysis started', ...analysisStatus() });
+}
+
+app.post(['/analysis/start', '/debug/analysis/start'], (req, res, next) => {
+    startAnalysis(req, res).catch(next);
+});
+
+app.get('/analysis/status', async (req, res, next) => {
+    try {
+        const token = req.headers.authorization?.startsWith('Bearer ')
+            ? req.headers.authorization.slice(7).trim()
+            : null;
+        if (!token) return res.status(401).json({ ok: false, error: 'missing_auth_token' });
+
+        const { data: userData, error: userError } = await supabase.auth.getUser(token);
+        if (userError || !userData?.user?.email) {
+            return res.status(401).json({ ok: false, error: 'invalid_auth_token' });
+        }
+
+        const { data: ownedBusiness, error: businessError } = await supabase
+            .from('businesses')
+            .select('business_id')
+            .eq('owner_email', userData.user.email)
+            .single();
+        if (businessError || !ownedBusiness) {
+            return res.status(403).json({ ok: false, error: 'no_business_for_user' });
+        }
+
+        if (analysisProcess && analysisBusinessId.businessId !== ownedBusiness.business_id) {
+            return res.json({ running: false, businessId: null, contactIds: [] });
+        }
+        return res.json(analysisStatus());
+    } catch (error) {
+        return next(error);
+    }
 });
 
 app.get('/debug/events', (_req, res) => {

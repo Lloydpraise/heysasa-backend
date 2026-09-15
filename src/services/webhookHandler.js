@@ -347,14 +347,18 @@ export async function processMessageStatusUpdate(payload, businessIdOverride) {
     for (const update of rawUpdates) {
         try {
             const messageId = update?.key?.id;
-            const status = update?.status;
+            const status = String(update?.status || '').toUpperCase();
             if (!messageId || !status) continue;
 
-            const { error } = await supabase
+            let statusUpdate = supabase
                 .from('messages')
                 .update({ status, is_read: status.toUpperCase() === 'READ' })
                 .eq('whatsapp_message_id', messageId)
                 .eq('business_id', businessId);
+
+            if (status !== 'READ') statusUpdate = statusUpdate.not('status', 'ilike', 'READ');
+
+            const { error } = await statusUpdate;
 
             if (error) {
                 debugLog('error', 'DB receipt update', 'Message status update failed', { messageId, status, businessId, error });
