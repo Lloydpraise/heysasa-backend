@@ -1,4 +1,5 @@
 import { getContact, getConversation } from '../lib/db.js'
+import { resolveMergeFields } from '../lib/mergeFields.js'
 
 const BATCH_SIZE = 30
 const CAMPAIGN_SEED_INTERVAL_MS = parseInt(process.env.CAMPAIGN_SEED_INTERVAL_MS ?? `${5 * 60_000}`)
@@ -189,7 +190,7 @@ export async function runCampaignScheduler(supabase) {
         sequence_step: step.step_number,
         touchpoint_type: 'campaign',
         klt_phase: 'know',
-        final_message: step.content,
+        final_message: resolveMergeFields(step.content, contact),
         approval_status: 'approved',
         status: 'pending',
         scheduled_at: now
