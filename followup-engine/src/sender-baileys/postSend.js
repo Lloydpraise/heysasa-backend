@@ -152,6 +152,13 @@ export async function recordSuccessfulSend(supabase, { item, contact, business, 
         .update({ current_step: item.campaign_step, status: 'completed' })
         .eq('campaign_id', item.campaign_id)
         .eq('lead_id', item.contact_id)
+
+      const { error: completionError } = await supabase.rpc('complete_campaign_if_finished', {
+        target_campaign_id: item.campaign_id
+      })
+      if (completionError) {
+        console.error(`[Sender] Campaign completion check failed for ${item.campaign_id}: ${completionError.message}`)
+      }
     }
   }
 }

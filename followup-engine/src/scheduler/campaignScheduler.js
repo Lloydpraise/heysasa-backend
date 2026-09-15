@@ -148,6 +148,12 @@ export async function runCampaignScheduler(supabase) {
         // No more steps defined — campaign finished for this lead
         console.warn(`[CampaignScheduler] Completed enrollment ${enrollment.id}: step ${nextStepNumber} not found`)
         await supabase.from('campaign_enrollments').update({ status: 'completed' }).eq('id', enrollment.id)
+        const { error: completionError } = await supabase.rpc('complete_campaign_if_finished', {
+          target_campaign_id: enrollment.campaign_id
+        })
+        if (completionError) {
+          console.error(`[CampaignScheduler] Campaign completion check failed for ${enrollment.campaign_id}: ${completionError.message}`)
+        }
         continue
       }
 
