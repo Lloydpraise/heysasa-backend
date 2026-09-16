@@ -38,6 +38,10 @@ export async function isEvolutionInstanceOpen(instanceName) {
 }
 
 export async function sendViaEvolution(instanceName, phone, message, countryCode = DEFAULT_PHONE_COUNTRY_CODE) {
+  return sendContentViaEvolution(instanceName, phone, { text: message }, countryCode)
+}
+
+export async function sendContentViaEvolution(instanceName, phone, content = {}, countryCode = DEFAULT_PHONE_COUNTRY_CODE) {
   try {
     const number = normalizePhone(phone, countryCode)
     if (!number) return { ok: false, error: 'invalid_phone' }
@@ -45,14 +49,27 @@ export async function sendViaEvolution(instanceName, phone, message, countryCode
       console.warn(`[Evolution] Instance ${instanceName} is not open; send deferred`)
       return { ok: false, error: 'evolution_instance_not_open' }
     }
-    console.log(`[Evolution] Sending message via ${instanceName} to ${number}`)
+    const media = content.media ?? null
+    const endpoint = media ? 'sendMedia' : 'sendText'
+    const payload = media
+      ? {
+          number,
+          mediatype: media.type,
+          mimetype: media.mime_type || undefined,
+          caption: media.caption ?? content.text ?? '',
+          media: media.url,
+          fileName: media.file_name || undefined
+        }
+      : { number, text: content.text ?? '' }
+
+    console.log(`[Evolution] Sending ${media ? media.type : 'text'} via ${instanceName} to ${number}`)
     const controller = new AbortController()
     const timeout = setTimeout(() => controller.abort(), 15000)
 
-    const res = await fetch(`${EVOLUTION_URL}/message/sendText/${encodeURIComponent(instanceName)}`, {
+    const res = await fetch(`${EVOLUTION_URL}/message/${endpoint}/${encodeURIComponent(instanceName)}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'apikey': EVOLUTION_KEY },
-      body: JSON.stringify({ number, text: message }),
+      body: JSON.stringify(payload),
       signal: controller.signal
     })
     clearTimeout(timeout)

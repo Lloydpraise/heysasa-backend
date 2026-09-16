@@ -4,6 +4,10 @@ import { DEFAULT_MSG_COST, DEFAULT_CONSENT_COST } from '../config.js'
 
 export async function recordSuccessfulSend(supabase, { item, contact, business, finalMessage, whatsappMessageId }) {
   const now = new Date().toISOString()
+  const messageType = item.media?.type || 'text'
+  const messageContent = item.media
+    ? { text: finalMessage || item.media.caption || '', type: messageType, media: item.media }
+    : { text: finalMessage || '', type: 'text' }
 
   // Consent messages (touchpoint_type: 'consent', queued by consent.js)
   // get different bookkeeping — they're not a sequence step, so they
@@ -18,7 +22,7 @@ export async function recordSuccessfulSend(supabase, { item, contact, business, 
         conversation_id: item.conversation_id,
         whatsapp_message_id: whatsappMessageId,
         direction: 'out', role: 'ai', agent_role: 'follow_up_ai',
-        type: 'text', content: { text: finalMessage }, status: 'sent', created_at: now
+        type: messageType, content: messageContent, status: 'sent', created_at: now
       }),
       supabase.from('follow_up_queue').update({ status: 'sent', processed_at: now, next_step_processed: true }).eq('id', item.id),
       supabase.from('contacts').update({ consent_message_sent_at: now }).eq('id', item.contact_id),
@@ -41,8 +45,8 @@ export async function recordSuccessfulSend(supabase, { item, contact, business, 
       direction: 'out',
       role: 'ai',
       agent_role: 'follow_up_ai',
-      type: 'text',
-      content: { text: finalMessage },
+      type: messageType,
+      content: messageContent,
       status: 'sent',
       created_at: now
     }),

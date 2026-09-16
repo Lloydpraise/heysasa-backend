@@ -286,11 +286,46 @@ Body:
 
 `number` must not contain the leading `+`. Business follow-ups use the business Evolution instance. Platform alerts use `PLATFORM_EVOLUTION_INSTANCE`.
 
+#### Send customer media
+
+Follow-up queue rows support an optional `media` JSONB value. The frontend should upload the file to the Supabase Storage bucket `customer_images`, then save the resulting public URL or a signed URL that will remain valid until the scheduled send:
+
+```json
+{
+  "type": "image",
+  "url": "https://project.supabase.co/storage/v1/object/public/customer_images/business-id/file.jpg",
+  "mime_type": "image/jpeg",
+  "file_name": "product.jpg",
+  "caption": "Here is the product we discussed"
+}
+```
+
+The frontend stores this object in `follow_up_queue.media` alongside `final_message` (the caption may also be kept in `final_message` for queue previews). Supported `type` values are `image`, `video`, `audio`, and `document`; the current UI request is `image`. URLs must be `http` or `https`, and the backend rejects invalid media before approval or dispatch.
+
+When a queued row has `media`, the follow-up sender calls Evolution's media endpoint instead of the text endpoint:
+
+```http
+POST {EVOLUTION_URL}/message/sendMedia/{instanceName}
+```
+
+```json
+{
+  "number": "254712345678",
+  "mediatype": "image",
+  "mimetype": "image/jpeg",
+  "caption": "Here is the product we discussed",
+  "media": "https://project.supabase.co/storage/v1/object/public/customer_images/business-id/file.jpg",
+  "fileName": "product.jpg"
+}
+```
+
+The sender records the successful outbound row in `messages` with `type: "image"` and the same media object in `content`. Platform owner alerts are still text-only and do not use customer follow-up media.
+
 ### Browser CORS policy
 
-The main backend allows configured origins from `CORS_ORIGINS` (defaulting to `http://localhost:5173`) for `GET`, `POST`, and `OPTIONS`, with `Content-Type` and `Authorization` headers. During local development, any `localhost` or `127.0.0.1` HTTP origin is also allowed so alternate dev-server ports work.
+The main backend allows configured origins from `CORS_ORIGINS` (defaulting to `https://heysasa.co.ke`, `https://www.heysasa.co.ke`, and `http://localhost:5173`) for `GET`, `POST`, and `OPTIONS`, with `Content-Type` and `Authorization` headers. During local development, any `localhost` or `127.0.0.1` HTTP origin is also allowed so alternate dev-server ports work.
 
-The follow-up API also allows `http://localhost:5173` by default. It permits `GET`, `POST`, `PUT`, `DELETE`, and `OPTIONS`, because settings and materials routes use `PUT` and `DELETE`. Set `FOLLOWUP_CORS_ORIGINS` or `CORS_ORIGINS` to a comma-separated list to replace the default origin in deployed environments.
+The follow-up API also allows `https://heysasa.co.ke`, `https://www.heysasa.co.ke`, and `http://localhost:5173` by default. It permits `GET`, `POST`, `PUT`, `DELETE`, and `OPTIONS`, because settings and materials routes use `PUT` and `DELETE`. Set `FOLLOWUP_CORS_ORIGINS` or `CORS_ORIGINS` to a comma-separated list to replace the default origin in deployed environments.
 
 ### External request requirements
 
@@ -612,7 +647,7 @@ Loads up to 50 due queue rows where `status = pending` and `approval_status = ap
 Seeds active campaigns from their `list_members` records, subject to the
 one-active-campaign-per-lead database rule. It then finds due
 `campaign_enrollments`, creates the next `follow_up_queue` row from the
-matching `campaign_steps.content`, and advances the enrollment after a send.
+matching `campaign_steps.content` and optional `campaign_steps.media`, and advances the enrollment after a send.
 Campaign rows are pre-written and do not need AI drafting. Campaign seeding
 defaults to every five minutes and can be changed with
 `CAMPAIGN_SEED_INTERVAL_MS`.

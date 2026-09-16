@@ -30,7 +30,7 @@ dotenv.config();
 const app = express();
 app.use(cors({
     origin: (origin, callback) => {
-        const configuredOrigins = (process.env.CORS_ORIGINS || 'http://localhost:5173')
+        const configuredOrigins = (process.env.CORS_ORIGINS || 'https://heysasa.co.ke,https://www.heysasa.co.ke,http://localhost:5173')
             .split(',')
             .map(value => value.trim())
             .filter(Boolean);

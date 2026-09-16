@@ -2,6 +2,7 @@ import { Router } from 'express'
 import { supabase } from '../supabaseClient.js'
 import { getBusiness, getContact, getPersonaPack, getConversation } from '../lib/db.js'
 import { generateFollowupDraft } from '../scheduler/generateDraft.js'
+import { normalizeOutboundMedia } from '../lib/media.js'
 
 export const queueRouter = Router()
 
@@ -26,7 +27,7 @@ async function loadOwnedAwaitingItem(req, res) {
 queueRouter.get('/queue/pending', async (req, res) => {
   const { data, error } = await supabase
     .from('follow_up_queue')
-    .select('id, contact_id, sequence_step, touchpoint_type, draft_message, qc_passed, qc_notes, scheduled_at')
+    .select('id, contact_id, sequence_step, touchpoint_type, draft_message, media, qc_passed, qc_notes, scheduled_at')
     .eq('business_id', req.businessId)
     .eq('approval_status', 'awaiting_approval')
     .order('scheduled_at', { ascending: true })
@@ -39,7 +40,7 @@ queueRouter.get('/queue/pending', async (req, res) => {
 queueRouter.get('/queue/status', async (req, res) => {
   const { data, error } = await supabase
     .from('follow_up_queue')
-    .select('id, contact_id, campaign_id, campaign_step, sequence_step, touchpoint_type, status, approval_status, channel, final_message, scheduled_at, processed_at, dispatch_attempts, last_dispatch_error, skip_reason, created_at')
+    .select('id, contact_id, campaign_id, campaign_step, sequence_step, touchpoint_type, status, approval_status, channel, final_message, media, scheduled_at, processed_at, dispatch_attempts, last_dispatch_error, skip_reason, created_at')
     .eq('business_id', req.businessId)
     .order('scheduled_at', { ascending: false })
     .limit(100)
@@ -48,7 +49,7 @@ queueRouter.get('/queue/status', async (req, res) => {
   res.json({ items: data })
 })
 
-// POST /queue/:id/approve — { text?: string } — approve as-is, or approve with an inline edit
+// POST /queue/:id/approve — { text?: string, media?: object } — approve as-is, or edit content
 queueRouter.post('/queue/:id/approve', async (req, res) => {
   const item = await loadOwnedAwaitingItem(req, res)
   if (!item) return
@@ -56,14 +57,21 @@ queueRouter.post('/queue/:id/approve', async (req, res) => {
   const business = await getBusiness(supabase, item.business_id)
   if (!business) return res.status(500).json({ error: 'business_not_found' })
 
-  const finalMessage = req.body?.text?.trim() || item.draft_message
-  if (!finalMessage) return res.status(400).json({ error: 'no_message_to_approve' })
+  let media
+  try {
+    media = normalizeOutboundMedia(req.body?.media === undefined ? item.media : req.body.media)
+  } catch (error) {
+    return res.status(400).json({ error: error.message })
+  }
+  const finalMessage = req.body?.text?.trim() || item.draft_message || ''
+  if (!finalMessage && !media) return res.status(400).json({ error: 'no_message_or_media_to_approve' })
 
   await supabase.from('follow_up_queue').update({
     status: 'ready_to_send',
     channel: business.whatsapp_channel,
     final_message: finalMessage,
     draft_message: finalMessage,
+    media,
     approval_status: 'approved'
   }).eq('id', item.id)
 

@@ -9,6 +9,7 @@ import { checkBalance, flagInsufficientFunds } from '../lib/billing.js'
 import { DEFAULT_TIMEZONE } from '../config.js'
 import { calculateSendTime, getZonedParts, leadAgeDays, hoursSince, nextActiveDayDate } from '../lib/timing.js'
 import { generateFollowupDraft, rewriteSuggestedMessage } from './generateDraft.js'
+import { normalizeOutboundMedia } from '../lib/media.js'
 
 export async function runWorker(supabase, queueItemId) {
   if (!queueItemId) throw new Error('queue_item_id required')
@@ -31,6 +32,11 @@ export async function runWorker(supabase, queueItemId) {
   if (itemErr || !item) return skipItem('item_not_found')
   if (item.status !== 'pending') return skipItem('already_processed')
   if (item.approval_status === 'rejected') return skipItem('rejected_by_owner')
+  try {
+    item.media = normalizeOutboundMedia(item.media)
+  } catch (error) {
+    return skipItem(error.message)
+  }
 
   if (item.campaign_id) {
     const { data: campaign, error: campaignError } = await supabase
@@ -174,7 +180,7 @@ export async function runWorker(supabase, queueItemId) {
       await updateQueueItem({
         status: 'ready_to_send', channel: business.whatsapp_channel,
         final_message: finalMessage, draft_message: draft, qc_passed: qcPassed,
-        approval_status: 'approved'
+        approval_status: 'approved', media: item.media
       })
       console.log(`[Worker] Campaign ready to send — campaign:${item.campaign_id} | step:${item.campaign_step} | contact:${item.contact_id}`)
       return { status: 'ready_to_send', step: item.sequence_step, channel: business.whatsapp_channel }
@@ -192,7 +198,7 @@ export async function runWorker(supabase, queueItemId) {
   let draft = item.draft_message
   let qcPassed = item.qc_passed ?? true
   let qcNotes = item.qc_notes ?? null
-  const preWritten = !!(item.final_message || item.draft_message)
+  const preWritten = !!(item.final_message || item.draft_message || item.media)
 
   if (preWritten && item.ai_rewrite_enabled) {
     // Owner wrote it but asked AI to expand/personalize — treat as a
@@ -245,7 +251,8 @@ export async function runWorker(supabase, queueItemId) {
       final_message: finalMessage,
       draft_message: draft,
       qc_passed: qcPassed,
-      approval_status: 'approved'
+      approval_status: 'approved',
+      media: item.media
     })
 
     console.log(`[Worker] Owner-written message ready to send — step:${item.sequence_step} | contact:${item.contact_id}`)
@@ -273,7 +280,8 @@ export async function runWorker(supabase, queueItemId) {
       final_message: finalMessage,
       draft_message: draft,
       qc_passed: qcPassed,
-      approval_status: 'approved'
+      approval_status: 'approved',
+      media: item.media
     })
 
     console.log(`[Worker] Ready to send — channel:${business.whatsapp_channel} | step:${item.sequence_step} | contact:${item.contact_id}`)

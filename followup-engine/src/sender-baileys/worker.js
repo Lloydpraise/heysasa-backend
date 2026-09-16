@@ -1,6 +1,6 @@
 import { supabase } from '../supabaseClient.js'
 import { getBusiness, getContact } from '../lib/db.js'
-import { isEvolutionInstanceOpen, sendViaEvolution } from './evolutionSender.js'
+import { isEvolutionInstanceOpen, sendContentViaEvolution } from './evolutionSender.js'
 import { checkAntiban, recordSend } from './antiban.js'
 import { recordSuccessfulSend, recordFailedDispatch } from './postSend.js'
 
@@ -168,7 +168,10 @@ export async function processBaileysBatch() {
       }
       if (!claimedItem) continue
 
-      const result = await sendViaEvolution(activeSession.instance_name, contact.phone, item.final_message, contact.country_code)
+      const result = await sendContentViaEvolution(activeSession.instance_name, contact.phone, {
+        text: item.final_message,
+        media: item.media
+      }, contact.country_code)
 
       if (!result.ok) {
         await recordFailedDispatch(supabase, item, result.error ?? 'send_failed')

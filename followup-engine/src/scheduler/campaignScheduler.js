@@ -140,7 +140,7 @@ export async function runCampaignScheduler(supabase) {
       const nextStepNumber = (enrollment.current_step ?? 0) + 1
       const { data: step } = await supabase
         .from('campaign_steps')
-        .select('step_number, content, delay_hours')
+        .select('step_number, content, media, delay_hours')
         .eq('campaign_id', enrollment.campaign_id)
         .eq('step_number', nextStepNumber)
         .maybeSingle()
@@ -191,6 +191,7 @@ export async function runCampaignScheduler(supabase) {
         touchpoint_type: 'campaign',
         klt_phase: 'know',
         final_message: resolveMergeFields(step.content, contact),
+        media: step.media ?? null,
         approval_status: 'approved',
         status: 'pending',
         scheduled_at: now

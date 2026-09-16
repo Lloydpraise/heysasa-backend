@@ -10,7 +10,7 @@ export const EVOLUTION_WEBHOOK_URL = process.env.EVOLUTION_WEBHOOK_URL ?? ''
 
 export const OPENAI_KEY = process.env.OPENAI_API_KEY ?? ''
 export const OPENAI_MODEL = 'gpt-4.1-mini'
-export const CORS_ORIGINS = (process.env.FOLLOWUP_CORS_ORIGINS ?? process.env.CORS_ORIGINS ?? 'http://localhost:5173')
+export const CORS_ORIGINS = (process.env.FOLLOWUP_CORS_ORIGINS ?? process.env.CORS_ORIGINS ?? 'https://heysasa.co.ke,https://www.heysasa.co.ke,http://localhost:5173')
 	.split(',')
 	.map(origin => origin.trim())
 	.filter(Boolean)
