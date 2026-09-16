@@ -18,6 +18,38 @@ async function selectedInstanceAvailable(supabase, campaign) {
   return Boolean(session && await isEvolutionInstanceOpen(campaign.whatsapp_instance_name))
 }
 
+// A failed check here can mean the instance is genuinely disconnected —
+// or it can mean a single transient blip (Evolution API timeout, a DNS
+// hiccup reaching Supabase, a momentary network drop). isEvolutionInstanceOpen
+// treats any such error as "not open" with no distinction. Killing an
+// active campaign on the strength of one failed check is too aggressive:
+// this happened for real on lashesbyshazz's "Price Update Notice"
+// campaign, which was permanently failed (and 368 remaining messages
+// skipped) after 55 successful sends, off a single bad health check,
+// while the WhatsApp instance was never actually disconnected.
+//
+// Requiring several consecutive failures (spaced ~CAMPAIGN_SEED_INTERVAL_MS
+// apart) before giving up still catches a genuinely dead instance within
+// a few cycles, without a one-off blip destroying a healthy campaign.
+const INSTANCE_FAILURE_THRESHOLD = 3
+const instanceCheckFailures = new Map() // campaignId -> consecutive failure count (in-memory; resets on restart, which just costs a few extra checks)
+
+async function checkInstanceStatus(supabase, campaign) {
+  const available = await selectedInstanceAvailable(supabase, campaign)
+  if (available) {
+    instanceCheckFailures.delete(campaign.id)
+    return 'ok'
+  }
+  const failures = (instanceCheckFailures.get(campaign.id) ?? 0) + 1
+  instanceCheckFailures.set(campaign.id, failures)
+  if (failures < INSTANCE_FAILURE_THRESHOLD) {
+    console.warn(`[CampaignScheduler] Instance check failed for campaign ${campaign.id} (${failures}/${INSTANCE_FAILURE_THRESHOLD}) — retrying next cycle, not failing yet`)
+    return 'retry'
+  }
+  instanceCheckFailures.delete(campaign.id)
+  return 'failed'
+}
+
 async function failCampaign(supabase, campaignId, reason) {
   await supabase.from('campaigns').update({ status: 'failed', failure_reason: reason, failed_at: new Date().toISOString() }).eq('id', campaignId).eq('status', 'active')
   await supabase.from('follow_up_queue')
@@ -38,8 +70,10 @@ async function seedCampaignEnrollments(supabase) {
 
   let enrolled = 0
   for (const campaign of campaigns ?? []) {
-    if (!(await selectedInstanceAvailable(supabase, campaign))) {
-      console.error(`[CampaignScheduler] Campaign ${campaign.id} failed: selected WhatsApp instance is unavailable`)
+    const instanceStatus = await checkInstanceStatus(supabase, campaign)
+    if (instanceStatus === 'retry') continue
+    if (instanceStatus === 'failed') {
+      console.error(`[CampaignScheduler] Campaign ${campaign.id} failed: selected WhatsApp instance unavailable after ${INSTANCE_FAILURE_THRESHOLD} consecutive checks`)
       await failCampaign(supabase, campaign.id, 'campaign_instance_unavailable')
       continue
     }
@@ -162,7 +196,9 @@ export async function runCampaignScheduler(supabase) {
         console.warn(`[CampaignScheduler] Skipped enrollment ${enrollment.id}: campaign status is ${campaign.status}`)
         continue
       }
-      if (!(await selectedInstanceAvailable(supabase, campaign))) {
+      const instanceStatus = await checkInstanceStatus(supabase, campaign)
+      if (instanceStatus === 'retry') continue
+      if (instanceStatus === 'failed') {
         await failCampaign(supabase, campaign.id, 'campaign_instance_unavailable')
         continue
       }
