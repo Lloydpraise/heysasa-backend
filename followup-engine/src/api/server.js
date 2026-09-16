@@ -11,7 +11,11 @@ const PORT = parseInt(process.env.PORT ?? '3001')
 
 const app = express()
 app.use(cors({
-  origin: CORS_ORIGINS.length ? CORS_ORIGINS : false,
+  origin: (origin, callback) => {
+    const isLocalDevelopmentOrigin = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin || '')
+    const isConfiguredOrigin = !origin || CORS_ORIGINS.includes(origin)
+    callback(null, isLocalDevelopmentOrigin || isConfiguredOrigin)
+  },
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Authorization', 'Content-Type', 'X-Business-Id'],
 }))
