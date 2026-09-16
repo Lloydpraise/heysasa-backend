@@ -17,6 +17,7 @@ import {
     cancelPendingFollowUps 
 } from './dbService.js';
 import { debugLog } from './debugConsole.js';
+import { deleteSessionRecord } from './evolutionConnections.js';
 
 export async function resolveBusinessId(payload) {
     const instanceName = payload?.instance || payload?.data?.instance;
@@ -45,7 +46,13 @@ export async function processConnectionUpdate(payload, businessId) {
     const isConnected = state === 'open' || state === 'connected';
     const isDisconnected = state === 'close' || state === 'closed' || state === 'disconnected';
     const instanceName = payload?.instance || data.instance;
-    const sessionStatus = isConnected ? 'connected' : isDisconnected ? 'disconnected' : 'pending';
+    if (isDisconnected) {
+        if (!instanceName) throw new Error('evolution_instance_missing');
+        await deleteSessionRecord(instanceName, businessId);
+        console.log(`[Webhook] Removed inactive WhatsApp session ${instanceName}`);
+        return;
+    }
+    const sessionStatus = isConnected ? 'connected' : 'pending';
     const values = {
         business_id: businessId,
         instance_name: instanceName,

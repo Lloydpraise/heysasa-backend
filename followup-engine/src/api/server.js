@@ -5,6 +5,7 @@ import { queueRouter } from './queueRoutes.js'
 import { followupSettingsRouter } from './followupSettingsRoutes.js'
 import { materialsRouter } from './materialsRoutes.js'
 import { whatsappRouter } from './whatsappRoutes.js'
+import { campaignRouter } from './campaignRoutes.js'
 import { CORS_ORIGINS } from '../config.js'
 
 const PORT = parseInt(process.env.PORT ?? '3001')
@@ -25,6 +26,7 @@ app.use(queueRouter)
 app.use(followupSettingsRouter)
 app.use(materialsRouter)
 app.use(whatsappRouter)
+app.use(campaignRouter)
 
 app.listen(PORT, () => {
   console.log(`[API] Listening on :${PORT}`)

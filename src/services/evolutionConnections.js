@@ -209,10 +209,10 @@ export async function markSessionConnected(instanceName, { phoneNumber, sessionD
 export async function markSessionDisconnected(instanceName) {
     const { data, error } = await supabase
         .from('whatsapp_sessions')
-        .update({ status: 'disconnected', updated_at: new Date().toISOString() })
+        .delete()
         .eq('instance_name', instanceName)
         .select()
-        .single();
+        .maybeSingle();
     if (error) throw error;
     return data;
 }
@@ -234,6 +234,17 @@ export async function getSessionsForBusiness(businessId) {
         .eq('business_id', businessId);
     if (error) throw error;
     return data;
+}
+
+export async function deleteSessionRecord(instanceName, businessId = null) {
+    let query = supabase
+        .from('whatsapp_sessions')
+        .delete()
+        .eq('instance_name', instanceName);
+    if (businessId) query = query.eq('business_id', businessId);
+
+    const { error } = await query;
+    if (error) throw error;
 }
 
 export async function deleteEvolutionInstance(instanceName) {

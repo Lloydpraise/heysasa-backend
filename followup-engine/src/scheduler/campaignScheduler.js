@@ -1,14 +1,35 @@
 import { getContact, getConversation } from '../lib/db.js'
-import { resolveMergeFields } from '../lib/mergeFields.js'
+import { resolveMediaMergeFields, resolveMergeFields } from '../lib/mergeFields.js'
+import { isEvolutionInstanceOpen } from '../sender-baileys/evolutionSender.js'
 
 const BATCH_SIZE = 30
 const CAMPAIGN_SEED_INTERVAL_MS = parseInt(process.env.CAMPAIGN_SEED_INTERVAL_MS ?? `${5 * 60_000}`)
 let lastCampaignSeedAt = 0
 
+async function selectedInstanceAvailable(supabase, campaign) {
+  if (!campaign.whatsapp_instance_name) return false
+  const { data: session } = await supabase
+    .from('whatsapp_sessions')
+    .select('instance_name')
+    .eq('business_id', campaign.business_id)
+    .eq('instance_name', campaign.whatsapp_instance_name)
+    .eq('status', 'connected')
+    .maybeSingle()
+  return Boolean(session && await isEvolutionInstanceOpen(campaign.whatsapp_instance_name))
+}
+
+async function failCampaign(supabase, campaignId, reason) {
+  await supabase.from('campaigns').update({ status: 'failed', failure_reason: reason, failed_at: new Date().toISOString() }).eq('id', campaignId).eq('status', 'active')
+  await supabase.from('follow_up_queue')
+    .update({ status: 'failed', last_dispatch_error: reason })
+    .eq('campaign_id', campaignId)
+    .in('status', ['pending', 'ready_to_send', 'sending'])
+}
+
 async function seedCampaignEnrollments(supabase) {
   const { data: campaigns, error: campaignError } = await supabase
     .from('campaigns')
-    .select('id, business_id, list_id')
+    .select('id, business_id, list_id, whatsapp_instance_name')
     .eq('status', 'active')
     .not('list_id', 'is', null)
     .order('created_at', { ascending: true })
@@ -17,6 +38,11 @@ async function seedCampaignEnrollments(supabase) {
 
   let enrolled = 0
   for (const campaign of campaigns ?? []) {
+    if (!(await selectedInstanceAvailable(supabase, campaign))) {
+      console.error(`[CampaignScheduler] Campaign ${campaign.id} failed: selected WhatsApp instance is unavailable`)
+      await failCampaign(supabase, campaign.id, 'campaign_instance_unavailable')
+      continue
+    }
     const { data: members, error: memberError } = await supabase
       .from('list_members')
       .select('lead_id')
@@ -125,7 +151,7 @@ export async function runCampaignScheduler(supabase) {
       console.log(`[CampaignScheduler] Checking enrollment ${enrollment.id} campaign:${enrollment.campaign_id} lead:${enrollment.lead_id} step:${(enrollment.current_step ?? 0) + 1}`)
       const { data: campaign } = await supabase
         .from('campaigns')
-        .select('id, business_id, status')
+        .select('id, business_id, status, whatsapp_instance_name')
         .eq('id', enrollment.campaign_id)
         .single()
       if (!campaign) {
@@ -134,6 +160,10 @@ export async function runCampaignScheduler(supabase) {
       }
       if (campaign.status !== 'active') {
         console.warn(`[CampaignScheduler] Skipped enrollment ${enrollment.id}: campaign status is ${campaign.status}`)
+        continue
+      }
+      if (!(await selectedInstanceAvailable(supabase, campaign))) {
+        await failCampaign(supabase, campaign.id, 'campaign_instance_unavailable')
         continue
       }
 
@@ -191,7 +221,8 @@ export async function runCampaignScheduler(supabase) {
         touchpoint_type: 'campaign',
         klt_phase: 'know',
         final_message: resolveMergeFields(step.content, contact),
-        media: step.media ?? null,
+        media: resolveMediaMergeFields(step.media, contact),
+        assigned_instance_name: campaign.whatsapp_instance_name,
         approval_status: 'approved',
         status: 'pending',
         scheduled_at: now

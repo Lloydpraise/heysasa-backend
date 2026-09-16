@@ -8,8 +8,28 @@ import {
   getEvolutionConnectionState,
   saveConnectionState,
 } from '../../../src/services/evolutionConnections.js'
+import { isEvolutionInstanceOpen } from '../sender-baileys/evolutionSender.js'
 
 export const whatsappRouter = Router()
+
+whatsappRouter.get('/whatsapp/instances', async (req, res) => {
+  const { data: sessions, error } = await supabase
+    .from('whatsapp_sessions')
+    .select('id, instance_name, status, phone_number, updated_at')
+    .eq('business_id', req.businessId)
+    .eq('status', 'connected')
+    .order('updated_at', { ascending: false })
+
+  if (error) return res.status(500).json({ error: error.message })
+
+  const instances = []
+  for (const session of sessions ?? []) {
+    if (await isEvolutionInstanceOpen(session.instance_name)) {
+      instances.push({ ...session, connected: true })
+    }
+  }
+  res.json({ instances })
+})
 
 async function ensureInstance(businessId) {
   const { data: business, error } = await supabase

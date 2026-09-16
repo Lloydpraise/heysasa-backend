@@ -10,6 +10,8 @@ import { DEFAULT_TIMEZONE } from '../config.js'
 import { calculateSendTime, getZonedParts, leadAgeDays, hoursSince, nextActiveDayDate } from '../lib/timing.js'
 import { generateFollowupDraft, rewriteSuggestedMessage } from './generateDraft.js'
 import { normalizeOutboundMedia } from '../lib/media.js'
+import { isEvolutionInstanceOpen } from '../sender-baileys/evolutionSender.js'
+import { resolveMediaMergeFields, resolveMergeFields } from '../lib/mergeFields.js'
 
 export async function runWorker(supabase, queueItemId) {
   if (!queueItemId) throw new Error('queue_item_id required')
@@ -40,9 +42,19 @@ export async function runWorker(supabase, queueItemId) {
 
   if (item.campaign_id) {
     const { data: campaign, error: campaignError } = await supabase
-      .from('campaigns').select('status').eq('id', item.campaign_id).maybeSingle()
+      .from('campaigns').select('status, business_id, whatsapp_instance_name').eq('id', item.campaign_id).maybeSingle()
     if (campaignError) throw new Error(`campaign status lookup failed: ${campaignError.message}`)
     if (!campaign || campaign.status !== 'active') return skipItem('campaign_inactive')
+    const selectedInstance = item.assigned_instance_name || campaign.whatsapp_instance_name
+    const { data: session } = await supabase.from('whatsapp_sessions')
+      .select('instance_name').eq('business_id', item.business_id)
+      .eq('instance_name', selectedInstance).eq('status', 'connected').maybeSingle()
+    if (!selectedInstance || !session || !(await isEvolutionInstanceOpen(selectedInstance))) {
+      await supabase.from('campaigns').update({ status: 'failed', failure_reason: 'campaign_instance_unavailable', failed_at: new Date().toISOString() }).eq('id', item.campaign_id).eq('status', 'active')
+      await updateQueueItem({ status: 'failed', last_dispatch_error: 'campaign_instance_unavailable' })
+      return { status: 'failed', reason: 'campaign_instance_unavailable' }
+    }
+    item.assigned_instance_name = selectedInstance
   }
 
   // ── 2. Load contact + business ───────────────────────────────
@@ -156,6 +168,8 @@ export async function runWorker(supabase, queueItemId) {
     let draft = item.draft_message
     let qcPassed = item.qc_passed ?? true
     let qcNotes = item.qc_notes ?? null
+    finalMessage = resolveMergeFields(finalMessage, contact)
+    item.media = resolveMediaMergeFields(item.media, contact)
 
     if (campaign?.ai_rewrite_enabled) {
       const result = await rewriteSuggestedMessage(supabase, item.final_message, contact, business, pack, conv)

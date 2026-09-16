@@ -112,20 +112,23 @@ export async function processBaileysBatch() {
         continue
       }
 
-      // business.evolution_instance_id is a denormalized copy that's never
-      // kept in sync when a business reconnects/re-scans — only
-      // whatsapp_sessions.instance_name is reliably updated (by
-      // saveConnectionState/markSessionConnected/processConnectionUpdate on
-      // the main backend). Confirmed via Supabase: this business's
-      // evolution_instance_id pointed at an instance name that doesn't even
-      // appear in its own whatsapp_sessions history anymore. Look up the
-      // live connected instance directly instead of trusting the stale copy.
-      const { data: session, error: sessionError } = await supabase
+      const { data: campaign } = item.campaign_id
+        ? await supabase.from('campaigns').select('whatsapp_instance_name, status').eq('id', item.campaign_id).maybeSingle()
+        : { data: null }
+      if (item.campaign_id && (!campaign || campaign.status !== 'active' || !item.assigned_instance_name || campaign.whatsapp_instance_name !== item.assigned_instance_name)) {
+        await supabase.from('campaigns').update({ status: 'failed', failure_reason: 'campaign_instance_unavailable', failed_at: new Date().toISOString() }).eq('id', item.campaign_id).eq('status', 'active')
+        await supabase.from('follow_up_queue').update({ status: 'failed', last_dispatch_error: 'campaign_instance_unavailable' }).eq('id', item.id)
+        continue
+      }
+
+      const sessionQuery = supabase
         .from('whatsapp_sessions')
         .select('instance_name')
         .eq('business_id', item.business_id)
         .eq('status', 'connected')
-        .order('updated_at', { ascending: false })
+      const { data: session, error: sessionError } = item.campaign_id
+        ? await sessionQuery.eq('instance_name', item.assigned_instance_name).limit(1)
+        : await sessionQuery.order('updated_at', { ascending: false })
 
       if (sessionError) {
         await recordFailedDispatch(supabase, item, `session_lookup_failed: ${sessionError.message}`)

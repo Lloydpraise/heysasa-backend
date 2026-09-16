@@ -16,3 +16,11 @@ export function resolveMergeFields(content, contact) {
   if (!content) return content
   return content.replace(/\{\{\s*first_name\s*\}\}/gi, firstName(contact))
 }
+
+export function resolveMediaMergeFields(media, contact) {
+  if (!media || typeof media !== 'object') return media
+  return {
+    ...media,
+    ...(media.caption ? { caption: resolveMergeFields(media.caption, contact) } : {})
+  }
+}
