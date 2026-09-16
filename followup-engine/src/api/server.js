@@ -13,7 +13,7 @@ const app = express()
 app.use(cors({
   origin: CORS_ORIGINS.length ? CORS_ORIGINS : false,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Authorization', 'Content-Type'],
+  allowedHeaders: ['Authorization', 'Content-Type', 'X-Business-Id'],
 }))
 app.use(express.json())
 app.use(requireBusinessAuth)

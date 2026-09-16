@@ -325,7 +325,7 @@ The sender records the successful outbound row in `messages` with `type: "image"
 
 The main backend allows configured origins from `CORS_ORIGINS` (defaulting to `https://heysasa.co.ke`, `https://www.heysasa.co.ke`, and `http://localhost:5173`) for `GET`, `POST`, and `OPTIONS`, with `Content-Type` and `Authorization` headers. During local development, any `localhost` or `127.0.0.1` HTTP origin is also allowed so alternate dev-server ports work.
 
-The follow-up API also allows `https://heysasa.co.ke`, `https://www.heysasa.co.ke`, and `http://localhost:5173` by default. It permits `GET`, `POST`, `PUT`, `DELETE`, and `OPTIONS`, because settings and materials routes use `PUT` and `DELETE`. Set `FOLLOWUP_CORS_ORIGINS` or `CORS_ORIGINS` to a comma-separated list to replace the default origin in deployed environments.
+The follow-up API allows configured production origins and any HTTP/HTTPS `localhost` or `127.0.0.1` origin for local development. It permits `GET`, `POST`, `PUT`, `DELETE`, and `OPTIONS`, because settings and materials routes use `PUT` and `DELETE`. Set `FOLLOWUP_CORS_ORIGINS` or `CORS_ORIGINS` to a comma-separated list for deployed production origins.
 
 ### External request requirements
 
