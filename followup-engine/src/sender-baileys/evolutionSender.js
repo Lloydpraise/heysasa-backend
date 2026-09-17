@@ -14,9 +14,20 @@ export function normalizePhone(phone, countryCode = DEFAULT_PHONE_COUNTRY_CODE) 
 const connectionStateCache = new Map()
 const CONNECTION_STATE_CACHE_MS = 10_000
 
-export async function isEvolutionInstanceOpen(instanceName) {
+// Returns the instance's real connection state, distinguishing a
+// confirmed answer from Evolution API ({ open: true/false, error: null })
+// from a check that couldn't complete at all ({ open: null, error }) —
+// a timeout, a DNS failure, Evolution being briefly unreachable. These
+// are not the same thing: a confirmed "not open" means the WhatsApp
+// session is genuinely disconnected; a failed check means we simply
+// don't know yet. Conflating them (as this used to do, returning a
+// bare `false` for both) caused a healthy, connected campaign to be
+// killed off a single network blip. Error results are deliberately
+// NOT cached — caching a transient failure would keep reporting "closed"
+// for the full cache window even after the network recovers.
+export async function checkEvolutionInstanceState(instanceName) {
   const cached = connectionStateCache.get(instanceName)
-  if (cached && cached.expiresAt > Date.now()) return cached.open
+  if (cached && cached.expiresAt > Date.now()) return { open: cached.open, error: null }
 
   try {
     const controller = new AbortController()
@@ -30,11 +41,21 @@ export async function isEvolutionInstanceOpen(instanceName) {
     const state = body?.instance?.state ?? body?.state
     const open = res.ok && state === 'open'
     connectionStateCache.set(instanceName, { open, expiresAt: Date.now() + CONNECTION_STATE_CACHE_MS })
-    return open
-  } catch {
-    connectionStateCache.set(instanceName, { open: false, expiresAt: Date.now() + CONNECTION_STATE_CACHE_MS })
-    return false
+    return { open, error: null }
+  } catch (err) {
+    return { open: null, error: err }
   }
+}
+
+// Boolean convenience wrapper for callers (the send path) that just need
+// a yes/no answer and should treat "couldn't check" the same as "not
+// open" — you shouldn't send a message when you can't confirm the
+// instance is connected. The scheduler's health check needs the richer
+// tri-state above instead, since for *that* purpose an unconfirmed check
+// must NOT be treated as a confirmed disconnect.
+export async function isEvolutionInstanceOpen(instanceName) {
+  const { open } = await checkEvolutionInstanceState(instanceName)
+  return open === true
 }
 
 export async function sendViaEvolution(instanceName, phone, message, countryCode = DEFAULT_PHONE_COUNTRY_CODE) {

@@ -1,49 +1,77 @@
 import { getContact, getConversation } from '../lib/db.js'
 import { resolveMediaMergeFields, resolveMergeFields } from '../lib/mergeFields.js'
-import { isEvolutionInstanceOpen } from '../sender-baileys/evolutionSender.js'
+import { checkEvolutionInstanceState } from '../sender-baileys/evolutionSender.js'
 
 const BATCH_SIZE = 30
 const CAMPAIGN_SEED_INTERVAL_MS = parseInt(process.env.CAMPAIGN_SEED_INTERVAL_MS ?? `${5 * 60_000}`)
 let lastCampaignSeedAt = 0
 
+// Checks whether the campaign's WhatsApp instance is genuinely
+// connected. Returns 'available', 'unavailable' (a confirmed answer
+// that it's not connected), or 'unknown' (the check itself failed —
+// a Supabase query error, a DNS blip reaching Evolution API, a
+// timeout — which says nothing about the instance either way).
 async function selectedInstanceAvailable(supabase, campaign) {
-  if (!campaign.whatsapp_instance_name) return false
-  const { data: session } = await supabase
+  if (!campaign.whatsapp_instance_name) return 'unavailable'
+
+  const { data: session, error: sessionError } = await supabase
     .from('whatsapp_sessions')
     .select('instance_name')
     .eq('business_id', campaign.business_id)
     .eq('instance_name', campaign.whatsapp_instance_name)
     .eq('status', 'connected')
     .maybeSingle()
-  return Boolean(session && await isEvolutionInstanceOpen(campaign.whatsapp_instance_name))
+
+  if (sessionError) {
+    console.warn(`[CampaignScheduler] whatsapp_sessions check errored for campaign ${campaign.id}: ${sessionError.message} — treating as unknown, not unavailable`)
+    return 'unknown'
+  }
+  if (!session) return 'unavailable'
+
+  const { open, error: evolutionError } = await checkEvolutionInstanceState(campaign.whatsapp_instance_name)
+  if (evolutionError) {
+    console.warn(`[CampaignScheduler] Evolution connection check errored for campaign ${campaign.id}: ${evolutionError.message} — treating as unknown, not unavailable`)
+    return 'unknown'
+  }
+  return open ? 'available' : 'unavailable'
 }
 
-// A failed check here can mean the instance is genuinely disconnected —
-// or it can mean a single transient blip (Evolution API timeout, a DNS
-// hiccup reaching Supabase, a momentary network drop). isEvolutionInstanceOpen
-// treats any such error as "not open" with no distinction. Killing an
-// active campaign on the strength of one failed check is too aggressive:
-// this happened for real on lashesbyshazz's "Price Update Notice"
-// campaign, which was permanently failed (and 368 remaining messages
-// skipped) after 55 successful sends, off a single bad health check,
-// while the WhatsApp instance was never actually disconnected.
+// A confirmed 'unavailable' result can still mean the instance is
+// genuinely disconnected, or it can mean a single transient blip that
+// nonetheless produced a definite (if wrong) answer. Killing an active
+// campaign on the strength of one such result is too aggressive: this
+// happened for real on lashesbyshazz's "Price Update Notice" campaign,
+// which was permanently failed after 55 successful sends off a single
+// bad health check, while the WhatsApp instance was never actually
+// disconnected. A later 'unknown' result (Supabase/Evolution
+// unreachable — e.g. the VPS's own DNS intermittently failing to
+// resolve Supabase's host) doesn't count toward this at all, since it
+// isn't evidence of anything.
 //
-// Requiring several consecutive failures (spaced ~CAMPAIGN_SEED_INTERVAL_MS
-// apart) before giving up still catches a genuinely dead instance within
-// a few cycles, without a one-off blip destroying a healthy campaign.
+// Requiring several consecutive confirmed failures (spaced
+// ~CAMPAIGN_SEED_INTERVAL_MS apart) before giving up still catches a
+// genuinely dead instance within a few cycles, without a blip — or a
+// string of "we couldn't check" results — destroying a healthy campaign.
 const INSTANCE_FAILURE_THRESHOLD = 3
-const instanceCheckFailures = new Map() // campaignId -> consecutive failure count (in-memory; resets on restart, which just costs a few extra checks)
+const instanceCheckFailures = new Map() // campaignId -> consecutive confirmed-failure count (in-memory; resets on restart, which just costs a few extra checks)
 
 async function checkInstanceStatus(supabase, campaign) {
-  const available = await selectedInstanceAvailable(supabase, campaign)
-  if (available) {
+  const status = await selectedInstanceAvailable(supabase, campaign)
+
+  if (status === 'available') {
     instanceCheckFailures.delete(campaign.id)
     return 'ok'
   }
+
+  if (status === 'unknown') {
+    console.warn(`[CampaignScheduler] Instance check for campaign ${campaign.id} was inconclusive — retrying next cycle, not counted as a failure`)
+    return 'retry'
+  }
+
   const failures = (instanceCheckFailures.get(campaign.id) ?? 0) + 1
   instanceCheckFailures.set(campaign.id, failures)
   if (failures < INSTANCE_FAILURE_THRESHOLD) {
-    console.warn(`[CampaignScheduler] Instance check failed for campaign ${campaign.id} (${failures}/${INSTANCE_FAILURE_THRESHOLD}) — retrying next cycle, not failing yet`)
+    console.warn(`[CampaignScheduler] Instance confirmed unavailable for campaign ${campaign.id} (${failures}/${INSTANCE_FAILURE_THRESHOLD}) — retrying next cycle, not failing yet`)
     return 'retry'
   }
   instanceCheckFailures.delete(campaign.id)
