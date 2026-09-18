@@ -95,14 +95,8 @@ async function seedCampaignEnrollments(supabase) {
   for (const campaign of campaigns ?? []) {
     const instanceStatus = await checkInstanceStatus(supabase, campaign)
     if (instanceStatus === 'retry') continue
-    if (instanceStatus === 'paused') {
-      console.warn(`[CampaignScheduler] Campaign ${campaign.id} paused: selected WhatsApp instance unavailable after grace window`)
-      await pauseCampaign(supabase, campaign.id, 'campaign_instance_unavailable')
-      continue
-    }
-    if (instanceStatus === 'failed') {
-      console.error(`[CampaignScheduler] Campaign ${campaign.id} failed: selected WhatsApp instance remained unavailable after pause/retry grace period`)
-      await failCampaign(supabase, campaign.id, 'campaign_instance_unavailable')
+    if (instanceStatus === 'locked') {
+      console.warn(`[CampaignScheduler] Campaign ${campaign.id} is locked because the WhatsApp session is closed; not auto-pausing or failing the campaign`)
       continue
     }
     if (campaign.status === 'paused') {
@@ -242,12 +236,8 @@ export async function runCampaignScheduler(supabase) {
       }
       const instanceStatus = await checkInstanceStatus(supabase, campaign)
       if (instanceStatus === 'retry') continue
-      if (instanceStatus === 'paused') {
-        await pauseCampaign(supabase, campaign.id, 'campaign_instance_unavailable')
-        continue
-      }
-      if (instanceStatus === 'failed') {
-        await failCampaign(supabase, campaign.id, 'campaign_instance_unavailable')
+      if (instanceStatus === 'locked') {
+        console.warn(`[CampaignScheduler] Campaign ${campaign.id} is locked because the WhatsApp session is closed; skipping queue work until the session reconnects`)
         continue
       }
 

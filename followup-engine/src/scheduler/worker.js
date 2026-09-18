@@ -58,15 +58,7 @@ export async function runWorker(supabase, queueItemId) {
     // result is inconclusive or hasn't failed enough times to trust.
     const instanceStatus = await checkInstanceStatus(supabase, { id: campaign.id, business_id: item.business_id, whatsapp_instance_name: selectedInstance, status: campaign.status })
     if (instanceStatus === 'retry') return { status: 'retry', reason: 'instance_check_inconclusive' }
-    if (instanceStatus === 'paused') {
-      await supabase.from('campaigns').update({ status: 'paused', failure_reason: 'campaign_instance_unavailable', failed_at: null }).eq('id', item.campaign_id).in('status', ['active', 'paused'])
-      return { status: 'paused', reason: 'instance_check_paused' }
-    }
-    if (instanceStatus === 'failed') {
-      await supabase.from('campaigns').update({ status: 'failed', failure_reason: 'campaign_instance_unavailable', failed_at: new Date().toISOString() }).eq('id', item.campaign_id).eq('status', 'active')
-      await updateQueueItem({ status: 'failed', last_dispatch_error: 'campaign_instance_unavailable' })
-      return { status: 'failed', reason: 'campaign_instance_unavailable' }
-    }
+    if (instanceStatus === 'locked') return { status: 'locked', reason: 'instance_session_closed' }
     item.assigned_instance_name = selectedInstance
   }
 
