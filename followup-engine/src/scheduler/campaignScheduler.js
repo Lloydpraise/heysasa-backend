@@ -21,6 +21,66 @@ async function failCampaign(supabase, campaignId, reason) {
     .in('status', ['pending', 'ready_to_send', 'sending'])
 }
 
+async function retryFailedCampaignItems(supabase, campaignId) {
+  const { data: failedItems, error } = await supabase
+    .from('follow_up_queue')
+    .select('id, contact_id, campaign_step, last_dispatch_error')
+    .eq('campaign_id', campaignId)
+    .eq('status', 'failed')
+    .order('created_at', { ascending: true })
+
+  if (error) {
+    console.error(`[CampaignScheduler] Failed queue lookup for campaign ${campaignId}: ${error.message}`)
+    return
+  }
+
+  if (!failedItems?.length) return
+
+  const idsToRetry = []
+  for (const item of failedItems) {
+    const msg = item.last_dispatch_error ?? ''
+    if (msg.includes('exists') && msg.includes('false')) continue
+    if (msg.includes('not on whatsapp') || msg.includes('not registered')) continue
+
+    const { data: existing, error: duplicateError } = await supabase
+      .from('follow_up_queue')
+      .select('id')
+      .eq('campaign_id', campaignId)
+      .eq('contact_id', item.contact_id)
+      .eq('campaign_step', item.campaign_step)
+      .in('status', ['pending', 'ready_to_send', 'sending', 'sent'])
+      .maybeSingle()
+
+    if (duplicateError) {
+      console.error(`[CampaignScheduler] Duplicate check failed for ${campaignId}/${item.contact_id}/${item.campaign_step}: ${duplicateError.message}`)
+      continue
+    }
+    if (existing) continue
+
+    idsToRetry.push(item.id)
+  }
+
+  if (!idsToRetry.length) return
+
+  const { error: retryError } = await supabase
+    .from('follow_up_queue')
+    .update({
+      status: 'pending',
+      scheduled_at: new Date().toISOString(),
+      skip_reason: null,
+      last_dispatch_error: null,
+      approval_status: 'approved'
+    })
+    .in('id', idsToRetry)
+
+  if (retryError) {
+    console.error(`[CampaignScheduler] Could not requeue failed campaign items for ${campaignId}: ${retryError.message}`)
+    return
+  }
+
+  console.log(`[CampaignScheduler] Requeued ${idsToRetry.length} recoverable failed items for campaign ${campaignId}`)
+}
+
 async function seedCampaignEnrollments(supabase) {
   const { data: campaigns, error: campaignError } = await supabase
     .from('campaigns')
@@ -149,6 +209,19 @@ export async function runCampaignScheduler(supabase) {
   }
   console.log(`[CampaignScheduler] Due enrollments found: ${due?.length ?? 0}`)
   if (!due?.length) return { queued: 0 }
+
+  const activeCampaignIds = new Set((due ?? []).map(item => item.campaign_id))
+  for (const campaignId of activeCampaignIds) {
+    const { data: campaign } = await supabase
+      .from('campaigns')
+      .select('id, status')
+      .eq('id', campaignId)
+      .single()
+
+    if (campaign?.status === 'active') {
+      await retryFailedCampaignItems(supabase, campaignId)
+    }
+  }
 
   let queued = 0
   for (const enrollment of due) {

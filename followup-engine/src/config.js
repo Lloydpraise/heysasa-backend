@@ -38,5 +38,5 @@ export const SENDER_POLL_INTERVAL_MS = parseInt(process.env.SENDER_POLL_INTERVAL
 // ── Antiban defaults (system-set, not exposed to business config) ──
 export const ANTIBAN_MIN_GAP_MS = 20_000       // floor gap between sends per business instance
 export const ANTIBAN_JITTER_MS = 45_000        // extra random jitter added on top of the floor
-export const ANTIBAN_HOURLY_CEILING = 15       // hard ceiling regardless of configured daily cap
+export const ANTIBAN_HOURLY_CEILING = 20       // hard ceiling regardless of configured daily cap
 export const ANTIBAN_WINDOW_MS = 60 * 60_000   // sliding window size for the hourly cap
