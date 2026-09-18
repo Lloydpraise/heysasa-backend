@@ -1,81 +1,16 @@
 import { getContact, getConversation } from '../lib/db.js'
 import { resolveMediaMergeFields, resolveMergeFields } from '../lib/mergeFields.js'
-import { checkEvolutionInstanceState } from '../sender-baileys/evolutionSender.js'
+import { checkInstanceStatus } from '../lib/instanceHealth.js'
 
 const BATCH_SIZE = 30
 const CAMPAIGN_SEED_INTERVAL_MS = parseInt(process.env.CAMPAIGN_SEED_INTERVAL_MS ?? `${5 * 60_000}`)
 let lastCampaignSeedAt = 0
 
-// Checks whether the campaign's WhatsApp instance is genuinely
-// connected. Returns 'available', 'unavailable' (a confirmed answer
-// that it's not connected), or 'unknown' (the check itself failed —
-// a Supabase query error, a DNS blip reaching Evolution API, a
-// timeout — which says nothing about the instance either way).
-async function selectedInstanceAvailable(supabase, campaign) {
-  if (!campaign.whatsapp_instance_name) return 'unavailable'
-
-  const { data: session, error: sessionError } = await supabase
-    .from('whatsapp_sessions')
-    .select('instance_name')
-    .eq('business_id', campaign.business_id)
-    .eq('instance_name', campaign.whatsapp_instance_name)
-    .eq('status', 'connected')
-    .maybeSingle()
-
-  if (sessionError) {
-    console.warn(`[CampaignScheduler] whatsapp_sessions check errored for campaign ${campaign.id}: ${sessionError.message} — treating as unknown, not unavailable`)
-    return 'unknown'
-  }
-  if (!session) return 'unavailable'
-
-  const { open, error: evolutionError } = await checkEvolutionInstanceState(campaign.whatsapp_instance_name)
-  if (evolutionError) {
-    console.warn(`[CampaignScheduler] Evolution connection check errored for campaign ${campaign.id}: ${evolutionError.message} — treating as unknown, not unavailable`)
-    return 'unknown'
-  }
-  return open ? 'available' : 'unavailable'
-}
-
-// A confirmed 'unavailable' result can still mean the instance is
-// genuinely disconnected, or it can mean a single transient blip that
-// nonetheless produced a definite (if wrong) answer. Killing an active
-// campaign on the strength of one such result is too aggressive: this
-// happened for real on lashesbyshazz's "Price Update Notice" campaign,
-// which was permanently failed after 55 successful sends off a single
-// bad health check, while the WhatsApp instance was never actually
-// disconnected. A later 'unknown' result (Supabase/Evolution
-// unreachable — e.g. the VPS's own DNS intermittently failing to
-// resolve Supabase's host) doesn't count toward this at all, since it
-// isn't evidence of anything.
-//
-// Requiring several consecutive confirmed failures (spaced
-// ~CAMPAIGN_SEED_INTERVAL_MS apart) before giving up still catches a
-// genuinely dead instance within a few cycles, without a blip — or a
-// string of "we couldn't check" results — destroying a healthy campaign.
-const INSTANCE_FAILURE_THRESHOLD = 3
-const instanceCheckFailures = new Map() // campaignId -> consecutive confirmed-failure count (in-memory; resets on restart, which just costs a few extra checks)
-
-async function checkInstanceStatus(supabase, campaign) {
-  const status = await selectedInstanceAvailable(supabase, campaign)
-
-  if (status === 'available') {
-    instanceCheckFailures.delete(campaign.id)
-    return 'ok'
-  }
-
-  if (status === 'unknown') {
-    console.warn(`[CampaignScheduler] Instance check for campaign ${campaign.id} was inconclusive — retrying next cycle, not counted as a failure`)
-    return 'retry'
-  }
-
-  const failures = (instanceCheckFailures.get(campaign.id) ?? 0) + 1
-  instanceCheckFailures.set(campaign.id, failures)
-  if (failures < INSTANCE_FAILURE_THRESHOLD) {
-    console.warn(`[CampaignScheduler] Instance confirmed unavailable for campaign ${campaign.id} (${failures}/${INSTANCE_FAILURE_THRESHOLD}) — retrying next cycle, not failing yet`)
-    return 'retry'
-  }
-  instanceCheckFailures.delete(campaign.id)
-  return 'failed'
+async function pauseCampaign(supabase, campaignId, reason) {
+  await supabase.from('campaigns')
+    .update({ status: 'paused', failure_reason: reason, failed_at: null })
+    .eq('id', campaignId)
+    .in('status', ['active', 'paused'])
 }
 
 async function failCampaign(supabase, campaignId, reason) {
@@ -89,8 +24,8 @@ async function failCampaign(supabase, campaignId, reason) {
 async function seedCampaignEnrollments(supabase) {
   const { data: campaigns, error: campaignError } = await supabase
     .from('campaigns')
-    .select('id, business_id, list_id, whatsapp_instance_name')
-    .eq('status', 'active')
+    .select('id, business_id, list_id, whatsapp_instance_name, status')
+    .in('status', ['active', 'paused'])
     .not('list_id', 'is', null)
     .order('created_at', { ascending: true })
 
@@ -100,9 +35,17 @@ async function seedCampaignEnrollments(supabase) {
   for (const campaign of campaigns ?? []) {
     const instanceStatus = await checkInstanceStatus(supabase, campaign)
     if (instanceStatus === 'retry') continue
+    if (instanceStatus === 'paused') {
+      console.warn(`[CampaignScheduler] Campaign ${campaign.id} paused: selected WhatsApp instance unavailable after grace window`)
+      await pauseCampaign(supabase, campaign.id, 'campaign_instance_unavailable')
+      continue
+    }
     if (instanceStatus === 'failed') {
-      console.error(`[CampaignScheduler] Campaign ${campaign.id} failed: selected WhatsApp instance unavailable after ${INSTANCE_FAILURE_THRESHOLD} consecutive checks`)
+      console.error(`[CampaignScheduler] Campaign ${campaign.id} failed: selected WhatsApp instance remained unavailable after pause/retry grace period`)
       await failCampaign(supabase, campaign.id, 'campaign_instance_unavailable')
+      continue
+    }
+    if (campaign.status === 'paused') {
       continue
     }
     const { data: members, error: memberError } = await supabase
@@ -226,6 +169,10 @@ export async function runCampaignScheduler(supabase) {
       }
       const instanceStatus = await checkInstanceStatus(supabase, campaign)
       if (instanceStatus === 'retry') continue
+      if (instanceStatus === 'paused') {
+        await pauseCampaign(supabase, campaign.id, 'campaign_instance_unavailable')
+        continue
+      }
       if (instanceStatus === 'failed') {
         await failCampaign(supabase, campaign.id, 'campaign_instance_unavailable')
         continue

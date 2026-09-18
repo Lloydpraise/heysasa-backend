@@ -10,7 +10,7 @@ import { DEFAULT_TIMEZONE } from '../config.js'
 import { calculateSendTime, getZonedParts, leadAgeDays, hoursSince, nextActiveDayDate } from '../lib/timing.js'
 import { generateFollowupDraft, rewriteSuggestedMessage } from './generateDraft.js'
 import { normalizeOutboundMedia } from '../lib/media.js'
-import { isEvolutionInstanceOpen } from '../sender-baileys/evolutionSender.js'
+import { checkInstanceStatus } from '../lib/instanceHealth.js'
 import { resolveMediaMergeFields, resolveMergeFields } from '../lib/mergeFields.js'
 
 export async function runWorker(supabase, queueItemId) {
@@ -42,14 +42,27 @@ export async function runWorker(supabase, queueItemId) {
 
   if (item.campaign_id) {
     const { data: campaign, error: campaignError } = await supabase
-      .from('campaigns').select('status, business_id, whatsapp_instance_name').eq('id', item.campaign_id).maybeSingle()
+      .from('campaigns').select('id, status, business_id, whatsapp_instance_name').eq('id', item.campaign_id).maybeSingle()
     if (campaignError) throw new Error(`campaign status lookup failed: ${campaignError.message}`)
     if (!campaign || campaign.status !== 'active') return skipItem('campaign_inactive')
     const selectedInstance = item.assigned_instance_name || campaign.whatsapp_instance_name
-    const { data: session } = await supabase.from('whatsapp_sessions')
-      .select('instance_name').eq('business_id', item.business_id)
-      .eq('instance_name', selectedInstance).eq('status', 'connected').maybeSingle()
-    if (!selectedInstance || !session || !(await isEvolutionInstanceOpen(selectedInstance))) {
+    if (!selectedInstance) {
+      await supabase.from('campaigns').update({ status: 'failed', failure_reason: 'campaign_instance_unavailable', failed_at: new Date().toISOString() }).eq('id', item.campaign_id).eq('status', 'active')
+      await updateQueueItem({ status: 'failed', last_dispatch_error: 'campaign_instance_unavailable' })
+      return { status: 'failed', reason: 'campaign_instance_unavailable' }
+    }
+    // Same tolerant, 3-strike check the campaign seeder uses (see
+    // lib/instanceHealth.js) — a single flaky/slow Evolution ping here
+    // used to kill the whole campaign outright. Now this item just
+    // stays 'pending' and gets picked up again next poll when the
+    // result is inconclusive or hasn't failed enough times to trust.
+    const instanceStatus = await checkInstanceStatus(supabase, { id: campaign.id, business_id: item.business_id, whatsapp_instance_name: selectedInstance, status: campaign.status })
+    if (instanceStatus === 'retry') return { status: 'retry', reason: 'instance_check_inconclusive' }
+    if (instanceStatus === 'paused') {
+      await supabase.from('campaigns').update({ status: 'paused', failure_reason: 'campaign_instance_unavailable', failed_at: null }).eq('id', item.campaign_id).in('status', ['active', 'paused'])
+      return { status: 'paused', reason: 'instance_check_paused' }
+    }
+    if (instanceStatus === 'failed') {
       await supabase.from('campaigns').update({ status: 'failed', failure_reason: 'campaign_instance_unavailable', failed_at: new Date().toISOString() }).eq('id', item.campaign_id).eq('status', 'active')
       await updateQueueItem({ status: 'failed', last_dispatch_error: 'campaign_instance_unavailable' })
       return { status: 'failed', reason: 'campaign_instance_unavailable' }
