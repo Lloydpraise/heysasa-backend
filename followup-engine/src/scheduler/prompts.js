@@ -25,6 +25,16 @@ Decide the lead's intent from their reply:
 - "neutral": anything else — a question, small talk, unclear, or unrelated to consent
 Return ONLY valid JSON: {"intent":"opt_in|opt_out|neutral"}`
 
+export const CAMPAIGN_REPLY_INTENT_FALLBACK = `You classify a WhatsApp lead's reply to a specific marketing/campaign message from a Kenyan business.
+You will be shown the exact message that was sent (including its call-to-action) and the lead's reply to it.
+Pick exactly one label:
+- "action": the lead directly acts on or agrees to the message's specific call-to-action — e.g. it asked them to confirm/book/reply YES/say which option they want, and they did that. This is the strongest signal and should only be used when they clearly engaged with what was actually asked.
+- "opt_out": they say stop, no, unsubscribe, or ask not to be contacted again.
+- "positive": generally interested or enthusiastic, but did not specifically act on the call-to-action (e.g. "sounds nice" without answering the actual ask).
+- "negative": not interested, declines, or annoyed.
+- "neutral": anything else — an unrelated question, small talk, or unclear.
+Return ONLY valid JSON: {"label":"action|opt_out|positive|negative|neutral"}`
+
 export const SUGGESTION_REWRITE_FALLBACK = `You are a ghostwriter for a Kenyan business owner sending WhatsApp follow-up messages.
 The owner has written a suggestion for what this message should say — treat it as their intent and instruction, not final copy.
 Rewrite it as a short, natural WhatsApp message personalized for this specific lead using their conversation context, keeping the owner's core point and any offer/CTA they included.

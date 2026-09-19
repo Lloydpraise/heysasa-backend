@@ -50,7 +50,15 @@ export function extractMessageContent(msg) {
     if (m.stickerMessage)
         return { text: '', type: 'sticker' };
     if (m.reactionMessage)
-        return { text: m.reactionMessage.text || '', type: 'reaction', emoji: m.reactionMessage.text || '' };
+        // key.id here is the whatsapp_message_id of the message being
+        // reacted to (not this reaction event's own id) — needed to
+        // attribute the reaction back to a campaign_step_events row.
+        return {
+            text: m.reactionMessage.text || '',
+            type: 'reaction',
+            emoji: m.reactionMessage.text || '',
+            reactedMessageId: m.reactionMessage.key?.id || null
+        };
     if (m.locationMessage)
         return {
             text: `Location: ${m.locationMessage.degreesLatitude}, ${m.locationMessage.degreesLongitude}`,

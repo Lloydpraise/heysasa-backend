@@ -35,8 +35,9 @@ export async function recordSuccessfulSend(supabase, { item, contact, business, 
   const sendDate = now.slice(0, 10)
   const messageCost = await getBillingConfig(supabase, 'followup_message_cost_usd', DEFAULT_MSG_COST)
 
-  await Promise.all([
-    // Log the message
+  const [messageInsertResult] = await Promise.all([
+    // Log the message — .select('id') so we can link it onto the
+    // campaign_step_events row below instead of leaving message_id null.
     supabase.from('messages').insert({
       business_id: item.business_id,
       contact_id: item.contact_id,
@@ -49,7 +50,7 @@ export async function recordSuccessfulSend(supabase, { item, contact, business, 
       content: messageContent,
       status: 'sent',
       created_at: now
-    }),
+    }).select('id').single(),
     // Mark queue item sent
     supabase.from('follow_up_queue').update({
       status: 'sent',
@@ -92,10 +93,17 @@ export async function recordSuccessfulSend(supabase, { item, contact, business, 
       }, { onConflict: 'business_id,send_date' }))
   ])
 
+  if (messageInsertResult?.error) {
+    console.error(`[Sender] Failed to log outbound message for ${item.id}: ${messageInsertResult.error.message}`)
+  }
+  const insertedMessageId = messageInsertResult?.data?.id ?? null
+
   // Campaign step tracking — v_campaign_summary/v_campaign_step_summary
   // (sent_count, response_rate, etc.) read from campaign_step_events;
   // nothing wrote to it before, so the dashboard would show zeros even
-  // while sends succeeded.
+  // while sends succeeded. message_id links this step event to the actual
+  // message row so delivery/read/reply/reaction feedback can be joined
+  // back to a specific campaign step (see v_campaign_message_feedback).
   if (item.campaign_id) {
     const { data: enrollment } = await supabase
       .from('campaign_enrollments')
@@ -115,7 +123,7 @@ export async function recordSuccessfulSend(supabase, { item, contact, business, 
       await supabase.from('campaign_step_events').upsert({
         enrollment_id: enrollment.id,
         step_id: stepRow.id,
-        message_id: null,
+        message_id: insertedMessageId,
         sent_at: now
       }, { onConflict: 'enrollment_id,step_id' })
     }

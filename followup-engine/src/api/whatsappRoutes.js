@@ -1,5 +1,6 @@
 import { Router } from 'express'
 import { supabase } from '../supabaseClient.js'
+import { normalizeWhatsappConnectionRequest } from './whatsappConnectionRequest.js'
 import {
   connectEvolutionInstance,
   createEvolutionInstance,
@@ -61,10 +62,11 @@ whatsappRouter.get('/whatsapp/connection', async (req, res) => {
 })
 
 whatsappRouter.post('/whatsapp/connection', async (req, res) => {
-  const mode = req.body?.mode ?? 'qr'
-  const phoneNumber = req.body?.phoneNumber?.replace(/\D/g, '') || null
-  if (!['qr', 'phone'].includes(mode)) return res.status(400).json({ error: 'mode_must_be_qr_or_phone' })
-  if (mode === 'phone' && !phoneNumber) return res.status(400).json({ error: 'phone_number_required' })
+  const request = normalizeWhatsappConnectionRequest(req.body ?? {})
+  const mode = request.mode ?? 'qr'
+  const phoneNumber = request.phoneNumber
+
+  if (request.error) return res.status(400).json({ error: request.error })
 
   try {
     const instanceName = await ensureInstance(req.businessId)

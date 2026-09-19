@@ -34,14 +34,17 @@ export async function callOpenAI(options) {
   }
 }
 
-// Fetches prompt from ai_bots_config — falls back to hardcoded if missing
+// Fetches prompt from ai_bots_config — falls back to hardcoded if missing.
+// Precedence for model: an admin override saved in ai_bots_config always
+// wins, then the caller's own default (e.g. a classifier that wants a
+// cheaper model than the platform default), then OPENAI_MODEL.
 export async function callBot(supabase, botId, userContent, fallbackPrompt, options = {}) {
   const config = await getBotConfig(supabase, botId)
   return callOpenAI({
     systemPrompt: config?.prompt ?? fallbackPrompt,
     userContent,
-    model: config?.model ?? OPENAI_MODEL,
-    temperature: config?.temperature ?? 0.7,
+    model: config?.model ?? options.model ?? OPENAI_MODEL,
+    temperature: config?.temperature ?? options.temperature ?? 0.7,
     maxTokens: options.maxTokens ?? config?.max_tokens ?? 500,
     json: options.json
   })

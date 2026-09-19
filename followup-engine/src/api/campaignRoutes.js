@@ -28,6 +28,24 @@ campaignRouter.get('/campaigns/:id', async (req, res) => {
   if (campaign) res.json(campaign)
 })
 
+// Per-step, per-contact feedback for a campaign: sent -> delivery/read
+// status -> replied_at -> reacted_at/emoji, from v_campaign_message_feedback.
+// Scoped to the authenticated business via loadOwnedCampaign.
+campaignRouter.get('/campaigns/:id/feedback', async (req, res) => {
+  const campaign = await loadOwnedCampaign(req, res)
+  if (!campaign) return
+
+  const { data: feedback, error } = await supabase
+    .from('v_campaign_message_feedback')
+    .select('*')
+    .eq('campaign_id', campaign.id)
+    .order('step_number', { ascending: true })
+    .order('sent_at', { ascending: true })
+
+  if (error) return res.status(500).json({ error: error.message })
+  res.json(feedback ?? [])
+})
+
 campaignRouter.patch('/campaigns/:id/instance', async (req, res) => {
   const campaign = await loadOwnedCampaign(req, res)
   if (!campaign) return

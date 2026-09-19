@@ -14,7 +14,9 @@ import {
     getOrCreateConversation, 
     recordAdAttribution, 
     updateLeadStateOnReply, 
-    cancelPendingFollowUps 
+    cancelPendingFollowUps,
+    recordCampaignStepReply,
+    recordCampaignStepReaction
 } from './dbService.js';
 import { debugLog } from './debugConsole.js';
 import { deleteSessionRecord } from './evolutionConnections.js';
@@ -108,6 +110,7 @@ function parseMessagePayload(rawMessage) {
         text: content.text || '',
         type: content.type || 'text',
         adAttribution: extractAdAttribution(rawMessage),
+        reactedMessageId: content.reactedMessageId || null,
     };
 }
 
@@ -122,7 +125,7 @@ export async function processLiveMessage(messages, businessId) {
             const parsed = parseMessagePayload(rawMessage);
             if (!parsed) continue;
 
-            const { jid, pushName, isFromMe, keyId, timestamp, text, type, adAttribution } = parsed;
+            const { jid, pushName, isFromMe, keyId, timestamp, text, type, adAttribution, reactedMessageId } = parsed;
 
             // 1. Resolve Contact safely
             const contact = await getOrCreateContact(businessId, jid, pushName);
@@ -140,10 +143,20 @@ export async function processLiveMessage(messages, businessId) {
                 await recordAdAttribution(businessId, contactId, adAttribution);
             }
 
-            // 4. Update state & cancel follow-ups on incoming user response
+            // 4. Update state & cancel follow-ups on incoming user response,
+            // and attribute the response back to whichever campaign step
+            // it belongs to — a reaction attributes to the specific message
+            // reacted to, anything else counts as a reply to the most
+            // recent unreplied step (see recordCampaignStepReply/Reaction).
             if (!isFromMe) {
                 await updateLeadStateOnReply(contactId, contact.lead_state);
                 await cancelPendingFollowUps(contactId);
+
+                if (type === 'reaction') {
+                    await recordCampaignStepReaction(businessId, reactedMessageId, text);
+                } else {
+                    await recordCampaignStepReply(contactId);
+                }
             }
 
             // 5. Store message record — real `messages` columns are

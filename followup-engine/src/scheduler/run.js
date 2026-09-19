@@ -5,6 +5,7 @@ import { runCampaignScheduler } from './campaignScheduler.js'
 import { runPostSendReconciliation } from './reconciliation.js'
 import { runConsent } from './consent.js'
 import { runOptInClassifier } from './optInClassifier.js'
+import { runCampaignReplyIntentClassifier } from './campaignReplyIntentClassifier.js'
 import { runStageClassifier } from './stageClassifier.js'
 import { runActivityPatterns } from './activityPatterns.js'
 
@@ -34,5 +35,6 @@ loop('CampaignScheduler', runCampaignScheduler, SCHEDULER_POLL_INTERVAL_MS)
 loop('Reconciliation', runPostSendReconciliation, SCHEDULER_POLL_INTERVAL_MS)
 loop('Consent', runConsent, 5 * 60_000)          // every 5 min — low volume, not urgent
 loop('OptInClassifier', runOptInClassifier, 2 * 60_000) // every 2 min — reacts to replies without hammering the AI
+loop('CampaignReplyIntentClassifier', runCampaignReplyIntentClassifier, 2 * 60_000) // same cadence — same reasoning
 loop('StageClassifier', runStageClassifier, 60_000) // every 1 min — matches the 15-min lookback window with margin
 loop('ActivityPatterns', runActivityPatterns, 60 * 60_000) // hourly — cheap to run less often

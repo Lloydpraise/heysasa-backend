@@ -146,6 +146,92 @@ export async function updateLeadStateOnReply(contactId, currentState) {
     }
 }
 
+// Cheap, local sentiment for reactions — no AI round-trip needed since an
+// emoji reaction is already a compact, explicit signal. Text replies go
+// through campaignReplyIntentClassifier.js instead (see that file for why
+// this can't happen inline here — it needs the AI infra that only lives
+// in the followup-engine service, not this one).
+const POSITIVE_REACTIONS = new Set(['👍', '❤️', '❤', '😍', '🔥', '🙌', '✅', '🎉', '😂', '💯']);
+const NEGATIVE_REACTIONS = new Set(['👎', '😡', '💔', '😢', '😞']);
+
+function classifyReactionEmoji(emoji) {
+    if (!emoji) return null;
+    if (POSITIVE_REACTIONS.has(emoji)) return 'positive';
+    if (NEGATIVE_REACTIONS.has(emoji)) return 'negative';
+    return 'neutral';
+}
+
+// Attributes an inbound reply to whichever campaign step is still waiting
+// on one. "Reply" here means any inbound message after a campaign send —
+// not a WhatsApp quote-reply to that specific message — since that's the
+// signal that covers every message type today. Deliberately picks the
+// most recently sent, not-yet-replied step event for the lead's active
+// enrollment; if none is pending (no active enrollment, or every step
+// already has a replied_at), this is a no-op.
+export async function recordCampaignStepReply(contactId) {
+    try {
+        const { data: enrollment, error: enrollmentError } = await supabase
+            .from('campaign_enrollments')
+            .select('id')
+            .eq('lead_id', contactId)
+            .in('status', ['pending', 'active', 'awaiting_opt_in'])
+            .maybeSingle();
+        if (enrollmentError) throw enrollmentError;
+        if (!enrollment?.id) return;
+
+        const { data: stepEvent, error: stepEventError } = await supabase
+            .from('campaign_step_events')
+            .select('id')
+            .eq('enrollment_id', enrollment.id)
+            .not('sent_at', 'is', null)
+            .is('replied_at', null)
+            .order('sent_at', { ascending: false })
+            .limit(1)
+            .maybeSingle();
+        if (stepEventError) throw stepEventError;
+        if (!stepEvent?.id) return;
+
+        const { error } = await supabase
+            .from('campaign_step_events')
+            .update({ replied_at: new Date().toISOString() })
+            .eq('id', stepEvent.id);
+        if (error) throw error;
+    } catch (error) {
+        logDbFailure('recordCampaignStepReply', { contactId }, error);
+    }
+}
+
+// Attributes an inbound reaction to the specific campaign step whose
+// outbound message was reacted to. reactedMessageId is the whatsapp_message_id
+// of the message being reacted to (see extractMessageContent), which we
+// resolve to our own messages.id, then to the campaign_step_events row
+// that message was linked to at send time.
+export async function recordCampaignStepReaction(businessId, reactedMessageId, emoji) {
+    if (!reactedMessageId) return;
+    try {
+        const { data: message, error: messageError } = await supabase
+            .from('messages')
+            .select('id')
+            .eq('business_id', businessId)
+            .eq('whatsapp_message_id', reactedMessageId)
+            .maybeSingle();
+        if (messageError) throw messageError;
+        if (!message?.id) return;
+
+        const { error } = await supabase
+            .from('campaign_step_events')
+            .update({
+                reacted_at: new Date().toISOString(),
+                reaction_emoji: emoji || null,
+                reply_intent: classifyReactionEmoji(emoji)
+            })
+            .eq('message_id', message.id);
+        if (error) throw error;
+    } catch (error) {
+        logDbFailure('recordCampaignStepReaction', { businessId, reactedMessageId }, error);
+    }
+}
+
 export async function cancelPendingFollowUps(contactId) {
     try {
         const { error } = await supabase.from('follow_up_queue')
