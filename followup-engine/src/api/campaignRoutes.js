@@ -1,6 +1,5 @@
 import { Router } from 'express'
 import { supabase } from '../supabaseClient.js'
-import { isEvolutionInstanceOpen } from '../sender-baileys/evolutionSender.js'
 
 export const campaignRouter = Router()
 
@@ -62,12 +61,14 @@ campaignRouter.patch('/campaigns/:id/instance', async (req, res) => {
     .limit(1)
 
   if (sessionError) return res.status(500).json({ error: sessionError.message })
-  if (!session?.length || !(await isEvolutionInstanceOpen(instanceName))) {
+  // whatsapp_sessions is the source of truth now — a connected row is
+  // trusted as-is, no extra live ping to Evolution to re-confirm it.
+  if (!session?.length) {
     return res.status(409).json({ error: 'instance_not_connected' })
   }
 
   const updates = { whatsapp_instance_name: instanceName }
-  if (campaign.status === 'failed') {
+  if (campaign.status === 'failed' || campaign.status === 'paused') {
     updates.status = 'active'
     updates.failure_reason = null
     updates.failed_at = null

@@ -1,31 +1,11 @@
 import { supabase } from '../supabaseClient.js'
 import { getBusiness, getContact } from '../lib/db.js'
-import { isEvolutionInstanceOpen, sendContentViaEvolution } from './evolutionSender.js'
+import { sendContentViaEvolution } from './evolutionSender.js'
 import { checkAntiban, recordSend } from './antiban.js'
 import { recordSuccessfulSend, recordFailedDispatch } from './postSend.js'
 
 const BATCH_SIZE = 25
 const STALE_CLAIM_MS = 2 * 60_000
-
-// Circuit breaker — if a business is racking up failures fast, stop
-// hammering it and surface that instead of grinding through the rest
-// of the batch into a possibly-flagged number.
-const recentFailures = new Map() // business_id -> [timestamp, ...]
-const CIRCUIT_WINDOW_MS = 10 * 60_000
-const CIRCUIT_THRESHOLD = 8
-
-function tooManyRecentFailures(businessId) {
-  const cutoff = Date.now() - CIRCUIT_WINDOW_MS
-  const list = (recentFailures.get(businessId) ?? []).filter(t => t > cutoff)
-  recentFailures.set(businessId, list)
-  return list.length >= CIRCUIT_THRESHOLD
-}
-
-function recordFailure(businessId) {
-  const list = recentFailures.get(businessId) ?? []
-  list.push(Date.now())
-  recentFailures.set(businessId, list)
-}
 
 async function logSendEvent(businessId, { queueId = null, contactId = null, instanceName = null, eventType, reason = null }) {
   const { error } = await supabase.from('follow_up_send_events').insert({
@@ -78,24 +58,9 @@ export async function processBaileysBatch() {
   if (!items?.length) return { dispatched: 0 }
 
   let dispatched = 0
-  const trippedBusinesses = new Set()
 
   for (const item of items) {
     try {
-      if (trippedBusinesses.has(item.business_id)) continue
-
-      if (tooManyRecentFailures(item.business_id)) {
-        trippedBusinesses.add(item.business_id)
-        console.error(`[Sender] Circuit breaker tripped for ${item.business_id} — pausing this business for the rest of the batch`)
-        await logSendEvent(item.business_id, {
-          queueId: item.id,
-          contactId: item.contact_id,
-          eventType: 'circuit_breaker_tripped',
-          reason: `${CIRCUIT_THRESHOLD}+ failures in ${CIRCUIT_WINDOW_MS / 60_000} min`
-        })
-        continue
-      }
-
       const [business, contact] = await Promise.all([
         getBusiness(supabase, item.business_id),
         getContact(supabase, item.contact_id)
@@ -112,15 +77,22 @@ export async function processBaileysBatch() {
         continue
       }
 
+      // Campaign items: if the campaign's assigned instance doesn't match
+      // what this queue row was stamped with, or the campaign got paused
+      // in the meantime, just leave this item for a later pass — nothing
+      // here ever fails the campaign itself anymore.
       const { data: campaign } = item.campaign_id
         ? await supabase.from('campaigns').select('whatsapp_instance_name, status').eq('id', item.campaign_id).maybeSingle()
         : { data: null }
       if (item.campaign_id && (!campaign || campaign.status !== 'active' || !item.assigned_instance_name || campaign.whatsapp_instance_name !== item.assigned_instance_name)) {
-        await supabase.from('campaigns').update({ status: 'failed', failure_reason: 'campaign_instance_unavailable', failed_at: new Date().toISOString() }).eq('id', item.campaign_id).eq('status', 'active')
-        await supabase.from('follow_up_queue').update({ status: 'failed', last_dispatch_error: 'campaign_instance_unavailable' }).eq('id', item.id)
         continue
       }
 
+      // whatsapp_sessions is the single source of truth for connection
+      // state (kept live by Evolution's connection.update webhook) — no
+      // extra live ping to re-confirm it. A connected row is trusted as-is;
+      // if it's actually stale, the send below will fail for real and get
+      // retried like any other send failure.
       const sessionQuery = supabase
         .from('whatsapp_sessions')
         .select('instance_name')
@@ -128,27 +100,16 @@ export async function processBaileysBatch() {
         .eq('status', 'connected')
       const { data: session, error: sessionError } = item.campaign_id
         ? await sessionQuery.eq('instance_name', item.assigned_instance_name).limit(1)
-        : await sessionQuery.order('updated_at', { ascending: false })
+        : await sessionQuery.order('updated_at', { ascending: false }).limit(1)
 
       if (sessionError) {
-        await recordFailedDispatch(supabase, item, `session_lookup_failed: ${sessionError.message}`)
         await logSendEvent(item.business_id, { queueId: item.id, contactId: item.contact_id, eventType: 'session_lookup_failed', reason: sessionError.message })
         continue
       }
-      let activeSession = null
-      for (const candidate of session ?? []) {
-        if (await isEvolutionInstanceOpen(candidate.instance_name)) {
-          activeSession = candidate
-          break
-        }
-      }
+      const activeSession = session?.[0] ?? null
       if (!activeSession?.instance_name) {
-        await logSendEvent(item.business_id, {
-          queueId: item.id,
-          contactId: item.contact_id,
-          eventType: 'no_open_session',
-          reason: `${session?.length ?? 0} connected session(s) in DB, none actually open`
-        })
+        // No connected session row at all right now — leave it
+        // ready_to_send and pick it back up next poll, no event logged.
         continue
       }
 
@@ -185,7 +146,6 @@ export async function processBaileysBatch() {
           eventType: 'failed',
           reason: result.error ?? 'send_failed'
         })
-        recordFailure(item.business_id)
         continue
       }
 
@@ -202,7 +162,6 @@ export async function processBaileysBatch() {
       console.error(`[Sender] Unexpected error for ${item.id}: ${e.message}`)
       await recordFailedDispatch(supabase, item, e.message).catch(() => {})
       await logSendEvent(item.business_id, { queueId: item.id, contactId: item.contact_id, eventType: 'failed', reason: e.message }).catch(() => {})
-      recordFailure(item.business_id)
     }
   }
 

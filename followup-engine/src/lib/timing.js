@@ -1,4 +1,4 @@
-import { DEFAULT_TIMEZONE } from '../config.js'
+import { DEFAULT_TIMEZONE, DEFAULT_QUIET_START, DEFAULT_QUIET_END } from '../config.js'
 
 const WEEKDAY_INDEX = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 }
 
@@ -44,10 +44,26 @@ function addLocalHours(parts, hours) {
   }
 }
 
-function isQuietHour(hour, quietStart, quietEnd) {
+export function isQuietHour(hour, quietStart, quietEnd) {
   return quietStart > quietEnd
     ? (hour >= quietStart || hour < quietEnd)
     : (hour >= quietStart && hour < quietEnd)
+}
+
+// "Sleep mode" — a single yes/no for whether a business is currently
+// reachable at all (active day + outside quiet hours). Used upstream by
+// the schedulers to hold a business's whole batch untouched while it's
+// asleep, instead of the old approach of touching every individual queue
+// item to reschedule it one at a time (which is what used to generate a
+// wall of per-item "quiet_hours"/"inactive_day" stall events every night).
+export function isBusinessAwake(business, now = new Date()) {
+  const timeZone = business.timezone || DEFAULT_TIMEZONE
+  const quietStart = business.followup_quiet_start ?? DEFAULT_QUIET_START
+  const quietEnd = business.followup_quiet_end ?? DEFAULT_QUIET_END
+  const activeDays = business.followup_active_days ?? [0, 1, 2, 3, 4, 5, 6]
+  const parts = getZonedParts(now, timeZone)
+  if (!activeDays.includes(parts.weekday)) return false
+  return !isQuietHour(parts.hour, quietStart, quietEnd)
 }
 
 export function calculateSendTime(delayHours, optimalHour, quietStart = 21, quietEnd = 8, timeZone = DEFAULT_TIMEZONE) {

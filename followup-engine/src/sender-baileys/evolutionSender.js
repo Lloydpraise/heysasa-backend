@@ -11,53 +11,16 @@ export function normalizePhone(phone, countryCode = DEFAULT_PHONE_COUNTRY_CODE) 
   return digits
 }
 
-const connectionStateCache = new Map()
-const CONNECTION_STATE_CACHE_MS = 10_000
-
-// Returns the instance's real connection state, distinguishing a
-// confirmed answer from Evolution API ({ open: true/false, error: null })
-// from a check that couldn't complete at all ({ open: null, error }) —
-// a timeout, a DNS failure, Evolution being briefly unreachable. These
-// are not the same thing: a confirmed "not open" means the WhatsApp
-// session is genuinely disconnected; a failed check means we simply
-// don't know yet. Conflating them (as this used to do, returning a
-// bare `false` for both) caused a healthy, connected campaign to be
-// killed off a single network blip. Error results are deliberately
-// NOT cached — caching a transient failure would keep reporting "closed"
-// for the full cache window even after the network recovers.
-export async function checkEvolutionInstanceState(instanceName) {
-  const cached = connectionStateCache.get(instanceName)
-  if (cached && cached.expiresAt > Date.now()) return { open: cached.open, error: null }
-
-  try {
-    const controller = new AbortController()
-    const timeout = setTimeout(() => controller.abort(), 5_000)
-    const res = await fetch(`${EVOLUTION_URL}/instance/connectionState/${encodeURIComponent(instanceName)}`, {
-      headers: { apikey: EVOLUTION_KEY },
-      signal: controller.signal
-    })
-    clearTimeout(timeout)
-    const body = await res.json().catch(() => null)
-    const state = body?.instance?.state ?? body?.state
-    const open = res.ok && state === 'open'
-    connectionStateCache.set(instanceName, { open, expiresAt: Date.now() + CONNECTION_STATE_CACHE_MS })
-    return { open, error: null }
-  } catch (err) {
-    return { open: null, error: err }
-  }
-}
-
-// Boolean convenience wrapper for callers (the send path) that just need
-// a yes/no answer and should treat "couldn't check" the same as "not
-// open" — you shouldn't send a message when you can't confirm the
-// instance is connected. The scheduler's health check needs the richer
-// tri-state above instead, since for *that* purpose an unconfirmed check
-// must NOT be treated as a confirmed disconnect.
-export async function isEvolutionInstanceOpen(instanceName) {
-  const { open } = await checkEvolutionInstanceState(instanceName)
-  return open === true
-}
-
+// NOTE: this used to also do a live HTTP ping to Evolution's
+// /instance/connectionState/ endpoint before every send (and again in a
+// couple of scheduler-side health checks), on top of checking the
+// whatsapp_sessions table. That was two sources of truth for the same
+// fact, and the live ping was the flaky one — a single slow/failed ping
+// was enough to kill a healthy campaign outright. whatsapp_sessions is
+// kept live by Evolution's own connection.update webhook, so it's
+// trusted as the sole source of truth now: if a row says 'connected',
+// we send. If the instance is actually down, the send call below will
+// fail with a real error and get retried like any other send failure.
 export async function sendViaEvolution(instanceName, phone, message, countryCode = DEFAULT_PHONE_COUNTRY_CODE) {
   return sendContentViaEvolution(instanceName, phone, { text: message }, countryCode)
 }
@@ -66,10 +29,6 @@ export async function sendContentViaEvolution(instanceName, phone, content = {},
   try {
     const number = normalizePhone(phone, countryCode)
     if (!number) return { ok: false, error: 'invalid_phone' }
-    if (!(await isEvolutionInstanceOpen(instanceName))) {
-      console.warn(`[Evolution] Instance ${instanceName} is not open; send deferred`)
-      return { ok: false, error: 'evolution_instance_not_open' }
-    }
     const media = content.media ?? null
     const endpoint = media ? 'sendMedia' : 'sendText'
     const payload = media

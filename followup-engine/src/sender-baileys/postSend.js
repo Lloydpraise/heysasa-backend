@@ -1,6 +1,9 @@
 import { deductBalance } from '../lib/billing.js'
 import { getBillingConfig } from '../lib/db.js'
 import { DEFAULT_MSG_COST, DEFAULT_CONSENT_COST } from '../config.js'
+import { isPermanentSendFailure } from '../lib/sendFailures.js'
+
+const SEND_RETRY_DELAY_MS = 60 * 60_000 // retry non-permanent send failures about an hour later
 
 export async function recordSuccessfulSend(supabase, { item, contact, business, finalMessage, whatsappMessageId }) {
   const now = new Date().toISOString()
@@ -175,15 +178,21 @@ export async function recordSuccessfulSend(supabase, { item, contact, business, 
   }
 }
 
-export async function recordFailedDispatch(supabase, item, errorMessage, maxAttempts = 5) {
+// Only "number not on WhatsApp" is a permanent stop now. Everything else
+// (Evolution errors, timeouts, transient network failures) is assumed
+// recoverable — it stays ready_to_send and comes back up for another
+// attempt in the next retry pass, indefinitely, rather than being given
+// up on after a fixed attempt count.
+export async function recordFailedDispatch(supabase, item, errorMessage) {
   const attempts = (item.dispatch_attempts ?? 0) + 1
-  const giveUp = attempts >= maxAttempts
+  const permanent = isPermanentSendFailure(errorMessage)
 
   await supabase.from('follow_up_queue').update({
-    status: giveUp ? 'failed' : 'ready_to_send',
+    status: permanent ? 'failed' : 'ready_to_send',
+    scheduled_at: permanent ? item.scheduled_at : new Date(Date.now() + SEND_RETRY_DELAY_MS).toISOString(),
     dispatch_attempts: attempts,
     last_dispatch_error: errorMessage
   }).eq('id', item.id)
 
-  console.error(`[Sender] Dispatch failed for ${item.id} (attempt ${attempts}${giveUp ? ', giving up' : ''}): ${errorMessage}`)
+  console.error(`[Sender] Dispatch failed for ${item.id} (attempt ${attempts}${permanent ? ', not on WhatsApp — giving up' : ', retrying in ~1h'}): ${errorMessage}`)
 }

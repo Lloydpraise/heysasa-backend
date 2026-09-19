@@ -1,6 +1,6 @@
 import { getContact, getConversation } from '../lib/db.js'
 import { resolveMediaMergeFields, resolveMergeFields } from '../lib/mergeFields.js'
-import { checkInstanceStatus } from '../lib/instanceHealth.js'
+import { isBusinessAwake } from '../lib/timing.js'
 
 const BATCH_SIZE = 30
 const CAMPAIGN_SEED_INTERVAL_MS = parseInt(process.env.CAMPAIGN_SEED_INTERVAL_MS ?? `${5 * 60_000}`)
@@ -13,73 +13,49 @@ async function pauseCampaign(supabase, campaignId, reason) {
     .in('status', ['active', 'paused'])
 }
 
-async function failCampaign(supabase, campaignId, reason) {
-  await supabase.from('campaigns').update({ status: 'failed', failure_reason: reason, failed_at: new Date().toISOString() }).eq('id', campaignId).eq('status', 'active')
-  await supabase.from('follow_up_queue')
-    .update({ status: 'failed', last_dispatch_error: reason })
-    .eq('campaign_id', campaignId)
-    .in('status', ['pending', 'ready_to_send', 'sending'])
-}
-
-async function retryFailedCampaignItems(supabase, campaignId) {
-  const { data: failedItems, error } = await supabase
-    .from('follow_up_queue')
-    .select('id, contact_id, campaign_step, last_dispatch_error')
-    .eq('campaign_id', campaignId)
-    .eq('status', 'failed')
-    .order('created_at', { ascending: true })
-
+// Nothing here fails a campaign anymore — an instance/session problem
+// just means its items wait (see the whatsapp_sessions check inline
+// below and in worker.js). The only thing that actively pauses a
+// campaign now is the business's own follow-up toggle, see
+// syncCampaignsWithFollowupToggle.
+async function syncCampaignsWithFollowupToggle(supabase) {
+  const { data: businesses, error } = await supabase
+    .from('businesses')
+    .select('business_id, followup_ai_enabled')
   if (error) {
-    console.error(`[CampaignScheduler] Failed queue lookup for campaign ${campaignId}: ${error.message}`)
+    console.error(`[CampaignScheduler] followup_ai_enabled lookup failed: ${error.message}`)
     return
   }
 
-  if (!failedItems?.length) return
+  const disabledIds = (businesses ?? []).filter(b => !b.followup_ai_enabled).map(b => b.business_id)
+  const enabledIds = (businesses ?? []).filter(b => b.followup_ai_enabled).map(b => b.business_id)
 
-  const idsToRetry = []
-  for (const item of failedItems) {
-    const msg = item.last_dispatch_error ?? ''
-    if (msg.includes('exists') && msg.includes('false')) continue
-    if (msg.includes('not on whatsapp') || msg.includes('not registered')) continue
-
-    const { data: existing, error: duplicateError } = await supabase
-      .from('follow_up_queue')
+  if (disabledIds.length) {
+    const { data: paused } = await supabase
+      .from('campaigns')
+      .update({ status: 'paused', failure_reason: 'followup_ai_disabled', failed_at: null })
+      .in('business_id', disabledIds)
+      .eq('status', 'active')
       .select('id')
-      .eq('campaign_id', campaignId)
-      .eq('contact_id', item.contact_id)
-      .eq('campaign_step', item.campaign_step)
-      .in('status', ['pending', 'ready_to_send', 'sending', 'sent'])
-      .maybeSingle()
-
-    if (duplicateError) {
-      console.error(`[CampaignScheduler] Duplicate check failed for ${campaignId}/${item.contact_id}/${item.campaign_step}: ${duplicateError.message}`)
-      continue
-    }
-    if (existing) continue
-
-    idsToRetry.push(item.id)
+    if (paused?.length) console.log(`[CampaignScheduler] Paused ${paused.length} campaign(s) — follow-ups disabled`)
   }
 
-  if (!idsToRetry.length) return
-
-  const { error: retryError } = await supabase
-    .from('follow_up_queue')
-    .update({
-      status: 'pending',
-      scheduled_at: new Date().toISOString(),
-      skip_reason: null,
-      last_dispatch_error: null,
-      approval_status: 'approved'
-    })
-    .in('id', idsToRetry)
-
-  if (retryError) {
-    console.error(`[CampaignScheduler] Could not requeue failed campaign items for ${campaignId}: ${retryError.message}`)
-    return
+  if (enabledIds.length) {
+    const { data: resumed } = await supabase
+      .from('campaigns')
+      .update({ status: 'active', failure_reason: null, failed_at: null })
+      .in('business_id', enabledIds)
+      .eq('status', 'paused')
+      .eq('failure_reason', 'followup_ai_disabled')
+      .select('id')
+    if (resumed?.length) console.log(`[CampaignScheduler] Resumed ${resumed.length} campaign(s) — follow-ups re-enabled`)
   }
-
-  console.log(`[CampaignScheduler] Requeued ${idsToRetry.length} recoverable failed items for campaign ${campaignId}`)
 }
+
+// Retryable send failures (anything except "not on WhatsApp") are handled
+// directly by postSend.js's recordFailedDispatch now — they stay
+// ready_to_send with scheduled_at pushed ~1h out, so this scheduler
+// doesn't need a separate sweep to bring them back.
 
 async function seedCampaignEnrollments(supabase) {
   const { data: campaigns, error: campaignError } = await supabase
@@ -93,14 +69,21 @@ async function seedCampaignEnrollments(supabase) {
 
   let enrolled = 0
   for (const campaign of campaigns ?? []) {
-    const instanceStatus = await checkInstanceStatus(supabase, campaign)
-    if (instanceStatus === 'retry') continue
-    if (instanceStatus === 'locked') {
-      console.warn(`[CampaignScheduler] Campaign ${campaign.id} is locked because the WhatsApp session is closed; not auto-pausing or failing the campaign`)
-      continue
-    }
     if (campaign.status === 'paused') {
       continue
+    }
+    // whatsapp_sessions is the source of truth — no live Evolution ping.
+    // No connected session yet just means wait, nothing pauses or fails
+    // the campaign over it.
+    if (campaign.whatsapp_instance_name) {
+      const { data: connectedSession } = await supabase
+        .from('whatsapp_sessions')
+        .select('instance_name')
+        .eq('business_id', campaign.business_id)
+        .eq('instance_name', campaign.whatsapp_instance_name)
+        .eq('status', 'connected')
+        .maybeSingle()
+      if (!connectedSession) continue
     }
     const { data: members, error: memberError } = await supabase
       .from('list_members')
@@ -183,6 +166,11 @@ export async function runCampaignScheduler(supabase) {
   const now = new Date().toISOString()
   console.log(`[CampaignScheduler] Cycle started at ${now}`)
 
+  // followup_ai_enabled is now an active blocker for campaigns: off
+  // pauses them, back on resumes them (and their stalled items pick
+  // right back up, since nothing marked them permanently dead).
+  await syncCampaignsWithFollowupToggle(supabase)
+
   let seeded = 0
   if (Date.now() - lastCampaignSeedAt >= CAMPAIGN_SEED_INTERVAL_MS) {
     seeded = await seedCampaignEnrollments(supabase)
@@ -204,20 +192,10 @@ export async function runCampaignScheduler(supabase) {
   console.log(`[CampaignScheduler] Due enrollments found: ${due?.length ?? 0}`)
   if (!due?.length) return { queued: 0 }
 
-  const activeCampaignIds = new Set((due ?? []).map(item => item.campaign_id))
-  for (const campaignId of activeCampaignIds) {
-    const { data: campaign } = await supabase
-      .from('campaigns')
-      .select('id, status')
-      .eq('id', campaignId)
-      .single()
-
-    if (campaign?.status === 'active') {
-      await retryFailedCampaignItems(supabase, campaignId)
-    }
-  }
-
   let queued = 0
+  // Cache business-awake checks per cycle so a batch spanning many
+  // enrollments for the same business only looks it up once.
+  const awakeCache = new Map()
   for (const enrollment of due) {
     try {
       console.log(`[CampaignScheduler] Checking enrollment ${enrollment.id} campaign:${enrollment.campaign_id} lead:${enrollment.lead_id} step:${(enrollment.current_step ?? 0) + 1}`)
@@ -234,11 +212,30 @@ export async function runCampaignScheduler(supabase) {
         console.warn(`[CampaignScheduler] Skipped enrollment ${enrollment.id}: campaign status is ${campaign.status}`)
         continue
       }
-      const instanceStatus = await checkInstanceStatus(supabase, campaign)
-      if (instanceStatus === 'retry') continue
-      if (instanceStatus === 'locked') {
-        console.warn(`[CampaignScheduler] Campaign ${campaign.id} is locked because the WhatsApp session is closed; skipping queue work until the session reconnects`)
-        continue
+
+      // Sleep mode — a business in quiet hours (or on an inactive day)
+      // just has its due items left alone this cycle, no per-item writes.
+      if (!awakeCache.has(campaign.business_id)) {
+        const { data: business } = await supabase
+          .from('businesses')
+          .select('timezone, followup_quiet_start, followup_quiet_end, followup_active_days')
+          .eq('business_id', campaign.business_id)
+          .maybeSingle()
+        awakeCache.set(campaign.business_id, business ? isBusinessAwake(business) : true)
+      }
+      if (!awakeCache.get(campaign.business_id)) continue
+
+      // whatsapp_sessions is the source of truth — no live Evolution
+      // ping, and nothing here pauses or fails the campaign over it.
+      if (campaign.whatsapp_instance_name) {
+        const { data: connectedSession } = await supabase
+          .from('whatsapp_sessions')
+          .select('instance_name')
+          .eq('business_id', campaign.business_id)
+          .eq('instance_name', campaign.whatsapp_instance_name)
+          .eq('status', 'connected')
+          .maybeSingle()
+        if (!connectedSession) continue
       }
 
       const nextStepNumber = (enrollment.current_step ?? 0) + 1

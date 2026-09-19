@@ -1,17 +1,16 @@
 import {
-  DEFAULT_DAILY_CAP, DEFAULT_MSG_COST, DEFAULT_ZONE_RECENT,
-  DEFAULT_ZONE_MEDIUM, DEFAULT_QUIET_START, DEFAULT_QUIET_END, DEFAULT_MAX_PER_LEAD
+  DEFAULT_DAILY_CAP, DEFAULT_MSG_COST, DEFAULT_ZONE_RECENT, DEFAULT_ZONE_MEDIUM, DEFAULT_MAX_PER_LEAD
 } from '../config.js'
 import {
   getBusiness, getContact, getPersonaPack, getConversation, getMessages, getBillingConfig, getDailyCount
 } from '../lib/db.js'
 import { checkBalance, flagInsufficientFunds } from '../lib/billing.js'
-import { DEFAULT_TIMEZONE } from '../config.js'
-import { calculateSendTime, getZonedParts, leadAgeDays, hoursSince, nextActiveDayDate } from '../lib/timing.js'
+import { leadAgeDays, hoursSince } from '../lib/timing.js'
 import { generateFollowupDraft, rewriteSuggestedMessage } from './generateDraft.js'
 import { normalizeOutboundMedia } from '../lib/media.js'
-import { checkInstanceStatus } from '../lib/instanceHealth.js'
 import { resolveMediaMergeFields, resolveMergeFields } from '../lib/mergeFields.js'
+
+const STALL_RETRY_MS = 5 * 60_000
 
 export async function runWorker(supabase, queueItemId) {
   if (!queueItemId) throw new Error('queue_item_id required')
@@ -21,10 +20,23 @@ export async function runWorker(supabase, queueItemId) {
     if (error) throw new Error(`queue update failed: ${error.message}`)
   }
 
+  // Permanent stop — will never be reconsidered (do-not-contact, deal
+  // already closed, bad sentiment, structural queue-item problems).
   const skipItem = async (reason) => {
     await updateQueueItem({ status: 'skipped', skip_reason: reason })
     console.log(`[Worker] Skipped ${queueItemId} — ${reason}`)
     return { status: 'skipped', reason }
+  }
+
+  // Temporary block — stays 'pending' and is retried automatically once
+  // scheduled_at comes back due, instead of dying as a permanent skip.
+  const stallItem = async (reason, retryInMs = STALL_RETRY_MS) => {
+    await updateQueueItem({
+      skip_reason: reason,
+      scheduled_at: new Date(Date.now() + retryInMs).toISOString()
+    })
+    console.log(`[Worker] Stalled ${queueItemId} — ${reason} (retry in ${Math.round(retryInMs / 60_000)}m)`)
+    return { status: 'stalled', reason }
   }
 
   // ── 1. Get queue item ────────────────────────────────────────
@@ -44,21 +56,24 @@ export async function runWorker(supabase, queueItemId) {
     const { data: campaign, error: campaignError } = await supabase
       .from('campaigns').select('id, status, business_id, whatsapp_instance_name').eq('id', item.campaign_id).maybeSingle()
     if (campaignError) throw new Error(`campaign status lookup failed: ${campaignError.message}`)
-    if (!campaign || campaign.status !== 'active') return skipItem('campaign_inactive')
+    // Campaign not active right now (e.g. paused because follow-ups are
+    // toggled off) — nothing here fails or pauses it further, just wait.
+    if (!campaign || campaign.status !== 'active') return stallItem('campaign_inactive')
     const selectedInstance = item.assigned_instance_name || campaign.whatsapp_instance_name
-    if (!selectedInstance) {
-      await supabase.from('campaigns').update({ status: 'failed', failure_reason: 'campaign_instance_unavailable', failed_at: new Date().toISOString() }).eq('id', item.campaign_id).eq('status', 'active')
-      await updateQueueItem({ status: 'failed', last_dispatch_error: 'campaign_instance_unavailable' })
-      return { status: 'failed', reason: 'campaign_instance_unavailable' }
-    }
-    // Same tolerant, 3-strike check the campaign seeder uses (see
-    // lib/instanceHealth.js) — a single flaky/slow Evolution ping here
-    // used to kill the whole campaign outright. Now this item just
-    // stays 'pending' and gets picked up again next poll when the
-    // result is inconclusive or hasn't failed enough times to trust.
-    const instanceStatus = await checkInstanceStatus(supabase, { id: campaign.id, business_id: item.business_id, whatsapp_instance_name: selectedInstance, status: campaign.status })
-    if (instanceStatus === 'retry') return { status: 'retry', reason: 'instance_check_inconclusive' }
-    if (instanceStatus === 'locked') return { status: 'locked', reason: 'instance_session_closed' }
+    if (!selectedInstance) return stallItem('campaign_instance_unassigned')
+
+    // whatsapp_sessions is the single source of truth for connection
+    // state — a connected row is trusted as-is, no extra live ping. If
+    // it's genuinely stale, the actual send attempt downstream will
+    // fail for real and that gets retried on its own schedule.
+    const { data: connectedSession } = await supabase
+      .from('whatsapp_sessions')
+      .select('instance_name')
+      .eq('business_id', item.business_id)
+      .eq('instance_name', selectedInstance)
+      .eq('status', 'connected')
+      .maybeSingle()
+    if (!connectedSession) return stallItem('instance_not_connected')
     item.assigned_instance_name = selectedInstance
   }
 
@@ -68,22 +83,27 @@ export async function runWorker(supabase, queueItemId) {
     getBusiness(supabase, item.business_id)
   ])
 
+  // Structural/data problems — not eligibility rules, so still a
+  // permanent skip: a deleted contact/business or a phone-less contact
+  // won't fix itself by waiting.
   if (!contact) return skipItem('contact_not_found')
   if (!business) return skipItem('business_not_found')
   if (!contact.phone) return skipItem('no_phone')
+
+  // Opt-out is the only permanent stop here. There's no separate
+  // opt-in gate anymore — leads are treated as opted in by default;
+  // opting a lead out happens explicitly from the lead detail panel
+  // and is what sets do_not_contact.
   if (contact.do_not_contact) return skipItem('do_not_contact')
-  if (!contact.follow_up_opted_in) {
-    if (item.campaign_id) {
-      const { error } = await supabase.from('campaign_enrollments')
-        .update({ status: 'awaiting_opt_in', next_send_at: null })
-        .eq('campaign_id', item.campaign_id)
-        .eq('lead_id', item.contact_id)
-      if (error) throw new Error(`opt-in enrollment update failed: ${error.message}`)
-    }
-    return skipItem('not_opted_in')
-  }
-  if (!business.followup_ai_enabled) return skipItem('followup_disabled')
-  if (!business.subscription_active) return skipItem('subscription_inactive')
+
+  // Business-level pause: this is now an active blocker (campaigns for
+  // this business get paused at the scheduler level too — see
+  // campaignScheduler.js), but a standalone follow-up just waits rather
+  // than dying, so nothing is lost while the toggle is off.
+  if (!business.followup_ai_enabled) return stallItem('followup_disabled')
+  if (!business.subscription_active) return stallItem('subscription_inactive')
+
+  // Deal already closed either way — more follow-ups are just noise/risk.
   if (['won', 'lost'].includes(contact.lead_state ?? '')) return skipItem(`lead_${contact.lead_state}`)
 
   // Stop at stage check
@@ -92,60 +112,35 @@ export async function runWorker(supabase, queueItemId) {
     const conv0 = await getConversation(supabase, item.contact_id, item.business_id)
     const isEcom0 = business.business_type === 'ecommerce'
     const currStage = isEcom0 ? conv0?.lead_stage_ecom : conv0?.lead_stage_service
-    if (currStage === stopAtStage) return skipItem(`stopped_at_stage_${stopAtStage}`)
+    if (currStage === stopAtStage) return stallItem(`stopped_at_stage_${stopAtStage}`)
   }
 
   // ── 3. Max follow-ups check ───────────────────────────────────
   const maxPerLead = business.followup_max_per_lead ?? DEFAULT_MAX_PER_LEAD
-  if ((contact.follow_up_count ?? 0) >= maxPerLead) return skipItem('max_followups_reached')
+  if ((contact.follow_up_count ?? 0) >= maxPerLead) return stallItem('max_followups_reached')
 
   // ── 4. Billing check ─────────────────────────────────────────
   const msgCost = await getBillingConfig(supabase, 'followup_message_cost_usd', DEFAULT_MSG_COST)
   const hasBalance = await checkBalance(supabase, item.business_id, msgCost)
   if (!hasBalance) {
     await flagInsufficientFunds(supabase, item.business_id)
-    return skipItem('insufficient_balance')
+    return stallItem('insufficient_balance')
   }
 
   // ── 5. Daily cap check ───────────────────────────────────────
   const dailyCap = business.followup_daily_cap ?? DEFAULT_DAILY_CAP
   const dailyCount = await getDailyCount(supabase, item.business_id)
-  if (dailyCount >= dailyCap) return skipItem('daily_cap_reached')
+  if (dailyCount >= dailyCap) return stallItem('daily_cap_reached')
 
   // ── 6. Load persona pack (Optional) ──────────────────────────
   const pack = await getPersonaPack(supabase, item.business_id)
 
-  // Quiet hours now come from the business's own Follow-up preferences
-  // tab first (followup_quiet_start/end), falling back to the persona
-  // pack's rules (older source), then hardcoded defaults.
-  const rules = pack?.follow_up_rules ?? {}
-  const timeZone = business.timezone || DEFAULT_TIMEZONE
-  const quietStart = business.followup_quiet_start
-    ?? parseInt(rules.quiet_hours_start ?? String(DEFAULT_QUIET_START))
-  const quietEnd = business.followup_quiet_end
-    ?? parseInt(rules.quiet_hours_end ?? String(DEFAULT_QUIET_END))
-
-  // ── 6b. Active sending days check ─────────────────────────────
-  // 0=Sun..6=Sat, evaluated in the business's local timezone.
-  const activeDays = business.followup_active_days ?? [0, 1, 2, 3, 4, 5, 6]
-  const now = new Date()
-  if (!activeDays.includes(getZonedParts(now, timeZone).weekday)) {
-    const nextDate = nextActiveDayDate(now, activeDays, timeZone, quietEnd)
-    await supabase.from('follow_up_queue').update({ scheduled_at: nextDate.toISOString() }).eq('id', queueItemId)
-    return { status: 'rescheduled', reason: 'inactive_day', next: nextDate.toISOString() }
-  }
-
-  // ── 7. Quiet hours check ─────────────────────────────────────
-  function isQuiet(h) {
-    return quietStart > quietEnd ? (h >= quietStart || h < quietEnd) : (h >= quietStart && h < quietEnd)
-  }
-
-  const nowHour = getZonedParts(new Date(), timeZone).hour
-  if (isQuiet(nowHour)) {
-    const next = calculateSendTime(1, contact.optimal_contact_hour, quietStart, quietEnd, timeZone)
-    await supabase.from('follow_up_queue').update({ scheduled_at: next.toISOString() }).eq('id', queueItemId)
-    return { status: 'rescheduled', reason: 'quiet_hours', next: next.toISOString() }
-  }
+  // Quiet hours / inactive days are no longer handled per item here —
+  // the scheduler (scheduler.js / campaignScheduler.js) now checks
+  // whether the business is awake at all *before* calling this worker,
+  // so a business in quiet hours just doesn't have its items touched —
+  // no per-item reschedule noise, everything picks back up together the
+  // moment active hours return.
 
   // ── 8. Don't interrupt active conversation ───────────────────
   const conv = await getConversation(supabase, item.contact_id, item.business_id)

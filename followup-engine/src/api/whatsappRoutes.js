@@ -9,7 +9,6 @@ import {
   getEvolutionConnectionState,
   saveConnectionState,
 } from '../../../src/services/evolutionConnections.js'
-import { isEvolutionInstanceOpen } from '../sender-baileys/evolutionSender.js'
 
 export const whatsappRouter = Router()
 
@@ -23,12 +22,9 @@ whatsappRouter.get('/whatsapp/instances', async (req, res) => {
 
   if (error) return res.status(500).json({ error: error.message })
 
-  const instances = []
-  for (const session of sessions ?? []) {
-    if (await isEvolutionInstanceOpen(session.instance_name)) {
-      instances.push({ ...session, connected: true })
-    }
-  }
+  // whatsapp_sessions is the source of truth — every row here already
+  // matched status='connected' above, no extra live ping needed.
+  const instances = (sessions ?? []).map(session => ({ ...session, connected: true }))
   res.json({ instances })
 })
 
