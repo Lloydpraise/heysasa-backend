@@ -382,7 +382,9 @@ async function refreshSummary() {
     refreshBizOptions();
   } catch (e) { /* summary is best-effort */ }
 }
-setInterval(refreshSummary, 15000);
+// Summary refresh is now manual-only. The page already uses a live
+// EventSource stream for event data, so we avoid polling Supabase in the
+// background while the console stays open.
 
 async function loadQueue() {
   try {
