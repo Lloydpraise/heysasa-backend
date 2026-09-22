@@ -8,24 +8,46 @@ import { runOptInClassifier } from './optInClassifier.js'
 import { runCampaignReplyIntentClassifier } from './campaignReplyIntentClassifier.js'
 import { runStageClassifier } from './stageClassifier.js'
 import { runActivityPatterns } from './activityPatterns.js'
+import { log } from '../lib/log.js'
 
 // Each job gets its own guard flag so a slow run never overlaps itself,
 // and its own cadence — no reason to run activity-pattern analysis
 // every 30s when it's only useful hourly.
+//
+// CHANGED: a tick used to be invisible unless it threw. That made "is
+// this loop actually alive?" unanswerable without guessing from side
+// effects elsewhere. Now: every tick error is logged (always — these
+// were silently swallowed to a console line before), and a tick that
+// did measurable work (any positive count in whatever the function
+// returned) logs a summary line. A tick that found nothing to do stays
+// silent on purpose — logging "0 processed" every 30 seconds forever
+// would bury the console in noise with no recognition value.
 function loop(name, fn, intervalMs) {
   let running = false
   const tick = async () => {
     if (running) return
     running = true
     try {
-      await fn(supabase)
+      const result = await fn(supabase)
+      const counts = result && typeof result === 'object' ? result : {}
+      const total = Object.values(counts).reduce((sum, v) => sum + (typeof v === 'number' ? v : 0), 0)
+      if (total > 0) {
+        log('info', 'engine', 'engine.tick', `${name}: ${JSON.stringify(counts)}`, { details: { loop: name, ...counts } })
+      }
+      // Fires every tick regardless of whether there was work — this is
+      // the signal the Health dashboard uses to tell "quiet because
+      // nothing to do" apart from "stuck/dead". Debug level: cheap,
+      // shown live, never persisted to system_logs.
+      log('debug', 'engine', 'engine.heartbeat', `${name} tick ok`, { details: { loop: name, ok: true } })
     } catch (e) {
       console.error(`[${name}] Tick error: ${e.message}`)
+      log('error', 'engine', 'engine.tick_error', `${name} tick failed: ${e.message}`, { details: { loop: name, error: { name: e.name, message: e.message } } })
     } finally {
       running = false
     }
   }
   console.log(`[${name}] Starting — polling every ${intervalMs}ms`)
+  log('info', 'engine', 'engine.loop_started', `${name} starting — polling every ${intervalMs}ms`, { details: { loop: name, intervalMs } })
   tick()
   setInterval(tick, intervalMs)
 }

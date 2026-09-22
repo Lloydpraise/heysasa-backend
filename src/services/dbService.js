@@ -1,9 +1,16 @@
 import { supabase } from '../config/supabase.js';
 import { extractPhone } from './dataCleaner.js';
-import { debugLog } from './debugConsole.js';
+import { logEvent } from './debugConsole.js';
 
-function logDbFailure(step, context, error) {
-    debugLog('error', `DB ${step}`, `${step} failed`, { ...context, error });
+// `area` groups related failures in the console (default 'db' for
+// generic contact/conversation bookkeeping; callers pass 'ads' or
+// 'campaign' for anything on those specific paths).
+function logDbFailure(step, context, error, area = 'db') {
+    logEvent({
+        level: 'error', area, event: `db.${step}_failed`, message: `${step} failed: ${error?.message || error}`,
+        business_id: context?.businessId ?? null, contact_id: context?.contactId ?? null,
+        details: { ...context, error: { message: error?.message, details: error?.details, hint: error?.hint, code: error?.code } },
+    });
     console.error(`[DB] ${step} failed`, {
         ...context,
         message: error?.message,
@@ -127,9 +134,14 @@ export async function recordAdAttribution(businessId, contactId, adData) {
 
         if (contactError) throw contactError;
 
+        logEvent({
+            level: 'ok', area: 'ads', event: 'ads.attributed', message: `Contact attributed to ad ${adData.ad_id}`,
+            business_id: businessId, contact_id: contactId,
+            details: { adId: adData.ad_id, adPlatform: adData.ad_platform, adHeadline: adData.ad_headline },
+        });
         return adRecord.id;
     } catch (error) {
-        logDbFailure('recordAdAttribution', { businessId, contactId, adId: adData?.ad_id }, error);
+        logDbFailure('recordAdAttribution', { businessId, contactId, adId: adData?.ad_id }, error, 'ads');
         return null;
     }
 }
@@ -189,15 +201,28 @@ export async function recordCampaignStepReply(contactId) {
             .limit(1)
             .maybeSingle();
         if (stepEventError) throw stepEventError;
-        if (!stepEvent?.id) return;
+        if (!stepEvent?.id) {
+            logEvent({
+                level: 'debug', area: 'campaign', event: 'campaign.reply_unmatched',
+                message: 'Inbound reply received but no pending campaign step event to attribute it to',
+                contact_id: contactId, details: { enrollmentId: enrollment.id },
+            });
+            return;
+        }
 
         const { error } = await supabase
             .from('campaign_step_events')
             .update({ replied_at: new Date().toISOString() })
             .eq('id', stepEvent.id);
         if (error) throw error;
+
+        logEvent({
+            level: 'ok', area: 'campaign', event: 'campaign.reply_attributed',
+            message: 'Inbound reply attributed to a campaign step',
+            contact_id: contactId, entity_id: stepEvent.id, details: { enrollmentId: enrollment.id },
+        });
     } catch (error) {
-        logDbFailure('recordCampaignStepReply', { contactId }, error);
+        logDbFailure('recordCampaignStepReply', { contactId }, error, 'campaign');
     }
 }
 
@@ -216,7 +241,14 @@ export async function recordCampaignStepReaction(businessId, reactedMessageId, e
             .eq('whatsapp_message_id', reactedMessageId)
             .maybeSingle();
         if (messageError) throw messageError;
-        if (!message?.id) return;
+        if (!message?.id) {
+            logEvent({
+                level: 'debug', area: 'campaign', event: 'campaign.reaction_no_message_match',
+                message: 'Reaction received but no local message row matches this whatsapp_message_id',
+                business_id: businessId, details: { reactedMessageId },
+            });
+            return;
+        }
 
         const { error } = await supabase
             .from('campaign_step_events')
@@ -227,8 +259,14 @@ export async function recordCampaignStepReaction(businessId, reactedMessageId, e
             })
             .eq('message_id', message.id);
         if (error) throw error;
+
+        logEvent({
+            level: 'ok', area: 'campaign', event: 'campaign.reaction_attributed',
+            message: `Reaction "${emoji || ''}" attributed to a campaign step`,
+            business_id: businessId, details: { reactedMessageId, emoji },
+        });
     } catch (error) {
-        logDbFailure('recordCampaignStepReaction', { businessId, reactedMessageId }, error);
+        logDbFailure('recordCampaignStepReaction', { businessId, reactedMessageId }, error, 'campaign');
     }
 }
 

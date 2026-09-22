@@ -62,9 +62,22 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {
     auth: { persistSession: false }
 });
 
-const log  = (tag, msg) => console.log(`[${new Date().toISOString()}] [${tag}] ${msg}`);
-const warn = (tag, msg) => console.warn(`[${new Date().toISOString()}] [${tag}] ⚠ ${msg}`);
-const err  = (tag, msg) => console.error(`[${new Date().toISOString()}] [${tag}] ✗ ${msg}`);
+const log  = (tag, msg) => emit('info', tag, msg);
+const warn = (tag, msg) => emit('warn', tag, msg);
+const err  = (tag, msg) => emit('error', tag, msg);
+
+// CHANGED: previously these three just console.log/warn/error'd a plain
+// text line, so the only place any of this was visible was a raw pm2
+// log file. Now each line is a single parseable "@@LOG " line that the
+// root process (src/index.js, which spawns this file as a child) picks
+// up and feeds into the live/persisted console — same place webhook and
+// sender events show up, filterable by area 'analysis' and by business
+// (once BUSINESS_ID is resolved). Only one line per call, matching the
+// pattern in followup-engine/src/lib/log.js — printing a second, plain
+// line here would make the parent double-log everything.
+function emit(level, tag, message) {
+    console.log(`@@LOG ${JSON.stringify({ level, area: 'analysis', event: tag, message, business_id: BUSINESS_ID || null, details: {} })}`);
+}
 
 // ─── Run tracking ─────────────────────────────────────────────────────────────
 let RUN_ID = null;

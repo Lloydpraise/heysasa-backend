@@ -1,6 +1,6 @@
 import { createClient } from '@supabase/supabase-js';
 import dotenv from 'dotenv';
-import { debugLog } from '../services/debugConsole.js';
+import { logEvent } from '../services/debugConsole.js';
 
 dotenv.config();
 
@@ -12,20 +12,52 @@ if (!SUPABASE_URL || !SUPABASE_KEY) {
     process.exit(1);
 }
 
+// CHANGED: this used to log two events (request + response) for every
+// single database call, which filled the old 500-slot buffer with pure
+// noise in seconds. Now it only logs: errors (always, level error),
+// slow calls over 800ms (level warn), and everything else as level
+// 'debug' (kept in the live buffer, hidden by default in the console,
+// and never persisted to system_logs — see debugConsole.js).
+const SLOW_QUERY_MS = 800;
+
 const tracedFetch = async (input, init = {}) => {
     const url = typeof input === 'string' ? input : input.url;
     const method = init.method || input.method || 'GET';
     const started = Date.now();
-    debugLog('info', 'DB request', `${method} ${url}`, { method, url });
     try {
         const response = await fetch(input, init);
-        const body = await response.clone().text();
-        const details = { method, url, status: response.status, durationMs: Date.now() - started };
-        if (!response.ok) details.response = body;
-        debugLog(response.ok ? 'ok' : 'error', 'DB response', `${method} ${response.status} ${url}`, details);
+        const durationMs = Date.now() - started;
+        if (!response.ok) {
+            const body = await response.clone().text();
+            logEvent({
+                level: 'error', area: 'db', event: 'db.error',
+                message: `${method} ${response.status} ${url}`,
+                duration_ms: durationMs,
+                details: { method, url, status: response.status, response: body.slice(0, 2000) },
+            });
+        } else if (durationMs > SLOW_QUERY_MS) {
+            logEvent({
+                level: 'warn', area: 'db', event: 'db.slow',
+                message: `${method} ${response.status} ${url} took ${durationMs}ms`,
+                duration_ms: durationMs,
+                details: { method, url, status: response.status },
+            });
+        } else {
+            logEvent({
+                level: 'debug', area: 'db', event: 'db.ok',
+                message: `${method} ${response.status} ${url}`,
+                duration_ms: durationMs,
+                details: { method, url, status: response.status },
+            });
+        }
         return response;
     } catch (error) {
-        debugLog('error', 'DB network error', `${method} ${url}`, { method, url, durationMs: Date.now() - started, error });
+        logEvent({
+            level: 'error', area: 'db', event: 'db.network_error',
+            message: `${method} ${url} — ${error.message}`,
+            duration_ms: Date.now() - started,
+            details: { method, url, error: { name: error.name, message: error.message } },
+        });
         throw error;
     }
 };

@@ -2,6 +2,7 @@ import { deductBalance } from '../lib/billing.js'
 import { getBillingConfig } from '../lib/db.js'
 import { DEFAULT_MSG_COST, DEFAULT_CONSENT_COST } from '../config.js'
 import { isPermanentSendFailure } from '../lib/sendFailures.js'
+import { log } from '../lib/log.js'
 
 const SEND_RETRY_DELAY_MS = 60 * 60_000 // retry non-permanent send failures about an hour later
 
@@ -98,6 +99,9 @@ export async function recordSuccessfulSend(supabase, { item, contact, business, 
 
   if (messageInsertResult?.error) {
     console.error(`[Sender] Failed to log outbound message for ${item.id}: ${messageInsertResult.error.message}`)
+    log('error', 'sender', 'sender.message_log_failed', `Failed to log outbound message: ${messageInsertResult.error.message}`, {
+      business_id: item.business_id, contact_id: item.contact_id, entity_id: item.id
+    })
   }
   const insertedMessageId = messageInsertResult?.data?.id ?? null
 
@@ -123,12 +127,31 @@ export async function recordSuccessfulSend(supabase, { item, contact, business, 
       .maybeSingle()
 
     if (enrollment && stepRow) {
-      await supabase.from('campaign_step_events').upsert({
+      const { error: stepEventError } = await supabase.from('campaign_step_events').upsert({
         enrollment_id: enrollment.id,
         step_id: stepRow.id,
         message_id: insertedMessageId,
         sent_at: now
       }, { onConflict: 'enrollment_id,step_id' })
+      if (stepEventError) {
+        log('error', 'campaign', 'campaign.step_event_write_failed', stepEventError.message, {
+          business_id: item.business_id, contact_id: item.contact_id, entity_id: item.id,
+          details: { campaignId: item.campaign_id, enrollmentId: enrollment.id, stepId: stepRow.id }
+        })
+      } else if (!insertedMessageId) {
+        // Known gap: reactions are matched back to a campaign step via
+        // message_id (see recordCampaignStepReaction in dbService.js), so
+        // a null here silently breaks reaction attribution for this step.
+        log('warn', 'campaign', 'campaign.step_event_missing_message_id', 'Step event written with no message_id — reaction attribution will not work for this step', {
+          business_id: item.business_id, contact_id: item.contact_id, entity_id: item.id,
+          details: { campaignId: item.campaign_id, enrollmentId: enrollment.id, stepId: stepRow.id }
+        })
+      }
+    } else {
+      log('warn', 'campaign', 'campaign.step_event_unmatched', 'Could not find enrollment/step row to record this send against', {
+        business_id: item.business_id, contact_id: item.contact_id, entity_id: item.id,
+        details: { campaignId: item.campaign_id, foundEnrollment: !!enrollment, foundStep: !!stepRow }
+      })
     }
   }
 

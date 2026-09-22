@@ -1,5 +1,6 @@
 import { OPENAI_KEY, OPENAI_MODEL } from '../config.js'
 import { getBotConfig } from './db.js'
+import { log } from './log.js'
 
 export async function callOpenAI(options) {
   const body = {
@@ -13,6 +14,7 @@ export async function callOpenAI(options) {
   }
   if (options.json) body.response_format = { type: 'json_object' }
 
+  const startedAt = Date.now()
   try {
     const controller = new AbortController()
     const timeout = setTimeout(() => controller.abort(), 30000)
@@ -24,12 +26,32 @@ export async function callOpenAI(options) {
       signal: controller.signal
     })
     clearTimeout(timeout)
+    const durationMs = Date.now() - startedAt
 
-    if (!res.ok) { console.error(`[AI] ${res.status}`); return null }
+    if (!res.ok) {
+      const errText = await res.text().catch(() => '')
+      console.error(`[AI] ${res.status}`)
+      log('error', 'ai', 'ai.call_failed', `OpenAI returned ${res.status}`, {
+        duration_ms: durationMs,
+        details: { purpose: options.purpose ?? null, model: body.model, status: res.status, error: errText.slice(0, 500) }
+      })
+      return null
+    }
     const data = await res.json()
+    log('info', 'ai', 'ai.call', `OpenAI call (${options.purpose ?? 'unspecified'})`, {
+      business_id: options.businessId ?? null,
+      duration_ms: durationMs,
+      details: {
+        purpose: options.purpose ?? null,
+        model: body.model,
+        promptTokens: data.usage?.prompt_tokens ?? null,
+        completionTokens: data.usage?.completion_tokens ?? null,
+      }
+    })
     return data.choices[0].message.content.trim()
   } catch (e) {
     console.error(`[AI] ${e.message}`)
+    log('error', 'ai', 'ai.call_error', e.message, { duration_ms: Date.now() - startedAt, details: { purpose: options.purpose ?? null } })
     return null
   }
 }
@@ -46,6 +68,8 @@ export async function callBot(supabase, botId, userContent, fallbackPrompt, opti
     model: config?.model ?? options.model ?? OPENAI_MODEL,
     temperature: config?.temperature ?? options.temperature ?? 0.7,
     maxTokens: options.maxTokens ?? config?.max_tokens ?? 500,
-    json: options.json
+    json: options.json,
+    purpose: options.purpose ?? botId,
+    businessId: options.businessId ?? null
   })
 }

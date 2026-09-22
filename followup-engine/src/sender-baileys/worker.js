@@ -3,6 +3,7 @@ import { getBusiness, getContact } from '../lib/db.js'
 import { sendContentViaEvolution } from './evolutionSender.js'
 import { checkAntiban, recordSend } from './antiban.js'
 import { recordSuccessfulSend, recordFailedDispatch } from './postSend.js'
+import { log } from '../lib/log.js'
 
 const BATCH_SIZE = 25
 const STALE_CLAIM_MS = 2 * 60_000
@@ -35,7 +36,10 @@ async function recoverStaleClaims() {
     console.error(`[Sender] Failed to recover stale claims: ${error.message}`)
     return
   }
-  if (data?.length) console.warn(`[Sender] Recovered ${data.length} stale sending claim(s)`)
+  if (data?.length) {
+    console.warn(`[Sender] Recovered ${data.length} stale sending claim(s)`)
+    log('warn', 'sender', 'sender.stale_claims_recovered', `Recovered ${data.length} stale sending claim(s)`, { details: { count: data.length, ids: data.map(r => r.id) } })
+  }
 }
 
 export async function processBaileysBatch() {
@@ -132,10 +136,12 @@ export async function processBaileysBatch() {
       }
       if (!claimedItem) continue
 
+      const sendStartedAt = Date.now()
       const result = await sendContentViaEvolution(activeSession.instance_name, contact.phone, {
         text: item.final_message,
         media: item.media
       }, contact.country_code)
+      const sendDurationMs = Date.now() - sendStartedAt
 
       if (!result.ok) {
         await recordFailedDispatch(supabase, item, result.error ?? 'send_failed')
@@ -145,6 +151,11 @@ export async function processBaileysBatch() {
           instanceName: activeSession.instance_name,
           eventType: 'failed',
           reason: result.error ?? 'send_failed'
+        })
+        log('error', 'sender', 'sender.send_failed', `Send failed to ${contact.phone}: ${result.error ?? 'send_failed'}`, {
+          business_id: item.business_id, contact_id: item.contact_id, entity_id: item.id,
+          duration_ms: sendDurationMs,
+          details: { instance: activeSession.instance_name, campaignId: item.campaign_id ?? null, error: result.error ?? 'send_failed' }
         })
         continue
       }
@@ -157,14 +168,26 @@ export async function processBaileysBatch() {
         finalMessage: item.final_message,
         whatsappMessageId: result.messageId
       })
+      log('ok', 'sender', 'sender.sent', `Sent to ${contact.phone}`, {
+        business_id: item.business_id, contact_id: item.contact_id, entity_id: item.id,
+        duration_ms: sendDurationMs,
+        details: { instance: activeSession.instance_name, campaignId: item.campaign_id ?? null, whatsappMessageId: result.messageId }
+      })
       dispatched++
     } catch (e) {
       console.error(`[Sender] Unexpected error for ${item.id}: ${e.message}`)
+      log('error', 'sender', 'sender.unexpected_error', `Unexpected error for queue item ${item.id}: ${e.message}`, {
+        business_id: item.business_id, contact_id: item.contact_id, entity_id: item.id,
+        details: { error: { name: e.name, message: e.message } }
+      })
       await recordFailedDispatch(supabase, item, e.message).catch(() => {})
       await logSendEvent(item.business_id, { queueId: item.id, contactId: item.contact_id, eventType: 'failed', reason: e.message }).catch(() => {})
     }
   }
 
-  if (dispatched) console.log(`[Sender] Dispatched ${dispatched}/${items.length}`)
+  if (dispatched) {
+    console.log(`[Sender] Dispatched ${dispatched}/${items.length}`)
+    log('info', 'sender', 'sender.batch_done', `Dispatched ${dispatched}/${items.length}`, { details: { dispatched, total: items.length } })
+  }
   return { dispatched }
 }

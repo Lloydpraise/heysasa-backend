@@ -9,11 +9,19 @@ import { leadAgeDays, hoursSince } from '../lib/timing.js'
 import { generateFollowupDraft, rewriteSuggestedMessage } from './generateDraft.js'
 import { normalizeOutboundMedia } from '../lib/media.js'
 import { resolveMediaMergeFields, resolveMergeFields } from '../lib/mergeFields.js'
+import { log } from '../lib/log.js'
 
 const STALL_RETRY_MS = 5 * 60_000
 
 export async function runWorker(supabase, queueItemId) {
   if (!queueItemId) throw new Error('queue_item_id required')
+
+  // `item` is assigned below, once loaded — declared here so the two
+  // helpers below (defined before it's loaded, but only ever called
+  // after most of the time) can log business_id/contact_id via closure
+  // when it's available, and fall back to nulls for the handful of
+  // very early checks (item_not_found, already_processed) where it isn't.
+  let item
 
   const updateQueueItem = async (updates) => {
     const { error } = await supabase.from('follow_up_queue').update(updates).eq('id', queueItemId)
@@ -25,6 +33,10 @@ export async function runWorker(supabase, queueItemId) {
   const skipItem = async (reason) => {
     await updateQueueItem({ status: 'skipped', skip_reason: reason })
     console.log(`[Worker] Skipped ${queueItemId} — ${reason}`)
+    log('info', 'scheduler', 'scheduler.skip', `Skipped — ${reason}`, {
+      business_id: item?.business_id ?? null, contact_id: item?.contact_id ?? null, entity_id: queueItemId,
+      details: { reason, campaignId: item?.campaign_id ?? null }
+    })
     return { status: 'skipped', reason }
   }
 
@@ -36,12 +48,17 @@ export async function runWorker(supabase, queueItemId) {
       scheduled_at: new Date(Date.now() + retryInMs).toISOString()
     })
     console.log(`[Worker] Stalled ${queueItemId} — ${reason} (retry in ${Math.round(retryInMs / 60_000)}m)`)
+    log('debug', 'scheduler', 'scheduler.stall', `Stalled — ${reason}, retry in ${Math.round(retryInMs / 60_000)}m`, {
+      business_id: item?.business_id ?? null, contact_id: item?.contact_id ?? null, entity_id: queueItemId,
+      details: { reason, retryInMs, campaignId: item?.campaign_id ?? null }
+    })
     return { status: 'stalled', reason }
   }
 
   // ── 1. Get queue item ────────────────────────────────────────
-  const { data: item, error: itemErr } = await supabase
+  const { data: loadedItem, error: itemErr } = await supabase
     .from('follow_up_queue').select('*').eq('id', queueItemId).single()
+  item = loadedItem
 
   if (itemErr || !item) return skipItem('item_not_found')
   if (item.status !== 'pending') return skipItem('already_processed')
