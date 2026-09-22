@@ -216,7 +216,17 @@ function fmtTime(iso) {
 
 document.getElementById('logout-btn').onclick = () => location.reload();
 
-boot();
+let booted = false;
+
+function boot() {
+  if (booted) return;
+  booted = true;
+  connect();
+  refreshSummary();
+  checkEvolution();
+  loadBusinesses();
+  render();
+}
 
 document.querySelectorAll('nav.tabs button').forEach(btn => {
   btn.onclick = () => {
@@ -376,7 +386,7 @@ setInterval(refreshSummary, 15000);
 
 async function loadQueue() {
   try {
-    const r = await authedFetch('/debug/api/queue').then(x => x.json());
+    const r = await fetch('/debug/api/queue').then(x => x.json());
     if (!r.ok) throw new Error(r.error);
     const statusBody = document.querySelector('#queue-status tbody');
     statusBody.innerHTML = Object.entries(r.byStatus || {}).sort((a,b) => b[1]-a[1])
@@ -500,16 +510,7 @@ document.getElementById('resync-btn').onclick = async () => {
   } catch (err) { alert(err.message); } finally { btn.disabled = false; }
 };
 
-let booted = false;
-function boot() {
-  if (booted) return;
-  booted = true;
-  connect();
-  refreshSummary();
-  checkEvolution();
-  loadBusinesses();
-  render();
-}
+boot();
 </script>
 </body>
 </html>
