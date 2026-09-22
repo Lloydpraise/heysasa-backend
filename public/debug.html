@@ -105,17 +105,7 @@
 </head>
 <body>
 
-<div id="gate">
-  <div class="card">
-    <h1>HeySasa Admin Console</h1>
-    <p>Enter the debug token to continue. It's kept in this browser tab only.</p>
-    <input type="password" id="gate-token" placeholder="Debug token" autocomplete="off">
-    <button id="gate-submit">Enter</button>
-    <div class="err" id="gate-err"></div>
-  </div>
-</div>
-
-<div id="app">
+<div id="app" class="show">
 <header>
   <span class="dot" id="conn-dot"></span>
   <span id="conn-text">connecting…</span>
@@ -206,18 +196,15 @@
 </div>
 
 <script>
-const TOKEN_KEY = 'heysasa_debug_token';
-
-function getToken() { return sessionStorage.getItem(TOKEN_KEY) || ''; }
-function setToken(t) { sessionStorage.setItem(TOKEN_KEY, t); }
-
-function authedFetch(url, opts = {}) {
-  const headers = { ...(opts.headers || {}), 'x-debug-token': getToken() };
-  return fetch(url, { ...opts, headers });
-}
-function withToken(url) {
-  const sep = url.includes('?') ? '&' : '?';
-  return `${url}${sep}token=${encodeURIComponent(getToken())}`;
+function fetchJson(url, opts = {}) {
+  return fetch(url, opts).then(async (res) => {
+    const text = await res.text();
+    try {
+      return { res, data: text ? JSON.parse(text) : null };
+    } catch {
+      return { res, data: text };
+    }
+  });
 }
 
 function escapeHtml(s) {
@@ -227,34 +214,9 @@ function fmtTime(iso) {
   try { return new Date(iso).toLocaleTimeString('en-KE', { hour12: false }); } catch { return iso; }
 }
 
-async function tryEnter(token) {
-  const errEl = document.getElementById('gate-err');
-  errEl.textContent = '';
-  let res;
-  try {
-    res = await fetch(`/debug/api/summary?token=${encodeURIComponent(token)}`);
-  } catch (e) {
-    errEl.textContent = 'Could not reach the server.';
-    return false;
-  }
-  if (res.status === 401 || res.status === 503) {
-    errEl.textContent = res.status === 503 ? 'Server has no DEBUG_TOKEN configured.' : 'Wrong token.';
-    return false;
-  }
-  setToken(token);
-  document.getElementById('gate').style.display = 'none';
-  document.getElementById('app').classList.add('show');
-  boot();
-  return true;
-}
-document.getElementById('gate-submit').onclick = () => tryEnter(document.getElementById('gate-token').value.trim());
-document.getElementById('gate-token').addEventListener('keydown', e => { if (e.key === 'Enter') tryEnter(e.target.value.trim()); });
-document.getElementById('logout-btn').onclick = () => { sessionStorage.removeItem(TOKEN_KEY); location.reload(); };
+document.getElementById('logout-btn').onclick = () => location.reload();
 
-(function autoEnter() {
-  const existing = getToken();
-  if (existing) tryEnter(existing);
-})();
+boot();
 
 document.querySelectorAll('nav.tabs button').forEach(btn => {
   btn.onclick = () => {
@@ -340,7 +302,7 @@ function refreshBizOptions() {
 function connect() {
   const dot = document.getElementById('conn-dot');
   const text = document.getElementById('conn-text');
-  const stream = new EventSource(withToken('/debug/events'));
+  const stream = new EventSource('/debug/events');
   stream.onopen = () => { dot.className = 'dot live'; text.textContent = 'live'; };
   stream.onmessage = ev => {
     const payload = JSON.parse(ev.data);
@@ -389,7 +351,7 @@ newpill.onclick = () => { window.scrollTo(0, document.body.scrollHeight); newpil
 
 async function refreshSummary() {
   try {
-    const r = await authedFetch('/debug/api/summary').then(x => x.json());
+    const r = await fetch('/debug/api/summary').then(x => x.json());
     const ev = document.getElementById('s-evolution');
     ev.textContent = r.evolution?.ok ? `reachable (${r.evolution.durationMs}ms)` : 'unreachable';
     ev.className = 'value ' + (r.evolution?.ok ? 'ok' : 'error');
@@ -438,7 +400,7 @@ async function loadQueue() {
       btn.onclick = async () => {
         btn.disabled = true; btn.textContent = '…';
         try {
-          await authedFetch(`/debug/api/queue/${encodeURIComponent(btn.dataset.retry)}/retry`, { method: 'POST' });
+          await fetch(`/debug/api/queue/${encodeURIComponent(btn.dataset.retry)}/retry`, { method: 'POST' });
           loadQueue();
         } catch { btn.textContent = 'failed'; }
       };
@@ -450,7 +412,7 @@ async function loadQueue() {
 document.getElementById('queue-refresh').onclick = loadQueue;
 document.getElementById('retry-all-btn').onclick = async () => {
   if (!confirm('Retry every currently-failed transient item?')) return;
-  const r = await authedFetch('/debug/api/queue/retry-transient', { method: 'POST' }).then(x => x.json());
+  const r = await fetch('/debug/api/queue/retry-transient', { method: 'POST' }).then(x => x.json());
   alert(`Retried ${r.retried ?? 0} item(s).`);
   loadQueue();
 };
@@ -458,7 +420,7 @@ document.getElementById('retry-all-btn').onclick = async () => {
 async function loadBusinesses() {
   const list = document.getElementById('business-list');
   try {
-    const result = await authedFetch('/debug/businesses').then(r => r.json());
+    const result = await fetch('/debug/businesses').then(r => r.json());
     if (!result.ok) throw new Error(result.error || 'Business lookup failed');
     if (!result.businesses.length) { list.innerHTML = '<div class="empty">No businesses found.</div>'; return; }
     list.replaceChildren(...result.businesses.map(b => {
@@ -475,7 +437,7 @@ async function loadBusinesses() {
 async function startAnalysis(business) {
   if (!confirm(`Run full lead analysis for ${business.name || business.business_id}?`)) return;
   try {
-    const res = await authedFetch('/debug/analysis/start', {
+    const res = await fetch('/debug/analysis/start', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ businessId: business.business_id }),
@@ -494,7 +456,7 @@ document.getElementById('h-run').onclick = async () => {
   const body = document.querySelector('#history-table tbody');
   body.innerHTML = '<tr><td colspan="5">Searching…</td></tr>';
   try {
-    const r = await authedFetch(`/debug/api/logs?${params}`).then(x => x.json());
+    const r = await fetch(`/debug/api/logs?${params}`).then(x => x.json());
     if (!r.ok) throw new Error(r.error || 'Search failed');
     body.innerHTML = (r.rows || []).map(row => `
       <tr>
@@ -514,7 +476,7 @@ async function checkEvolution() {
   const subEl = document.getElementById('evolution-sub');
   btn.disabled = true; subEl.textContent = 'checking…';
   try {
-    const res = await authedFetch('/debug/evolution');
+    const res = await fetch('/debug/evolution');
     const body = await res.json();
     subEl.textContent = body.ok ? `reachable · status ${body.status} · ${body.durationMs}ms` : (body.error || `status ${body.status}`);
   } catch (err) {
@@ -531,7 +493,7 @@ document.getElementById('resync-btn').onclick = async () => {
   const btn = document.getElementById('resync-btn');
   btn.disabled = true;
   try {
-    const res = await authedFetch(`/debug/evolution/resync/${encodeURIComponent(name)}`, { method: 'POST' });
+    const res = await fetch(`/debug/evolution/resync/${encodeURIComponent(name)}`, { method: 'POST' });
     const result = await res.json();
     if (!res.ok) throw new Error(result.error || 'Resync failed');
     alert(`Resync requested for ${name}. Reopen the WhatsApp connection flow to get a fresh QR.`);
