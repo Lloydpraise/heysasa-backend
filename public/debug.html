@@ -105,7 +105,17 @@
 </head>
 <body>
 
-<div id="app" class="show">
+<div id="gate">
+  <div class="card">
+    <h1>HeySasa debug</h1>
+    <p>Enter the debug password to unlock the admin console.</p>
+    <input id="debug-token-input" type="password" placeholder="debug token" autocomplete="current-password">
+    <button id="debug-gate-btn">Unlock</button>
+    <div id="debug-gate-error" class="err"></div>
+  </div>
+</div>
+
+<div id="app">
 <header>
   <span class="dot" id="conn-dot"></span>
   <span id="conn-text">connecting…</span>
@@ -196,8 +206,65 @@
 </div>
 
 <script>
+const DEBUG_TOKEN_STORAGE_KEY = 'heysasa_debug_token';
+
+function getDebugToken() {
+  const stored = sessionStorage.getItem(DEBUG_TOKEN_STORAGE_KEY) || '';
+  if (stored) return stored;
+
+  const legacy = localStorage.getItem(DEBUG_TOKEN_STORAGE_KEY) || '';
+  if (legacy) {
+    sessionStorage.setItem(DEBUG_TOKEN_STORAGE_KEY, legacy);
+    localStorage.removeItem(DEBUG_TOKEN_STORAGE_KEY);
+    return legacy;
+  }
+
+  const urlToken = new URLSearchParams(window.location.search).get('token');
+  return urlToken || '';
+}
+
+function setDebugToken(token) {
+  const next = (token || '').trim();
+  if (next) {
+    sessionStorage.setItem(DEBUG_TOKEN_STORAGE_KEY, next);
+    localStorage.removeItem(DEBUG_TOKEN_STORAGE_KEY);
+  } else {
+    sessionStorage.removeItem(DEBUG_TOKEN_STORAGE_KEY);
+    localStorage.removeItem(DEBUG_TOKEN_STORAGE_KEY);
+  }
+  return next;
+}
+
+const originalFetch = window.fetch.bind(window);
+window.fetch = (input, init = {}) => {
+  const token = getDebugToken();
+  const headers = new Headers(init.headers || {});
+  if (token) headers.set('x-debug-token', token);
+  return originalFetch(input, { ...init, headers });
+};
+
+function debugHeaders(extra = {}) {
+  const token = getDebugToken();
+  const merged = new Headers(extra);
+  if (token) merged.set('x-debug-token', token);
+  return Object.fromEntries(merged.entries());
+}
+
+function debugUrl(path) {
+  const token = getDebugToken();
+  if (!token) return path;
+  const separator = path.includes('?') ? '&' : '?';
+  return `${path}${separator}token=${encodeURIComponent(token)}`;
+}
+
 function fetchJson(url, opts = {}) {
-  return fetch(url, opts).then(async (res) => {
+  return fetch(url, {
+    ...opts,
+    headers: {
+      ...debugHeaders(),
+      ...(opts.headers || {}),
+    },
+  }).then(async (res) => {
     const text = await res.text();
     try {
       return { res, data: text ? JSON.parse(text) : null };
@@ -214,11 +281,44 @@ function fmtTime(iso) {
   try { return new Date(iso).toLocaleTimeString('en-KE', { hour12: false }); } catch { return iso; }
 }
 
-document.getElementById('logout-btn').onclick = () => location.reload();
+document.getElementById('logout-btn').onclick = () => {
+  sessionStorage.removeItem(DEBUG_TOKEN_STORAGE_KEY);
+  localStorage.removeItem(DEBUG_TOKEN_STORAGE_KEY);
+  window.location.reload();
+};
+
+const gateEl = document.getElementById('gate');
+const appEl = document.getElementById('app');
+const gateErrorEl = document.getElementById('debug-gate-error');
+
+function unlockDebugConsole() {
+  const token = setDebugToken(document.getElementById('debug-token-input').value);
+  if (!token) {
+    gateErrorEl.textContent = 'Enter the debug token.';
+    return;
+  }
+
+  gateErrorEl.textContent = '';
+  gateEl.style.display = 'none';
+  appEl.classList.add('show');
+  boot();
+}
+
+document.getElementById('debug-gate-btn').onclick = unlockDebugConsole;
+document.getElementById('debug-token-input').addEventListener('keydown', (event) => {
+  if (event.key === 'Enter') unlockDebugConsole();
+});
+
+const existingToken = getDebugToken();
+if (existingToken) {
+  gateEl.style.display = 'none';
+  appEl.classList.add('show');
+}
 
 let booted = false;
 
 function boot() {
+  if (booted) return;
   if (booted) return;
   booted = true;
   connect();
@@ -312,7 +412,7 @@ function refreshBizOptions() {
 function connect() {
   const dot = document.getElementById('conn-dot');
   const text = document.getElementById('conn-text');
-  const stream = new EventSource('/debug/events');
+  const stream = new EventSource(debugUrl('/debug/events'));
   stream.onopen = () => { dot.className = 'dot live'; text.textContent = 'live'; };
   stream.onmessage = ev => {
     const payload = JSON.parse(ev.data);
@@ -361,7 +461,7 @@ newpill.onclick = () => { window.scrollTo(0, document.body.scrollHeight); newpil
 
 async function refreshSummary() {
   try {
-    const r = await fetch('/debug/api/summary').then(x => x.json());
+    const r = await fetch(debugUrl('/debug/api/summary'), { headers: debugHeaders() }).then(x => x.json());
     const ev = document.getElementById('s-evolution');
     ev.textContent = r.evolution?.ok ? `reachable (${r.evolution.durationMs}ms)` : 'unreachable';
     ev.className = 'value ' + (r.evolution?.ok ? 'ok' : 'error');
@@ -388,7 +488,7 @@ async function refreshSummary() {
 
 async function loadQueue() {
   try {
-    const r = await fetch('/debug/api/queue').then(x => x.json());
+    const r = await fetch(debugUrl('/debug/api/queue'), { headers: debugHeaders() }).then(x => x.json());
     if (!r.ok) throw new Error(r.error);
     const statusBody = document.querySelector('#queue-status tbody');
     statusBody.innerHTML = Object.entries(r.byStatus || {}).sort((a,b) => b[1]-a[1])
@@ -412,7 +512,10 @@ async function loadQueue() {
       btn.onclick = async () => {
         btn.disabled = true; btn.textContent = '…';
         try {
-          await fetch(`/debug/api/queue/${encodeURIComponent(btn.dataset.retry)}/retry`, { method: 'POST' });
+          await fetch(debugUrl(`/debug/api/queue/${encodeURIComponent(btn.dataset.retry)}/retry`), {
+            method: 'POST',
+            headers: debugHeaders(),
+          });
           loadQueue();
         } catch { btn.textContent = 'failed'; }
       };
@@ -424,7 +527,7 @@ async function loadQueue() {
 document.getElementById('queue-refresh').onclick = loadQueue;
 document.getElementById('retry-all-btn').onclick = async () => {
   if (!confirm('Retry every currently-failed transient item?')) return;
-  const r = await fetch('/debug/api/queue/retry-transient', { method: 'POST' }).then(x => x.json());
+  const r = await fetch(debugUrl('/debug/api/queue/retry-transient'), { method: 'POST', headers: debugHeaders() }).then(x => x.json());
   alert(`Retried ${r.retried ?? 0} item(s).`);
   loadQueue();
 };
@@ -432,7 +535,7 @@ document.getElementById('retry-all-btn').onclick = async () => {
 async function loadBusinesses() {
   const list = document.getElementById('business-list');
   try {
-    const result = await fetch('/debug/businesses').then(r => r.json());
+    const result = await fetch(debugUrl('/debug/businesses'), { headers: debugHeaders() }).then(r => r.json());
     if (!result.ok) throw new Error(result.error || 'Business lookup failed');
     if (!result.businesses.length) { list.innerHTML = '<div class="empty">No businesses found.</div>'; return; }
     list.replaceChildren(...result.businesses.map(b => {
@@ -449,9 +552,9 @@ async function loadBusinesses() {
 async function startAnalysis(business) {
   if (!confirm(`Run full lead analysis for ${business.name || business.business_id}?`)) return;
   try {
-    const res = await fetch('/debug/analysis/start', {
+    const res = await fetch(debugUrl('/debug/analysis/start'), {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { ...debugHeaders(), 'Content-Type': 'application/json' },
       body: JSON.stringify({ businessId: business.business_id }),
     });
     const result = await res.json();
@@ -468,7 +571,7 @@ document.getElementById('h-run').onclick = async () => {
   const body = document.querySelector('#history-table tbody');
   body.innerHTML = '<tr><td colspan="5">Searching…</td></tr>';
   try {
-    const r = await fetch(`/debug/api/logs?${params}`).then(x => x.json());
+    const r = await fetch(debugUrl(`/debug/api/logs?${params}`), { headers: debugHeaders() }).then(x => x.json());
     if (!r.ok) throw new Error(r.error || 'Search failed');
     body.innerHTML = (r.rows || []).map(row => `
       <tr>
@@ -488,7 +591,7 @@ async function checkEvolution() {
   const subEl = document.getElementById('evolution-sub');
   btn.disabled = true; subEl.textContent = 'checking…';
   try {
-    const res = await fetch('/debug/evolution');
+    const res = await fetch(debugUrl('/debug/evolution'), { headers: debugHeaders() });
     const body = await res.json();
     subEl.textContent = body.ok ? `reachable · status ${body.status} · ${body.durationMs}ms` : (body.error || `status ${body.status}`);
   } catch (err) {
@@ -505,7 +608,10 @@ document.getElementById('resync-btn').onclick = async () => {
   const btn = document.getElementById('resync-btn');
   btn.disabled = true;
   try {
-    const res = await fetch(`/debug/evolution/resync/${encodeURIComponent(name)}`, { method: 'POST' });
+    const res = await fetch(debugUrl(`/debug/evolution/resync/${encodeURIComponent(name)}`), {
+      method: 'POST',
+      headers: debugHeaders(),
+    });
     const result = await res.json();
     if (!res.ok) throw new Error(result.error || 'Resync failed');
     alert(`Resync requested for ${name}. Reopen the WhatsApp connection flow to get a fresh QR.`);
