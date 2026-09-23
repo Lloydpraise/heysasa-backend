@@ -17,6 +17,7 @@ import {
     resolveBusinessId,
 } from './services/webhookHandler.js';
 import { attachDebugClient, debugLog, logEvent, queryLogs, getStreamClientCount } from './services/debugConsole.js';
+import { requireDebugToken } from './middleware/debugAuth.js';
 import { startAlerts } from './services/alerts.js';
 import { EVOLUTION_API_KEY, EVOLUTION_URL } from './config/evolution.js';
 import {
@@ -25,8 +26,14 @@ import {
     resyncHistoryForInstance,
 } from './services/evolutionConnections.js';
 import { supabase } from './config/supabase.js';
+import { createWaitlistSignup } from './services/waitlistService.js';
+import { getPublicStats } from './services/publicStatsService.js';
 
 dotenv.config();
+
+if (!process.env.DEBUG_TOKEN) {
+    console.error('✗ DEBUG_TOKEN is not set — every /debug route and /instance route will refuse requests until it is set.');
+}
 
 const app = express();
 app.use(cors({
@@ -50,6 +57,26 @@ app.use(express.json({ limit: '50mb' }));
 // from this file's own location can never be wrong.
 const PUBLIC_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '../public');
 app.use(express.static(PUBLIC_DIR));
+
+// ─── Public landing-page endpoints ─────────────────────────────────────────
+// No token, no auth — these are meant to be called from the public
+// heysasa.co.ke landing page by anyone. createWaitlistSignup and
+// getPublicStats do their own validation/rate-limiting/caching.
+app.post('/public/waitlist', async (req, res) => {
+    const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress || 'unknown';
+    const result = await createWaitlistSignup(req.body || {}, ip);
+    res.status(result.status).json(result.ok ? { ok: true, ...result.data } : { ok: false, error: result.error });
+});
+
+app.get('/public/stats', async (_req, res) => {
+    try {
+        const stats = await getPublicStats();
+        res.json({ ok: true, ...stats });
+    } catch (error) {
+        logEvent({ level: 'error', area: 'system', event: 'public_stats_failed', message: error.message });
+        res.status(500).json({ ok: false, error: 'stats_unavailable' });
+    }
+});
 
 let analysisProcess = null;
 let analysisBusinessId = null;
@@ -185,6 +212,7 @@ logEvent({
             SUPABASE_SERVICE_KEY: !!process.env.SUPABASE_SERVICE_KEY,
             EVOLUTION_URL: !!process.env.EVOLUTION_URL,
             EVOLUTION_API_KEY: !!process.env.EVOLUTION_API_KEY,
+            DEBUG_TOKEN: !!process.env.DEBUG_TOKEN,
             LLOYD_PHONE: !!process.env.LLOYD_PHONE,
             PLATFORM_EVOLUTION_INSTANCE: !!process.env.PLATFORM_EVOLUTION_INSTANCE,
             OPENAI_API_KEY: !!process.env.OPENAI_API_KEY,
@@ -222,9 +250,9 @@ function analysisStatus() {
     : { running: false, businessId: null, contactIds: [] };
 }
 
-app.get('/debug/analysis/status', (_req, res) => res.json({ running: !!analysisProcess }));
+app.get('/debug/analysis/status', requireDebugToken, (_req, res) => res.json({ running: !!analysisProcess }));
 
-app.get('/debug/businesses', async (_req, res) => {
+app.get('/debug/businesses', requireDebugToken, async (_req, res) => {
     const { data, error } = await supabase
         .from('businesses')
         .select('business_id, name, created_at')
@@ -239,13 +267,15 @@ app.get('/debug/businesses', async (_req, res) => {
     res.json({ ok: true, businesses: data || [] });
 });
 
-app.get('/debug/followup/status', (_req, res) => res.json({
+app.get('/debug/followup/status', requireDebugToken, (_req, res) => res.json({
     running: !!followupProcess && !followupProcess.killed,
     pid: followupProcess?.pid ?? null,
     port: Number(followupPort),
 }));
 
-app.post('/instance/create/:instanceName', async (req, res) => {
+// CHANGED: these two had no protection at all — anyone who found the URL
+// could create or delete a business's WhatsApp connection.
+app.post('/instance/create/:instanceName', requireDebugToken, async (req, res) => {
     try {
         const result = await createEvolutionInstance(req.params.instanceName);
         res.status(201).json({ ok: true, result });
@@ -254,7 +284,7 @@ app.post('/instance/create/:instanceName', async (req, res) => {
     }
 });
 
-app.delete('/instance/delete/:instanceName', async (req, res) => {
+app.delete('/instance/delete/:instanceName', requireDebugToken, async (req, res) => {
     try {
         await deleteEvolutionInstance(req.params.instanceName);
         res.status(204).send();
@@ -263,7 +293,7 @@ app.delete('/instance/delete/:instanceName', async (req, res) => {
     }
 });
 
-app.post('/debug/evolution/resync/:instanceName', async (req, res) => {
+app.post('/debug/evolution/resync/:instanceName', requireDebugToken, async (req, res) => {
     const { instanceName } = req.params;
     debugLog('info', 'Evolution resync', `Requesting resync for ${instanceName}`, { instanceName });
     try {
@@ -425,7 +455,7 @@ app.get('/analysis/status', async (req, res, next) => {
     }
 });
 
-app.get('/debug/events', (req, res) => {
+app.get('/debug/events', requireDebugToken, (req, res) => {
     // CHANGED: added no-transform (some proxies still buffer without it),
     // X-Accel-Buffering: no (nginx-specific, otherwise it buffers SSE by
     // default), and a 15s keepalive comment so proxies/Cloudflare don't
@@ -450,7 +480,7 @@ app.get('/debug/events', (req, res) => {
 });
 
 // ─── New debug API: summary, log history search, queue, sessions ──────────
-app.get('/debug/api/summary', async (_req, res) => {
+app.get('/debug/api/summary', requireDebugToken, async (_req, res) => {
     const [{ data: businesses }, { data: sessions }, { count: pendingCount }, { count: failedCount }] = await Promise.all([
         supabase.from('businesses').select('business_id, name, subscription_active').then(r => ({ data: r.data })).catch(() => ({ data: [] })),
         supabase.from('whatsapp_sessions').select('business_id, instance_name, status, updated_at').then(r => ({ data: r.data })).catch(() => ({ data: [] })),
@@ -480,13 +510,13 @@ app.get('/debug/api/summary', async (_req, res) => {
     });
 });
 
-app.get('/debug/api/logs', async (req, res) => {
+app.get('/debug/api/logs', requireDebugToken, async (req, res) => {
     const { from, to, area, level, business, q, limit } = req.query;
     const result = await queryLogs({ from, to, area, level, business, q, limit: limit ? Number(limit) : undefined });
     res.json({ ok: !result.error, ...result });
 });
 
-app.get('/debug/api/queue', async (req, res) => {
+app.get('/debug/api/queue', requireDebugToken, async (req, res) => {
     const { data: statusCounts, error: statusError } = await supabase
         .from('follow_up_queue')
         .select('status')
@@ -517,7 +547,7 @@ app.get('/debug/api/queue', async (req, res) => {
     res.json({ ok: true, byStatus, bySkipReason, recentFailed: failedRows || [] });
 });
 
-app.post('/debug/api/queue/:id/retry', async (req, res) => {
+app.post('/debug/api/queue/:id/retry', requireDebugToken, async (req, res) => {
     const { data, error } = await supabase
         .from('follow_up_queue')
         .update({ status: 'ready_to_send', last_dispatch_error: null })
@@ -531,7 +561,7 @@ app.post('/debug/api/queue/:id/retry', async (req, res) => {
     res.json({ ok: true });
 });
 
-app.post('/debug/api/queue/retry-transient', async (_req, res) => {
+app.post('/debug/api/queue/retry-transient', requireDebugToken, async (_req, res) => {
     const { data, error } = await supabase
         .from('follow_up_queue')
         .update({ status: 'ready_to_send', last_dispatch_error: null })
@@ -544,7 +574,7 @@ app.post('/debug/api/queue/retry-transient', async (_req, res) => {
     res.json({ ok: true, retried: data?.length ?? 0 });
 });
 
-app.get('/debug/evolution', async (_req, res) => {
+app.get('/debug/evolution', requireDebugToken, async (_req, res) => {
     const started = Date.now();
     debugLog('info', 'Evolution connect', `Checking ${EVOLUTION_URL}`, { url: EVOLUTION_URL });
     try {
