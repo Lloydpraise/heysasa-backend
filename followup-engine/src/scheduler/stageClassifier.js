@@ -2,6 +2,7 @@ import { getBusiness, getMessages } from '../lib/db.js'
 import { callBot } from '../lib/ai.js'
 import { chargeLeadStageChange } from '../lib/billing.js'
 import { STAGE_CLASSIFIER_FALLBACK } from './prompts.js'
+import { log } from '../lib/log.js'
 
 const BATCH_SIZE = 30
 
@@ -52,7 +53,9 @@ export async function runStageClassifier(supabase) {
 
       classified++
     } catch (e) {
-      console.error(`[Classifier] Error for conv ${conv.id}: ${e.message}`)
+      log('error', 'engine', 'stage_classifier.error', `Error for conv ${conv.id}: ${e.message}`, {
+        entity_id: conv.id, details: { error: { name: e.name, message: e.message } }
+      })
     }
   }
 

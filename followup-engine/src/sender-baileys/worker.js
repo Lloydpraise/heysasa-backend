@@ -17,7 +17,7 @@ async function logSendEvent(businessId, { queueId = null, contactId = null, inst
     event_type: eventType,
     reason
   })
-  if (error) console.error(`[Sender] Failed to log send event: ${error.message}`)
+  if (error) log('error', 'sender', 'sender.log_event_failed', `Failed to log send event: ${error.message}`, { business_id: businessId, details: { error: error.message } })
 }
 
 async function recoverStaleClaims() {
@@ -33,11 +33,10 @@ async function recoverStaleClaims() {
     .select('id')
 
   if (error) {
-    console.error(`[Sender] Failed to recover stale claims: ${error.message}`)
+    log('error', 'sender', 'sender.stale_claims_recovery_failed', `Failed to recover stale claims: ${error.message}`, { details: { error: error.message } })
     return
   }
   if (data?.length) {
-    console.warn(`[Sender] Recovered ${data.length} stale sending claim(s)`)
     log('warn', 'sender', 'sender.stale_claims_recovered', `Recovered ${data.length} stale sending claim(s)`, { details: { count: data.length, ids: data.map(r => r.id) } })
   }
 }
@@ -55,10 +54,9 @@ export async function processBaileysBatch() {
     .limit(BATCH_SIZE)
 
   if (error) {
-    console.error(`[Sender] Failed to fetch batch: ${error.message}`)
+    log('error', 'sender', 'sender.fetch_batch_failed', `Failed to fetch batch: ${error.message}`, { details: { error: error.message } })
     return { dispatched: 0 }
   }
-  console.log(`[Sender] Ready-to-send rows found: ${items?.length ?? 0}`)
   if (!items?.length) return { dispatched: 0 }
 
   let dispatched = 0
@@ -131,7 +129,9 @@ export async function processBaileysBatch() {
         .maybeSingle()
 
       if (claimError) {
-        console.error(`[Sender] Could not mark ${item.id} as sending: ${claimError.message}`)
+        log('error', 'sender', 'sender.claim_failed', `Could not mark ${item.id} as sending: ${claimError.message}`, {
+          business_id: item.business_id, contact_id: item.contact_id, entity_id: item.id, details: { error: claimError.message }
+        })
         continue
       }
       if (!claimedItem) continue
@@ -175,7 +175,6 @@ export async function processBaileysBatch() {
       })
       dispatched++
     } catch (e) {
-      console.error(`[Sender] Unexpected error for ${item.id}: ${e.message}`)
       log('error', 'sender', 'sender.unexpected_error', `Unexpected error for queue item ${item.id}: ${e.message}`, {
         business_id: item.business_id, contact_id: item.contact_id, entity_id: item.id,
         details: { error: { name: e.name, message: e.message } }
@@ -186,7 +185,6 @@ export async function processBaileysBatch() {
   }
 
   if (dispatched) {
-    console.log(`[Sender] Dispatched ${dispatched}/${items.length}`)
     log('info', 'sender', 'sender.batch_done', `Dispatched ${dispatched}/${items.length}`, { details: { dispatched, total: items.length } })
   }
   return { dispatched }

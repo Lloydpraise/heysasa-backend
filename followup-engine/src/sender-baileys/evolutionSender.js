@@ -1,4 +1,5 @@
 import { DEFAULT_PHONE_COUNTRY_CODE, EVOLUTION_URL, EVOLUTION_KEY, PLATFORM_EVOLUTION_INSTANCE } from '../config.js'
+import { log } from '../lib/log.js'
 
 export function normalizePhone(phone, countryCode = DEFAULT_PHONE_COUNTRY_CODE) {
   const digits = String(phone ?? '').replace(/\D/g, '')
@@ -42,7 +43,7 @@ export async function sendContentViaEvolution(instanceName, phone, content = {},
         }
       : { number, text: content.text ?? '' }
 
-    console.log(`[Evolution] Sending ${media ? media.type : 'text'} via ${instanceName} to ${number}`)
+    log('debug', 'connection', 'evolution.sending', `Sending ${media ? media.type : 'text'} via ${instanceName} to ${number}`, { details: { type: media ? media.type : 'text', instance: instanceName } })
     const controller = new AbortController()
     const timeout = setTimeout(() => controller.abort(), 15000)
 
@@ -62,10 +63,10 @@ export async function sendContentViaEvolution(instanceName, phone, content = {},
       }
     }
     const errText = await res.text().catch(() => '')
-    console.error(`[Evolution] ${res.status}: ${errText}`)
+    log('debug', 'connection', 'evolution.http_error', `${res.status}: ${errText}`, { details: { status: res.status, instance: instanceName } })
     return { ok: false, error: `${res.status}: ${errText}` }
   } catch (e) {
-    console.error(`[Evolution] ${e.message}`)
+    log('debug', 'connection', 'evolution.request_error', e.message, { details: { instance: instanceName, error: e.message } })
     return { ok: false, error: e.message }
   }
 }
@@ -74,7 +75,7 @@ export async function sendContentViaEvolution(instanceName, phone, content = {},
 // (uses the platform-level Evolution instance, not the business's own)
 export async function sendPlatformMessage(ownerPhone, message) {
   if (!PLATFORM_EVOLUTION_INSTANCE) {
-    console.warn('[Evolution] PLATFORM_EVOLUTION_INSTANCE not set — nudge not sent')
+    log('warn', 'connection', 'evolution.platform_instance_not_configured', 'PLATFORM_EVOLUTION_INSTANCE not set — nudge not sent', {})
     return { ok: false, error: 'platform_instance_not_configured' }
   }
   return sendViaEvolution(PLATFORM_EVOLUTION_INSTANCE, ownerPhone, message)

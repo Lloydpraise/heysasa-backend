@@ -3,6 +3,7 @@ import { supabase } from '../supabaseClient.js'
 import { getBusiness, getContact, getPersonaPack, getConversation } from '../lib/db.js'
 import { generateFollowupDraft } from '../scheduler/generateDraft.js'
 import { normalizeOutboundMedia } from '../lib/media.js'
+import { log } from '../lib/log.js'
 
 export const queueRouter = Router()
 
@@ -75,7 +76,7 @@ queueRouter.post('/queue/:id/approve', async (req, res) => {
     approval_status: 'approved'
   }).eq('id', item.id)
 
-  console.log(`[Approval] Approved ${item.id} for business ${req.businessId}`)
+  log('info', 'api', 'approval.approved', `Approved ${item.id} for business ${req.businessId}`, { business_id: req.businessId, entity_id: item.id })
   res.json({ status: 'ready_to_send', channel: business.whatsapp_channel })
 })
 
@@ -89,7 +90,7 @@ queueRouter.post('/queue/:id/edit', async (req, res) => {
 
   await supabase.from('follow_up_queue').update({ draft_message: text }).eq('id', item.id)
 
-  console.log(`[Approval] Edited ${item.id} for business ${req.businessId}`)
+  log('info', 'api', 'approval.edited', `Edited ${item.id} for business ${req.businessId}`, { business_id: req.businessId, entity_id: item.id })
   res.json({ status: 'awaiting_approval', draft_message: text })
 })
 
@@ -120,7 +121,7 @@ queueRouter.post('/queue/:id/regenerate', async (req, res) => {
     qc_notes: result.qcNotes
   }).eq('id', item.id)
 
-  console.log(`[Approval] Regenerated ${item.id} for business ${req.businessId}`)
+  log('info', 'api', 'approval.regenerated', `Regenerated ${item.id} for business ${req.businessId}`, { business_id: req.businessId, entity_id: item.id })
   res.json({ status: 'awaiting_approval', draft_message: result.finalMessage, qc_passed: result.qcPassed, qc_notes: result.qcNotes })
 })
 
@@ -135,6 +136,6 @@ queueRouter.post('/queue/:id/reject', async (req, res) => {
     skip_reason: 'rejected_by_owner'
   }).eq('id', item.id)
 
-  console.log(`[Approval] Rejected ${item.id} for business ${req.businessId}`)
+  log('info', 'api', 'approval.rejected', `Rejected ${item.id} for business ${req.businessId}`, { business_id: req.businessId, entity_id: item.id })
   res.json({ status: 'rejected' })
 })

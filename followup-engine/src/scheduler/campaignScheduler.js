@@ -1,6 +1,7 @@
 import { getContact, getConversation } from '../lib/db.js'
 import { resolveMediaMergeFields, resolveMergeFields } from '../lib/mergeFields.js'
 import { isBusinessAwake } from '../lib/timing.js'
+import { log } from '../lib/log.js'
 
 const BATCH_SIZE = 30
 const CAMPAIGN_SEED_INTERVAL_MS = parseInt(process.env.CAMPAIGN_SEED_INTERVAL_MS ?? `${5 * 60_000}`)
@@ -23,7 +24,7 @@ async function syncCampaignsWithFollowupToggle(supabase) {
     .from('businesses')
     .select('business_id, followup_ai_enabled')
   if (error) {
-    console.error(`[CampaignScheduler] followup_ai_enabled lookup failed: ${error.message}`)
+    log('error', 'engine', 'campaign_scheduler.toggle_lookup_failed', `followup_ai_enabled lookup failed: ${error.message}`, { details: { error: error.message } })
     return
   }
 
@@ -37,7 +38,7 @@ async function syncCampaignsWithFollowupToggle(supabase) {
       .in('business_id', disabledIds)
       .eq('status', 'active')
       .select('id')
-    if (paused?.length) console.log(`[CampaignScheduler] Paused ${paused.length} campaign(s) — follow-ups disabled`)
+    if (paused?.length) log('info', 'engine', 'campaign_scheduler.paused', `Paused ${paused.length} campaign(s) — follow-ups disabled`, { details: { count: paused.length, campaignIds: paused.map(p => p.id) } })
   }
 
   if (enabledIds.length) {
@@ -48,7 +49,7 @@ async function syncCampaignsWithFollowupToggle(supabase) {
       .eq('status', 'paused')
       .eq('failure_reason', 'followup_ai_disabled')
       .select('id')
-    if (resumed?.length) console.log(`[CampaignScheduler] Resumed ${resumed.length} campaign(s) — follow-ups re-enabled`)
+    if (resumed?.length) log('info', 'engine', 'campaign_scheduler.resumed', `Resumed ${resumed.length} campaign(s) — follow-ups re-enabled`, { details: { count: resumed.length, campaignIds: resumed.map(r => r.id) } })
   }
 }
 
@@ -91,7 +92,9 @@ async function seedCampaignEnrollments(supabase) {
       .eq('list_id', campaign.list_id)
 
     if (memberError) {
-      console.error(`[CampaignScheduler] List lookup failed for campaign ${campaign.id}: ${memberError.message}`)
+      log('error', 'engine', 'campaign_scheduler.list_lookup_failed', `List lookup failed for campaign ${campaign.id}: ${memberError.message}`, {
+        entity_id: campaign.id, details: { error: memberError.message }
+      })
       continue
     }
 
@@ -105,11 +108,15 @@ async function seedCampaignEnrollments(supabase) {
     ])
 
     if (contactsError) {
-      console.error(`[CampaignScheduler] Contact lookup failed for campaign ${campaign.id}: ${contactsError.message}`)
+      log('error', 'engine', 'campaign_scheduler.contact_lookup_failed', `Contact lookup failed for campaign ${campaign.id}: ${contactsError.message}`, {
+        entity_id: campaign.id, details: { error: contactsError.message }
+      })
       continue
     }
     if (existingError) {
-      console.error(`[CampaignScheduler] Enrollment lookup failed for campaign ${campaign.id}: ${existingError.message}`)
+      log('error', 'engine', 'campaign_scheduler.enrollment_lookup_failed', `Enrollment lookup failed for campaign ${campaign.id}: ${existingError.message}`, {
+        entity_id: campaign.id, details: { error: existingError.message }
+      })
       continue
     }
 
@@ -135,15 +142,21 @@ async function seedCampaignEnrollments(supabase) {
 
     if (enrollmentError) {
       if (enrollmentError.code === '23505' || enrollmentError.code === 'P0001') {
-        console.log(`[CampaignScheduler] Skipped conflicting enrollments for campaign ${campaign.id}: ${enrollmentError.message}`)
+        log('debug', 'engine', 'campaign_scheduler.enrollment_conflict', `Skipped conflicting enrollments for campaign ${campaign.id}: ${enrollmentError.message}`, {
+          entity_id: campaign.id, details: { code: enrollmentError.code }
+        })
       } else {
-        console.error(`[CampaignScheduler] Enrollment insert failed for campaign ${campaign.id}: ${enrollmentError.message}`)
+        log('error', 'engine', 'campaign_scheduler.enrollment_insert_failed', `Enrollment insert failed for campaign ${campaign.id}: ${enrollmentError.message}`, {
+          entity_id: campaign.id, details: { error: enrollmentError.message }
+        })
       }
       continue
     }
 
     enrolled += rows.length
-    console.log(`[CampaignScheduler] Enrolled ${rows.length} contacts in campaign ${campaign.id}`)
+    log('info', 'engine', 'campaign_scheduler.enrolled', `Enrolled ${rows.length} contacts in campaign ${campaign.id}`, {
+      entity_id: campaign.id, details: { count: rows.length }
+    })
   }
 
   return enrolled
@@ -164,7 +177,6 @@ async function seedCampaignEnrollments(supabase) {
 // should instead always auto-send regardless of zone.
 export async function runCampaignScheduler(supabase) {
   const now = new Date().toISOString()
-  console.log(`[CampaignScheduler] Cycle started at ${now}`)
 
   // followup_ai_enabled is now an active blocker for campaigns: off
   // pauses them, back on resumes them (and their stalled items pick
@@ -175,7 +187,7 @@ export async function runCampaignScheduler(supabase) {
   if (Date.now() - lastCampaignSeedAt >= CAMPAIGN_SEED_INTERVAL_MS) {
     seeded = await seedCampaignEnrollments(supabase)
     lastCampaignSeedAt = Date.now()
-    if (seeded) console.log(`[CampaignScheduler] Seeded ${seeded} campaign enrollments`)
+    if (seeded) log('info', 'engine', 'campaign_scheduler.seeded', `Seeded ${seeded} campaign enrollments`, { details: { seeded } })
   }
 
   const { data: due, error } = await supabase
@@ -186,30 +198,39 @@ export async function runCampaignScheduler(supabase) {
     .limit(BATCH_SIZE)
 
   if (error) {
-    console.error(`[CampaignScheduler] Enrollment fetch failed: ${error.message}`)
+    log('error', 'engine', 'campaign_scheduler.enrollment_fetch_failed', `Enrollment fetch failed: ${error.message}`, { details: { error: error.message } })
     return { queued: 0, error: error.message }
   }
-  console.log(`[CampaignScheduler] Due enrollments found: ${due?.length ?? 0}`)
   if (!due?.length) return { queued: 0 }
 
   let queued = 0
   // Cache business-awake checks per cycle so a batch spanning many
   // enrollments for the same business only looks it up once.
   const awakeCache = new Map()
+  // Cache campaign rows and their connected-session check per cycle too —
+  // a batch is frequently dozens of enrollments for the same one or two
+  // campaigns, and these were previously refetched per enrollment.
+  const campaignCache = new Map()
+  const sessionCache = new Map()
   for (const enrollment of due) {
     try {
-      console.log(`[CampaignScheduler] Checking enrollment ${enrollment.id} campaign:${enrollment.campaign_id} lead:${enrollment.lead_id} step:${(enrollment.current_step ?? 0) + 1}`)
-      const { data: campaign } = await supabase
-        .from('campaigns')
-        .select('id, business_id, status, whatsapp_instance_name')
-        .eq('id', enrollment.campaign_id)
-        .single()
+      let campaign = campaignCache.get(enrollment.campaign_id)
+      if (campaign === undefined) {
+        const { data } = await supabase
+          .from('campaigns')
+          .select('id, business_id, status, whatsapp_instance_name')
+          .eq('id', enrollment.campaign_id)
+          .single()
+        campaign = data ?? null
+        campaignCache.set(enrollment.campaign_id, campaign)
+      }
       if (!campaign) {
-        console.warn(`[CampaignScheduler] Skipped enrollment ${enrollment.id}: campaign not found`)
+        log('warn', 'engine', 'campaign_scheduler.campaign_not_found', `Skipped enrollment ${enrollment.id}: campaign not found`, {
+          entity_id: enrollment.id, details: { campaignId: enrollment.campaign_id }
+        })
         continue
       }
       if (campaign.status !== 'active') {
-        console.warn(`[CampaignScheduler] Skipped enrollment ${enrollment.id}: campaign status is ${campaign.status}`)
         continue
       }
 
@@ -228,14 +249,19 @@ export async function runCampaignScheduler(supabase) {
       // whatsapp_sessions is the source of truth — no live Evolution
       // ping, and nothing here pauses or fails the campaign over it.
       if (campaign.whatsapp_instance_name) {
-        const { data: connectedSession } = await supabase
-          .from('whatsapp_sessions')
-          .select('instance_name')
-          .eq('business_id', campaign.business_id)
-          .eq('instance_name', campaign.whatsapp_instance_name)
-          .eq('status', 'connected')
-          .maybeSingle()
-        if (!connectedSession) continue
+        let hasConnectedSession = sessionCache.get(campaign.id)
+        if (hasConnectedSession === undefined) {
+          const { data: connectedSession } = await supabase
+            .from('whatsapp_sessions')
+            .select('instance_name')
+            .eq('business_id', campaign.business_id)
+            .eq('instance_name', campaign.whatsapp_instance_name)
+            .eq('status', 'connected')
+            .maybeSingle()
+          hasConnectedSession = !!connectedSession
+          sessionCache.set(campaign.id, hasConnectedSession)
+        }
+        if (!hasConnectedSession) continue
       }
 
       const nextStepNumber = (enrollment.current_step ?? 0) + 1
@@ -248,20 +274,26 @@ export async function runCampaignScheduler(supabase) {
 
       if (!step) {
         // No more steps defined — campaign finished for this lead
-        console.warn(`[CampaignScheduler] Completed enrollment ${enrollment.id}: step ${nextStepNumber} not found`)
+        log('info', 'engine', 'campaign_scheduler.enrollment_completed', `Completed enrollment ${enrollment.id}: no step ${nextStepNumber}`, {
+          entity_id: enrollment.id, details: { campaignId: enrollment.campaign_id, finalStep: nextStepNumber - 1 }
+        })
         await supabase.from('campaign_enrollments').update({ status: 'completed' }).eq('id', enrollment.id)
         const { error: completionError } = await supabase.rpc('complete_campaign_if_finished', {
           target_campaign_id: enrollment.campaign_id
         })
         if (completionError) {
-          console.error(`[CampaignScheduler] Campaign completion check failed for ${enrollment.campaign_id}: ${completionError.message}`)
+          log('error', 'engine', 'campaign_scheduler.completion_check_failed', `Campaign completion check failed for ${enrollment.campaign_id}: ${completionError.message}`, {
+            entity_id: enrollment.campaign_id, details: { error: completionError.message }
+          })
         }
         continue
       }
 
       const contact = await getContact(supabase, enrollment.lead_id)
       if (!contact) {
-        console.warn(`[CampaignScheduler] Skipped enrollment ${enrollment.id}: contact ${enrollment.lead_id} not found`)
+        log('warn', 'engine', 'campaign_scheduler.contact_not_found', `Skipped enrollment ${enrollment.id}: contact ${enrollment.lead_id} not found`, {
+          entity_id: enrollment.id, details: { leadId: enrollment.lead_id }
+        })
         continue
       }
 
@@ -276,7 +308,9 @@ export async function runCampaignScheduler(supabase) {
         .in('status', ['pending', 'ready_to_send', 'sending', 'sent', 'failed'])
         .maybeSingle()
       if (existing) {
-        console.log(`[CampaignScheduler] Skipped enrollment ${enrollment.id}: queue item already exists for step ${step.step_number}`)
+        log('debug', 'engine', 'campaign_scheduler.dedupe_skip', `Skipped enrollment ${enrollment.id}: queue item already exists for step ${step.step_number}`, {
+          entity_id: enrollment.id, details: { step: step.step_number }
+        })
         continue
       }
 
@@ -300,21 +334,27 @@ export async function runCampaignScheduler(supabase) {
       }).select('id').single()
 
       if (queueError) {
-        console.error(`[CampaignScheduler] Queue insert failed for enrollment ${enrollment.id}: ${queueError.message}`)
+        log('error', 'engine', 'campaign_scheduler.queue_insert_failed', `Queue insert failed for enrollment ${enrollment.id}: ${queueError.message}`, {
+          entity_id: enrollment.id, details: { error: queueError.message }
+        })
         continue
       }
 
       queued++
-      console.log(`[CampaignScheduler] Queue item created ${queueItem.id} for enrollment ${enrollment.id} step ${step.step_number}`)
+      log('debug', 'engine', 'campaign_scheduler.queue_item_created', `Queue item created ${queueItem.id} for enrollment ${enrollment.id} step ${step.step_number}`, {
+        entity_id: enrollment.id, details: { queueItemId: queueItem.id, step: step.step_number }
+      })
 
       if (enrollment.status === 'pending') {
         await supabase.from('campaign_enrollments').update({ status: 'active' }).eq('id', enrollment.id)
       }
     } catch (e) {
-      console.error(`[CampaignScheduler] Error for enrollment ${enrollment.id}: ${e.message}`)
+      log('error', 'engine', 'campaign_scheduler.error', `Error for enrollment ${enrollment.id}: ${e.message}`, {
+        entity_id: enrollment.id, details: { error: { name: e.name, message: e.message } }
+      })
     }
   }
 
-  console.log(`[CampaignScheduler] Cycle completed: queued ${queued}/${due.length}`)
+  if (queued) log('info', 'engine', 'campaign_scheduler.cycle_completed', `Cycle completed: queued ${queued}/${due.length}`, { details: { queued, total: due.length } })
   return { queued }
 }

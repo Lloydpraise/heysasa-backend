@@ -1,5 +1,6 @@
 import { runWorker } from './worker.js'
 import { isBusinessAwake } from '../lib/timing.js'
+import { log } from '../lib/log.js'
 
 export async function runScheduler(supabase) {
   const { data: items, error } = await supabase
@@ -12,7 +13,6 @@ export async function runScheduler(supabase) {
     .limit(50)
 
   if (error) throw new Error(error.message)
-  console.log(`[Scheduler] Pending approved queue rows found: ${items?.length ?? 0}`)
   if (!items?.length) return { processed: 0 }
 
   // "Sleep mode" — hold every item for a business that's currently in
@@ -33,7 +33,7 @@ export async function runScheduler(supabase) {
   )
   const awakeItems = items.filter(item => awakeBusinessIds.has(item.business_id))
   const asleepCount = items.length - awakeItems.length
-  if (asleepCount) console.log(`[Scheduler] Holding ${asleepCount} item(s) — business asleep (quiet hours/inactive day)`)
+  if (asleepCount) log('debug', 'engine', 'scheduler.holding', `Holding ${asleepCount} item(s) — business asleep (quiet hours/inactive day)`, { details: { asleepCount } })
   if (!awakeItems.length) return { processed: 0 }
 
   // CHANGED from the original: same process, no fetch-to-self hop.
@@ -46,9 +46,9 @@ export async function runScheduler(supabase) {
 
   const failures = results.filter(r => r.status === 'rejected')
   if (failures.length) {
-    console.error(`[Scheduler] ${failures.length}/${awakeItems.length} worker runs threw`)
+    log('error', 'engine', 'scheduler.worker_failures', `${failures.length}/${awakeItems.length} worker runs threw`, { details: { failed: failures.length, total: awakeItems.length } })
   }
 
-  console.log(`[Scheduler] Cycle completed: processed ${awakeItems.length}, failures ${failures.length}`)
+  if (awakeItems.length) log('info', 'engine', 'scheduler.cycle_completed', `Cycle completed: processed ${awakeItems.length}, failures ${failures.length}`, { details: { processed: awakeItems.length, failures: failures.length } })
   return { processed: awakeItems.length }
 }

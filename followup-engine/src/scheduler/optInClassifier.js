@@ -1,6 +1,7 @@
 import { getConversation, getMessages } from '../lib/db.js'
 import { callBot } from '../lib/ai.js'
 import { OPT_IN_CLASSIFIER_FALLBACK } from './prompts.js'
+import { log } from '../lib/log.js'
 
 const BATCH_SIZE = 30
 
@@ -129,13 +130,14 @@ export async function runOptInClassifier(supabase) {
       // as-is; lastClassifiedAt above still gets set so this same message
       // isn't re-classified next poll.
     } catch (e) {
-      console.error(`[OptInClassifier] Error for contact ${contact.id}: ${e.message}`)
+      log('error', 'engine', 'opt_in_classifier.error', `Error for contact ${contact.id}: ${e.message}`, {
+        contact_id: contact.id, details: { error: { name: e.name, message: e.message } }
+      })
     }
   }
 
   for (const contact of notYetOptedIn.values()) await classifyOne(contact, { canOptIn: true })
   for (const contact of alreadyOptedIn.values()) await classifyOne(contact, { canOptIn: false })
 
-  if (classified) console.log(`[OptInClassifier] Classified ${classified}`)
   return { classified }
 }

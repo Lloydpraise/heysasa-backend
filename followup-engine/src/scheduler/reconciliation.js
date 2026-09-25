@@ -2,6 +2,7 @@ import { getContact, getBusiness, getConversation, getMessages, getNextSequenceS
 import { calculateSendTime, getZonedParts } from '../lib/timing.js'
 import { sendPlatformMessage } from '../sender-baileys/evolutionSender.js'
 import { DEFAULT_QUIET_START, DEFAULT_QUIET_END, DEFAULT_TIMEZONE } from '../config.js'
+import { log } from '../lib/log.js'
 
 const BATCH_SIZE = 50
 
@@ -83,10 +84,11 @@ export async function runPostSendReconciliation(supabase) {
       await supabase.from('follow_up_queue').update({ next_step_processed: true }).eq('id', item.id)
       reconciled++
     } catch (e) {
-      console.error(`[Reconciliation] Error for ${item.id}: ${e.message}`)
+      log('error', 'engine', 'reconciliation.error', `Error for ${item.id}: ${e.message}`, {
+        entity_id: item.id, details: { error: { name: e.name, message: e.message } }
+      })
     }
   }
 
-  if (reconciled) console.log(`[Reconciliation] Processed ${reconciled}`)
   return { reconciled }
 }

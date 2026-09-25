@@ -30,7 +30,6 @@ export async function callOpenAI(options) {
 
     if (!res.ok) {
       const errText = await res.text().catch(() => '')
-      console.error(`[AI] ${res.status}`)
       log('error', 'ai', 'ai.call_failed', `OpenAI returned ${res.status}`, {
         duration_ms: durationMs,
         details: { purpose: options.purpose ?? null, model: body.model, status: res.status, error: errText.slice(0, 500) }
@@ -50,7 +49,6 @@ export async function callOpenAI(options) {
     })
     return data.choices[0].message.content.trim()
   } catch (e) {
-    console.error(`[AI] ${e.message}`)
     log('error', 'ai', 'ai.call_error', e.message, { duration_ms: Date.now() - startedAt, details: { purpose: options.purpose ?? null } })
     return null
   }

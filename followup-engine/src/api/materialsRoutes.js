@@ -1,5 +1,6 @@
 import { Router } from 'express'
 import { supabase } from '../supabaseClient.js'
+import { log } from '../lib/log.js'
 
 export const materialsRouter = Router()
 
@@ -43,7 +44,7 @@ materialsRouter.post('/materials', async (req, res) => {
 
   if (error) return res.status(500).json({ error: error.message })
 
-  console.log(`[Materials] Created ${data.id} for business ${req.businessId}`)
+  log('info', 'api', 'materials.created', `Created ${data.id} for business ${req.businessId}`, { business_id: req.businessId, entity_id: data.id })
   res.status(201).json({ ...data, type: data.material_type })
 })
 
@@ -73,7 +74,7 @@ materialsRouter.put('/materials/:id', async (req, res) => {
 
   if (error) return res.status(500).json({ error: error.message })
 
-  console.log(`[Materials] Updated ${id} for business ${req.businessId}`)
+  log('info', 'api', 'materials.updated', `Updated ${id} for business ${req.businessId}`, { business_id: req.businessId, entity_id: id })
   res.json({ ...data, type: data.material_type })
 })
 
@@ -89,6 +90,6 @@ materialsRouter.delete('/materials/:id', async (req, res) => {
   const { error } = await supabase.from('followup_materials').delete().eq('id', id)
   if (error) return res.status(500).json({ error: error.message })
 
-  console.log(`[Materials] Deleted ${id} for business ${req.businessId}`)
+  log('info', 'api', 'materials.deleted', `Deleted ${id} for business ${req.businessId}`, { business_id: req.businessId, entity_id: id })
   res.status(204).send()
 })

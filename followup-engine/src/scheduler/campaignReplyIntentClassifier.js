@@ -1,6 +1,7 @@
 import { getConversation, getMessages } from '../lib/db.js'
 import { callBot } from '../lib/ai.js'
 import { CAMPAIGN_REPLY_INTENT_FALLBACK } from './prompts.js'
+import { log } from '../lib/log.js'
 
 const BATCH_SIZE = 30
 const VALID_LABELS = ['action', 'opt_out', 'positive', 'negative', 'neutral']
@@ -32,7 +33,7 @@ export async function runCampaignReplyIntentClassifier(supabase) {
     .limit(BATCH_SIZE)
 
   if (error) {
-    console.error(`[CampaignReplyIntent] Fetch failed: ${error.message}`)
+    log('error', 'engine', 'campaign_reply_intent.fetch_failed', `Fetch failed: ${error.message}`, { details: { error: error.message } })
     return { classified: 0 }
   }
   if (!pendingEvents?.length) return { classified: 0 }
@@ -116,10 +117,11 @@ export async function runCampaignReplyIntentClassifier(supabase) {
 
       classified++
     } catch (e) {
-      console.error(`[CampaignReplyIntent] Error for step event ${event.id}: ${e.message}`)
+      log('error', 'engine', 'campaign_reply_intent.error', `Error for step event ${event.id}: ${e.message}`, {
+        entity_id: event.id, details: { error: { name: e.name, message: e.message } }
+      })
     }
   }
 
-  if (classified) console.log(`[CampaignReplyIntent] Classified ${classified}`)
   return { classified }
 }

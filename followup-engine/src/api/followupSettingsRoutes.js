@@ -1,5 +1,6 @@
 import { Router } from 'express'
 import { supabase } from '../supabaseClient.js'
+import { log } from '../lib/log.js'
 
 export const followupSettingsRouter = Router()
 
@@ -113,6 +114,6 @@ followupSettingsRouter.put('/settings/followup', async (req, res) => {
 
   if (error) return res.status(500).json({ error: error.message })
 
-  console.log(`[Settings] Follow-up prefs saved for business ${req.businessId}`)
+  log('info', 'api', 'settings.saved', `Follow-up prefs saved for business ${req.businessId}`, { business_id: req.businessId })
   res.json(toUiPrefs(data))
 })

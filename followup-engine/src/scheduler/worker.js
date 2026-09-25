@@ -32,7 +32,6 @@ export async function runWorker(supabase, queueItemId) {
   // already closed, bad sentiment, structural queue-item problems).
   const skipItem = async (reason) => {
     await updateQueueItem({ status: 'skipped', skip_reason: reason })
-    console.log(`[Worker] Skipped ${queueItemId} — ${reason}`)
     log('info', 'scheduler', 'scheduler.skip', `Skipped — ${reason}`, {
       business_id: item?.business_id ?? null, contact_id: item?.contact_id ?? null, entity_id: queueItemId,
       details: { reason, campaignId: item?.campaign_id ?? null }
@@ -47,7 +46,6 @@ export async function runWorker(supabase, queueItemId) {
       skip_reason: reason,
       scheduled_at: new Date(Date.now() + retryInMs).toISOString()
     })
-    console.log(`[Worker] Stalled ${queueItemId} — ${reason} (retry in ${Math.round(retryInMs / 60_000)}m)`)
     log('debug', 'scheduler', 'scheduler.stall', `Stalled — ${reason}, retry in ${Math.round(retryInMs / 60_000)}m`, {
       business_id: item?.business_id ?? null, contact_id: item?.contact_id ?? null, entity_id: queueItemId,
       details: { reason, retryInMs, campaignId: item?.campaign_id ?? null }
@@ -213,14 +211,20 @@ export async function runWorker(supabase, queueItemId) {
         final_message: finalMessage, draft_message: draft, qc_passed: qcPassed,
         approval_status: 'approved', media: item.media
       })
-      console.log(`[Worker] Campaign ready to send — campaign:${item.campaign_id} | step:${item.campaign_step} | contact:${item.contact_id}`)
+      log('debug', 'scheduler', 'scheduler.campaign_ready', `Campaign ready to send — campaign:${item.campaign_id} | step:${item.campaign_step} | contact:${item.contact_id}`, {
+        business_id: item.business_id, contact_id: item.contact_id, entity_id: queueItemId,
+        details: { campaignId: item.campaign_id, step: item.campaign_step }
+      })
       return { status: 'ready_to_send', step: item.sequence_step, channel: business.whatsapp_channel }
     }
 
     await supabase.from('follow_up_queue').update({
       approval_status: 'awaiting_approval', draft_message: finalMessage, qc_passed: qcPassed, qc_notes: qcNotes
     }).eq('id', queueItemId)
-    console.log(`[Worker] Campaign draft awaiting approval — campaign:${item.campaign_id} | step:${item.campaign_step} | contact:${item.contact_id}`)
+    log('debug', 'scheduler', 'scheduler.campaign_awaiting_approval', `Campaign draft awaiting approval — campaign:${item.campaign_id} | step:${item.campaign_step} | contact:${item.contact_id}`, {
+      business_id: item.business_id, contact_id: item.contact_id, entity_id: queueItemId,
+      details: { campaignId: item.campaign_id, step: item.campaign_step }
+    })
     return { status: 'awaiting_approval', step: item.sequence_step }
   }
 
@@ -286,7 +290,10 @@ export async function runWorker(supabase, queueItemId) {
       media: item.media
     })
 
-    console.log(`[Worker] Owner-written message ready to send — step:${item.sequence_step} | contact:${item.contact_id}`)
+    log('debug', 'scheduler', 'scheduler.owner_written_ready', `Owner-written message ready to send — step:${item.sequence_step} | contact:${item.contact_id}`, {
+      business_id: item.business_id, contact_id: item.contact_id, entity_id: queueItemId,
+      details: { step: item.sequence_step }
+    })
     return { status: 'ready_to_send', step: item.sequence_step, channel: business.whatsapp_channel }
   }
 
@@ -315,7 +322,10 @@ export async function runWorker(supabase, queueItemId) {
       media: item.media
     })
 
-    console.log(`[Worker] Ready to send — channel:${business.whatsapp_channel} | step:${item.sequence_step} | contact:${item.contact_id}`)
+    log('debug', 'scheduler', 'scheduler.auto_ready', `Ready to send — channel:${business.whatsapp_channel} | step:${item.sequence_step} | contact:${item.contact_id}`, {
+      business_id: item.business_id, contact_id: item.contact_id, entity_id: queueItemId,
+      details: { channel: business.whatsapp_channel, step: item.sequence_step }
+    })
     return { status: 'ready_to_send', step: item.sequence_step, zone: 'auto', channel: business.whatsapp_channel }
   }
 
@@ -327,6 +337,9 @@ export async function runWorker(supabase, queueItemId) {
     qc_notes: qcNotes
   }).eq('id', queueItemId)
 
-  console.log(`[Worker] Draft saved — zone:${zone} | step:${item.sequence_step} | contact:${item.contact_id}`)
+  log('debug', 'scheduler', 'scheduler.draft_saved', `Draft saved — zone:${zone} | step:${item.sequence_step} | contact:${item.contact_id}`, {
+    business_id: item.business_id, contact_id: item.contact_id, entity_id: queueItemId,
+    details: { zone, step: item.sequence_step }
+  })
   return { status: 'awaiting_approval', zone, step: item.sequence_step }
 }

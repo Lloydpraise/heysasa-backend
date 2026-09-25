@@ -1,5 +1,6 @@
 import { DEFAULT_TIMEZONE } from '../config.js'
 import { getZonedParts } from '../lib/timing.js'
+import { log } from '../lib/log.js'
 
 export async function runActivityPatterns(supabase) {
   const cutoff = new Date(Date.now() - 3_600_000).toISOString()
@@ -63,7 +64,9 @@ export async function runActivityPatterns(supabase) {
 
       updated++
     } catch (e) {
-      console.error(`[Patterns] Error: ${e.message}`)
+      log('error', 'engine', 'activity_patterns.error', `Error: ${e.message}`, {
+        entity_id: item.contact_id, details: { error: { name: e.name, message: e.message } }
+      })
     }
   }
 

@@ -98,7 +98,6 @@ export async function recordSuccessfulSend(supabase, { item, contact, business, 
   ])
 
   if (messageInsertResult?.error) {
-    console.error(`[Sender] Failed to log outbound message for ${item.id}: ${messageInsertResult.error.message}`)
     log('error', 'sender', 'sender.message_log_failed', `Failed to log outbound message: ${messageInsertResult.error.message}`, {
       business_id: item.business_id, contact_id: item.contact_id, entity_id: item.id
     })
@@ -162,7 +161,9 @@ export async function recordSuccessfulSend(supabase, { item, contact, business, 
   const tierCap = newTotal >= tier3 ? 100 : newTotal >= tier2 ? 80 : null
   if (tierCap !== null && tierCap > business.followup_daily_cap) {
     await supabase.from('businesses').update({ followup_daily_cap: tierCap }).eq('business_id', item.business_id)
-    console.log(`[Sender] Daily cap upgraded to ${tierCap} for ${item.business_id}`)
+    log('info', 'sender', 'sender.daily_cap_upgraded', `Daily cap upgraded to ${tierCap} for ${item.business_id}`, {
+      business_id: item.business_id, details: { newCap: tierCap, lifetimeSends: newTotal }
+    })
   }
 
   // Campaign step advancement — separate from follow_up_count/sequence_step
@@ -195,7 +196,9 @@ export async function recordSuccessfulSend(supabase, { item, contact, business, 
         target_campaign_id: item.campaign_id
       })
       if (completionError) {
-        console.error(`[Sender] Campaign completion check failed for ${item.campaign_id}: ${completionError.message}`)
+        log('error', 'sender', 'sender.completion_check_failed', `Campaign completion check failed for ${item.campaign_id}: ${completionError.message}`, {
+          business_id: item.business_id, entity_id: item.campaign_id, details: { error: completionError.message }
+        })
       }
     }
   }
@@ -217,5 +220,8 @@ export async function recordFailedDispatch(supabase, item, errorMessage) {
     last_dispatch_error: errorMessage
   }).eq('id', item.id)
 
-  console.error(`[Sender] Dispatch failed for ${item.id} (attempt ${attempts}${permanent ? ', not on WhatsApp — giving up' : ', retrying in ~1h'}): ${errorMessage}`)
+  log('error', 'sender', 'sender.dispatch_failed', `Dispatch failed for ${item.id} (attempt ${attempts}${permanent ? ', not on WhatsApp — giving up' : ', retrying in ~1h'}): ${errorMessage}`, {
+    business_id: item.business_id, contact_id: item.contact_id, entity_id: item.id,
+    details: { attempts, permanent, error: errorMessage }
+  })
 }

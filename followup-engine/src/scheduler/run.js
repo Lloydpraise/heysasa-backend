@@ -40,13 +40,11 @@ function loop(name, fn, intervalMs) {
       // shown live, never persisted to system_logs.
       log('debug', 'engine', 'engine.heartbeat', `${name} tick ok`, { details: { loop: name, ok: true } })
     } catch (e) {
-      console.error(`[${name}] Tick error: ${e.message}`)
       log('error', 'engine', 'engine.tick_error', `${name} tick failed: ${e.message}`, { details: { loop: name, error: { name: e.name, message: e.message } } })
     } finally {
       running = false
     }
   }
-  console.log(`[${name}] Starting — polling every ${intervalMs}ms`)
   log('info', 'engine', 'engine.loop_started', `${name} starting — polling every ${intervalMs}ms`, { details: { loop: name, intervalMs } })
   tick()
   setInterval(tick, intervalMs)

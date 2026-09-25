@@ -7,7 +7,6 @@ import { materialsRouter } from './materialsRoutes.js'
 import { whatsappRouter } from './whatsappRoutes.js'
 import { campaignRouter } from './campaignRoutes.js'
 import { CORS_ORIGINS } from '../config.js'
-import { isAllowedOrigin } from '../../../src/cors.js'
 import { log } from '../lib/log.js'
 
 const PORT = parseInt(process.env.PORT ?? '3001')
@@ -15,7 +14,9 @@ const PORT = parseInt(process.env.PORT ?? '3001')
 const app = express()
 app.use(cors({
   origin: (origin, callback) => {
-    callback(null, isAllowedOrigin(origin, CORS_ORIGINS))
+    const isLocalDevelopmentOrigin = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin || '')
+    const isConfiguredOrigin = !origin || CORS_ORIGINS.includes(origin)
+    callback(null, isLocalDevelopmentOrigin || isConfiguredOrigin)
   },
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Authorization', 'Content-Type', 'X-Business-Id'],
@@ -51,6 +52,5 @@ app.use(whatsappRouter)
 app.use(campaignRouter)
 
 app.listen(PORT, () => {
-  console.log(`[API] Listening on :${PORT}`)
   log('info', 'api', 'api.started', `Follow-up API listening on :${PORT}`, { details: { port: PORT } })
 })

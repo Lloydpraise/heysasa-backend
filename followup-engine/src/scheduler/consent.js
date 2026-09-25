@@ -3,6 +3,7 @@ import { callBot } from '../lib/ai.js'
 import { checkBalance, flagInsufficientFunds } from '../lib/billing.js'
 import { DEFAULT_CONSENT_COST } from '../config.js'
 import { CONSENT_FALLBACK } from './prompts.js'
+import { log } from '../lib/log.js'
 
 const SILENCE_HOURS = 2
 const BATCH_SIZE = 30
@@ -82,10 +83,11 @@ export async function runConsent(supabase) {
 
       queued++
     } catch (e) {
-      console.error(`[Consent] Error for ${contact.id}: ${e.message}`)
+      log('error', 'engine', 'consent.error', `Error for ${contact.id}: ${e.message}`, {
+        contact_id: contact.id, details: { error: { name: e.name, message: e.message } }
+      })
     }
   }
 
-  if (queued) console.log(`[Consent] Queued ${queued}`)
   return { queued, checked: contacts.length }
 }
