@@ -1,6 +1,7 @@
 import { createClient } from '@supabase/supabase-js';
 import dotenv from 'dotenv';
 import crypto from 'crypto';
+import { resolveLeadClassification } from './src/leadClassification.js';
 
 dotenv.config();
 
@@ -530,7 +531,9 @@ RULES:
 3. Review "CURRENT STABLE PROFILE STATE" — if a field is already populated and still accurate, echo it back exactly. Only change a field when the fresh transcript gives a clear reason to.
 4. Fill null fields when the transcript gives enough evidence; otherwise leave null rather than guessing.
 5. Cross-reference product mentions against the catalog: match exact product_id/name if found; otherwise infer the rough item name, set product_id null, and set match_status "no match".
-6. Never invent a specific number, date, or promise the customer didn't actually state.
+6. Decide whether this is a business-use WhatsApp chat or a personal/private chat. If it is clearly personal, family-only, private-life, medical, relationship, or unrelated personal content, set lead_type to "personal", is_business_chat to false, and quality_score to 1. Do not treat personal chats as sales leads.
+7. If the transcript is not clearly business and not clearly personal, set lead_type to "junk" and is_business_chat to false rather than guessing a sale.
+8. Never invent a specific number, date, or promise the customer didn't actually state.
 
 Return ONLY a valid JSON object matching this schema:
 {
@@ -538,6 +541,9 @@ Return ONLY a valid JSON object matching this schema:
   "follow_up_urgency":      "hot | warm | cold",
   "quality_score":          integer 1-10,
   "lead_summary":           "one sentence what this lead wants (max 20 words)",
+  "lead_type":              "business | personal | junk",
+  "is_business_chat":       boolean,
+  "personal_reason":        "short reason if lead_type is personal, otherwise null",
   "customer_intent":        "short CRM phrase (max 8 words)",
   "psychology":             "one sentence buyer psychology",
   "conv_stage":             "Awareness | Consideration | Product interest | Negotiation | Stalled | Closed | Ghosted",
@@ -614,6 +620,14 @@ async function applyNLPResults(businessId, contactId, conversationId, nlp, callR
 
     await logAiUsage(businessId, callRunId, promptTokens, completionTokens);
 
+    const { data: existingContact } = await supabase
+        .from('contacts')
+        .select('product_interests, lead_type')
+        .eq('id', contactId)
+        .single();
+
+    const leadDecision = resolveLeadClassification(nlp, existingContact?.lead_type ?? null);
+
     const { error: enrichmentError } = await supabase.from('conversation_enrichment').upsert({
         conversation_id:        conversationId,
         contact_id:             contactId,
@@ -625,7 +639,7 @@ async function applyNLPResults(businessId, contactId, conversationId, nlp, callR
         sentiment_score:        nlp.sentiment_score        ?? null,
         price_objection:        nlp.price_objection        || false,
         product_tags:           nlp.product_tags           || [],
-        last_enriched_at:       new Date().toISOString()
+        last_enriched_at:       new Date().toISOString(),
     }, { onConflict: 'conversation_id' });
     if (enrichmentError) throw new Error(`conversation_enrichment write failed: ${enrichmentError.message}`);
 
@@ -641,25 +655,26 @@ async function applyNLPResults(businessId, contactId, conversationId, nlp, callR
 
     const { data: currentConv } = await supabase
         .from('conversations')
-        .select('customer_intent, psychology, vibe_check')
+        .select('customer_intent, psychology, vibe_check, context_summary, is_business_chat')
         .eq('id', conversationId)
         .single();
-
     const convUpdate = {};
-    if (!currentConv?.customer_intent && nlp.customer_intent) convUpdate.customer_intent = nlp.customer_intent;
-    if (!currentConv?.psychology       && nlp.psychology)      convUpdate.psychology       = nlp.psychology;
-    if (!currentConv?.vibe_check       && nlp.vibe_check)      convUpdate.vibe_check       = nlp.vibe_check;
+    if (nlp.lead_summary || nlp.personal_reason) convUpdate.context_summary = nlp.lead_summary || nlp.personal_reason;
+    if (leadDecision.isBusinessChat !== undefined) convUpdate.is_business_chat = leadDecision.isBusinessChat;
+    if (nlp.customer_intent) convUpdate.customer_intent = nlp.customer_intent;
+    if (nlp.psychology) convUpdate.psychology = nlp.psychology;
+    if (nlp.vibe_check) convUpdate.vibe_check = nlp.vibe_check;
+    if (nlp.quality_score !== undefined) {
+        convUpdate.lead_quality = deriveLeadQuality(
+            Number(nlp.quality_score),
+            leadDecision.isBusinessChat ? 'engaged' : 'cold'
+        );
+    }
 
     if (Object.keys(convUpdate).length > 0) {
         const { error: conversationError } = await supabase.from('conversations').update(convUpdate).eq('id', conversationId);
         if (conversationError) throw new Error(`conversation write failed: ${conversationError.message}`);
     }
-
-    const { data: existingContact } = await supabase
-        .from('contacts')
-        .select('product_interests, lead_type')
-        .eq('id', contactId)
-        .single();
 
     const matchedNames = (nlp.matched_products || []).map(p => p.product_name);
     const mergedInterests = [...new Set([
@@ -677,8 +692,19 @@ async function applyNLPResults(businessId, contactId, conversationId, nlp, callR
     };
     if (mergedInterests.length > 0) contactUpdate.product_interests = mergedInterests;
 
-    if (existingContact?.lead_type === 'pending_analysis' || existingContact?.lead_type === 'pending') {
-        contactUpdate.lead_type = nlp.quality_score >= 3 ? 'business' : 'junk';
+    if (leadDecision.leadType) {
+        contactUpdate.lead_type = leadDecision.leadType;
+    } else if (existingContact?.lead_type === 'personal') {
+        contactUpdate.lead_type = 'personal';
+    } else if (existingContact?.lead_type === 'pending_analysis' || existingContact?.lead_type === 'pending' || existingContact?.lead_type === 'junk' || existingContact?.lead_type === 'business' || !existingContact?.lead_type) {
+        const nextLeadType = leadDecision.leadType || (nlp.quality_score >= 3 ? 'business' : 'junk');
+        contactUpdate.lead_type = nextLeadType;
+    }
+    if (nlp.quality_score !== undefined) {
+        contactUpdate.lead_quality = deriveLeadQuality(
+            Number(nlp.quality_score),
+            leadDecision.isBusinessChat ? 'engaged' : 'cold'
+        );
     }
 
     const safeContactUpdate = Object.fromEntries(

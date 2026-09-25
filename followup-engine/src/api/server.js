@@ -7,6 +7,7 @@ import { materialsRouter } from './materialsRoutes.js'
 import { whatsappRouter } from './whatsappRoutes.js'
 import { campaignRouter } from './campaignRoutes.js'
 import { CORS_ORIGINS } from '../config.js'
+import { isAllowedOrigin } from '../../../src/cors.js'
 import { log } from '../lib/log.js'
 
 const PORT = parseInt(process.env.PORT ?? '3001')
@@ -14,9 +15,7 @@ const PORT = parseInt(process.env.PORT ?? '3001')
 const app = express()
 app.use(cors({
   origin: (origin, callback) => {
-    const isLocalDevelopmentOrigin = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin || '')
-    const isConfiguredOrigin = !origin || CORS_ORIGINS.includes(origin)
-    callback(null, isLocalDevelopmentOrigin || isConfiguredOrigin)
+    callback(null, isAllowedOrigin(origin, CORS_ORIGINS))
   },
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Authorization', 'Content-Type', 'X-Business-Id'],

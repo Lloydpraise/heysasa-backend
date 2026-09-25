@@ -4,6 +4,7 @@ import dotenv from 'dotenv';
 import { spawn, execSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
+import { isAllowedOrigin, normalizeAllowedOrigins } from './cors.js';
 import {
     processLiveMessage,
     processHistorySync,
@@ -36,15 +37,10 @@ if (!process.env.DEBUG_TOKEN) {
 }
 
 const app = express();
+const configuredOrigins = normalizeAllowedOrigins(process.env.CORS_ORIGINS || 'https://heysasa.co.ke,https://www.heysasa.co.ke,http://localhost:5173');
 app.use(cors({
     origin: (origin, callback) => {
-        const configuredOrigins = (process.env.CORS_ORIGINS || 'https://heysasa.co.ke,https://www.heysasa.co.ke,http://localhost:5173')
-            .split(',')
-            .map(value => value.trim())
-            .filter(Boolean);
-        const isLocalDevelopmentOrigin = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin || '');
-
-        callback(null, !origin || configuredOrigins.includes(origin) || isLocalDevelopmentOrigin);
+        callback(null, isAllowedOrigin(origin, configuredOrigins));
     },
     methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization', 'apikey'],
