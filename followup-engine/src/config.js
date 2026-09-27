@@ -1,14 +1,14 @@
 import 'dotenv/config'
 
 export const SUPABASE_URL = process.env.SUPABASE_URL ?? ''
-export const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY ?? ''
+export const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY ?? process.env.SUPABASE_SERVICE_KEY ?? ''
 
 export const EVOLUTION_URL = process.env.EVOLUTION_URL ?? 'http://129.213.33.173:8080'
-export const EVOLUTION_KEY = process.env.EVOLUTION_API_KEY ?? ''
+export const EVOLUTION_KEY = process.env.EVOLUTION_API_KEY ?? process.env.EVOLUTION_KEY ?? ''
 export const PLATFORM_EVOLUTION_INSTANCE = process.env.PLATFORM_EVOLUTION_INSTANCE ?? ''
 export const EVOLUTION_WEBHOOK_URL = process.env.EVOLUTION_WEBHOOK_URL ?? ''
 
-export const OPENAI_KEY = process.env.OPENAI_API_KEY ?? ''
+export const OPENAI_KEY = process.env.OPENAI_API_KEY ?? process.env.OPENAI_KEY ?? ''
 export const OPENAI_MODEL = 'gpt-4.1-mini'
 export const CORS_ORIGINS = (process.env.FOLLOWUP_CORS_ORIGINS ?? process.env.CORS_ORIGINS ?? 'https://heysasa.co.ke,https://www.heysasa.co.ke,http://localhost:5173')
 	.split(',')

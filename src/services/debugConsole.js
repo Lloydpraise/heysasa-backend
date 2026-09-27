@@ -20,10 +20,23 @@ let pendingWrites = [];
 // make the writer log its own writes forever. This is a second, silent
 // client used only for reading/writing system_logs.
 let writerClient = null;
+let invalidKeyWarningShown = false;
+
+export function resolveWriterKey() {
+    const candidates = [process.env.SUPABASE_SERVICE_ROLE_KEY, process.env.SUPABASE_SERVICE_KEY];
+    const key = candidates.map((value) => (typeof value === 'string' ? value.trim() : '')).find(Boolean);
+    return key || null;
+}
+
+export function shouldDisableWriterAfterError(error) {
+    const message = String(error?.message || error || '').toLowerCase();
+    return message.includes('invalid api key') || message.includes('invalid jwt');
+}
+
 function getWriterClient() {
     if (writerClient) return writerClient;
-    const url = process.env.SUPABASE_URL;
-    const key = process.env.SUPABASE_SERVICE_KEY;
+    const url = process.env.SUPABASE_URL?.trim();
+    const key = resolveWriterKey();
     if (!url || !key) return null;
     writerClient = createClient(url, key, { auth: { persistSession: false } });
     return writerClient;
@@ -143,7 +156,18 @@ async function flushPendingWrites() {
     const { error } = await client.from('system_logs').insert(rows);
     // Never route this failure back through logEvent — that would try to
     // persist the failure itself and loop.
-    if (error) console.error(`[DebugConsole] Failed to persist ${rows.length} log row(s): ${error.message}`);
+    if (error) {
+        if (shouldDisableWriterAfterError(error)) {
+            writerClient = null;
+            pendingWrites = [...batch, ...pendingWrites];
+            if (!invalidKeyWarningShown) {
+                console.warn('[DebugConsole] Disabling system_logs persistence because the configured Supabase service key is invalid. Check SUPABASE_SERVICE_ROLE_KEY or SUPABASE_SERVICE_KEY.');
+                invalidKeyWarningShown = true;
+            }
+            return;
+        }
+        console.error(`[DebugConsole] Failed to persist ${rows.length} log row(s): ${error.message}`);
+    }
 }
 setInterval(() => { flushPendingWrites().catch((e) => console.error(`[DebugConsole] Flush error: ${e.message}`)); }, PERSIST_BATCH_MS);
 

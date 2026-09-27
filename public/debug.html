@@ -80,6 +80,8 @@
   .ev-area { color: var(--muted); background: var(--surface-2); border-radius: 4px; padding: 1px 6px; white-space: nowrap; }
   .ev-biz { color: var(--info); white-space: nowrap; }
   .ev-msg { color: var(--text); font-family: var(--sans); font-size: 12.5px; flex: 1; min-width: 200px; }
+  .ev-copy { margin-left: auto; padding: 3px 7px; border: 1px solid var(--border); border-radius: 5px; background: var(--surface-2); color: var(--muted); cursor: pointer; font-size: 10.5px; }
+  .ev-copy:hover { border-color: var(--faint); color: var(--text); }
   .ev-details { display: none; margin-top: 6px; padding: 8px; background: var(--surface-2); border-radius: 6px; font-family: var(--mono); font-size: 11px; white-space: pre-wrap; word-break: break-word; max-height: 300px; overflow: auto; }
   .ev.open .ev-details { display: block; }
   .empty { color: var(--muted); text-align: center; padding: 30px; font-size: 12.5px; }
@@ -101,6 +103,15 @@
   .field { margin-bottom: 12px; }
   .field label { display: block; font-size: 11.5px; color: var(--muted); margin-bottom: 4px; }
   .row { display: flex; gap: 8px; flex-wrap: wrap; }
+
+  .modal { position: fixed; inset: 0; background: rgba(7, 11, 16, 0.7); display: none; align-items: center; justify-content: center; padding: 18px; z-index: 30; }
+  .modal.show { display: flex; }
+  .modal-card { width: min(420px, 100%); background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 18px; }
+  .modal-card h3 { margin: 0 0 8px; font-size: 15px; }
+  .modal-card p { margin: 0 0 12px; color: var(--muted); }
+  .modal-card label { display: block; margin-bottom: 6px; color: var(--muted); font-size: 11.5px; }
+  .modal-card select { width: 100%; margin-bottom: 14px; }
+  .modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
 </style>
 </head>
 <body>
@@ -179,7 +190,7 @@
   <div class="filters">
     <select id="h-area"><option value="">all areas</option></select>
     <select id="h-level"><option value="">all levels</option><option>error</option><option>warn</option><option>ok</option><option>info</option></select>
-    <input class="text" id="h-business" placeholder="business_id">
+    <select id="h-business"><option value="">all businesses</option></select>
     <input class="search" id="h-q" placeholder="search message…">
     <button class="btn primary" id="h-run">Search</button>
   </div>
@@ -203,6 +214,22 @@
   <button class="btn" id="logout-btn">Forget token on this device</button>
 </div>
 
+</div>
+
+<div id="business-run-modal" class="modal" aria-hidden="true">
+  <div class="modal-card">
+    <h3>Run business action</h3>
+    <p id="business-run-modal-name">Select an action for this business.</p>
+    <label for="business-run-action">Action</label>
+    <select id="business-run-action">
+      <option value="analysis">Run analyser</option>
+      <option value="persona">Run persona pack</option>
+    </select>
+    <div class="modal-actions">
+      <button type="button" class="btn" id="business-run-cancel">Cancel</button>
+      <button type="button" class="btn primary" id="business-run-confirm">OK</button>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -239,14 +266,20 @@ const originalFetch = window.fetch.bind(window);
 window.fetch = (input, init = {}) => {
   const token = getDebugToken();
   const headers = new Headers(init.headers || {});
-  if (token) headers.set('x-debug-token', token);
+  if (token) {
+    headers.set('x-debug-token', token);
+    headers.set('debug-token', token);
+  }
   return originalFetch(input, { ...init, headers });
 };
 
 function debugHeaders(extra = {}) {
   const token = getDebugToken();
   const merged = new Headers(extra);
-  if (token) merged.set('x-debug-token', token);
+  if (token) {
+    merged.set('x-debug-token', token);
+    merged.set('debug-token', token);
+  }
   return Object.fromEntries(merged.entries());
 }
 
@@ -279,6 +312,37 @@ function escapeHtml(s) {
 }
 function fmtTime(iso) {
   try { return new Date(iso).toLocaleTimeString('en-KE', { hour12: false }); } catch { return iso; }
+}
+
+async function copyTextToClipboard(text, buttonEl) {
+  const originalText = buttonEl.textContent;
+  const fallbackCopy = () => {
+    const textarea = document.createElement('textarea');
+    textarea.value = text;
+    textarea.setAttribute('readonly', '');
+    textarea.style.position = 'fixed';
+    textarea.style.opacity = '0';
+    document.body.appendChild(textarea);
+    textarea.select();
+    try { document.execCommand('copy'); } catch (_) { /* no-op */ }
+    document.body.removeChild(textarea);
+    buttonEl.textContent = 'Copied';
+    window.setTimeout(() => { buttonEl.textContent = originalText; }, 1200);
+  };
+
+  if (navigator.clipboard && window.isSecureContext) {
+    try {
+      await navigator.clipboard.writeText(text);
+      buttonEl.textContent = 'Copied';
+      window.setTimeout(() => { buttonEl.textContent = originalText; }, 1200);
+      return;
+    } catch (_) {
+      fallbackCopy();
+      return;
+    }
+  }
+
+  fallbackCopy();
 }
 
 document.getElementById('logout-btn').onclick = () => {
@@ -339,17 +403,33 @@ document.querySelectorAll('nav.tabs button').forEach(btn => {
   };
 });
 
-const state = { events: [], levelFilter: '', areaFilter: '', bizFilter: '', search: '', paused: false, errorCount: 0, knownAreas: new Set(), knownBiz: new Set() };
+const state = { events: [], levelFilter: '', areaFilter: '', bizFilter: '', search: '', paused: false, errorCount: 0, knownAreas: new Set(), knownBiz: new Set(), businesses: [] };
 const eventsEl = document.getElementById('events');
 const emptyEl = document.getElementById('events-empty');
 const newpill = document.getElementById('newpill');
 const MAX_KEPT = 2000;
 
+function refreshHistoryBusinessOptions(businesses = []) {
+  const sel = document.getElementById('h-business');
+  const current = sel.value;
+  const normalized = (businesses || [])
+    .filter(b => b && (b.business_id || b.id))
+    .map(b => ({
+      id: String(b.business_id ?? b.id ?? ''),
+      name: String(b.name || '(unnamed business)')
+    }))
+    .filter(b => b.id)
+    .sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id));
+
+  sel.innerHTML = '<option value="">all businesses</option>' + normalized.map(b => `<option value="${escapeHtml(b.id)}">${escapeHtml(b.name)}</option>`).join('');
+  sel.value = normalized.some(b => b.id === current) ? current : '';
+}
+
 function nearBottom() { return window.innerHeight + window.scrollY >= document.body.scrollHeight - 80; }
 
 function addEvent(ev) {
-  state.events.push(ev);
-  if (state.events.length > MAX_KEPT) state.events.shift();
+  state.events.unshift(ev);
+  if (state.events.length > MAX_KEPT) state.events.pop();
   if (ev.level === 'error') { state.errorCount++; document.getElementById('err-count').textContent = state.errorCount; document.getElementById('err-badge').classList.add('has-errors'); }
   if (ev.area && !state.knownAreas.has(ev.area)) { state.knownAreas.add(ev.area); refreshAreaOptions(); }
   if (ev.business_id && !state.knownBiz.has(ev.business_id)) { state.knownBiz.add(ev.business_id); refreshBizOptions(); }
@@ -357,10 +437,13 @@ function addEvent(ev) {
   if (!state.paused) {
     if (matchesFilter(ev)) {
       const wasNearBottom = nearBottom();
-      eventsEl.appendChild(renderEvent(ev));
+      eventsEl.prepend(renderEvent(ev));
       emptyEl.style.display = 'none';
-      if (wasNearBottom) window.scrollTo(0, document.body.scrollHeight);
-      else newpill.classList.add('show');
+      if (wasNearBottom) {
+        newpill.classList.add('show');
+      } else {
+        newpill.classList.add('show');
+      }
     }
   }
 }
@@ -373,6 +456,19 @@ function matchesFilter(ev) {
 }
 function renderEvent(ev) {
   const div = document.createElement('div');
+  const payload = JSON.stringify({
+    ts: ev.ts,
+    level: ev.level,
+    area: ev.area,
+    business_id: ev.business_id,
+    contact_id: ev.contact_id,
+    entity_id: ev.entity_id,
+    event: ev.event,
+    message: ev.message,
+    details: ev.details,
+    duration_ms: ev.duration_ms,
+  }, null, 2);
+
   div.className = `ev lvl-${ev.level}`;
   div.innerHTML = `
     <div class="ev-row">
@@ -381,18 +477,26 @@ function renderEvent(ev) {
       ${ev.business_id ? `<span class="ev-biz">${escapeHtml(ev.business_id)}</span>` : ''}
       <span class="ev-msg">${escapeHtml(ev.message)}</span>
       ${ev.duration_ms != null ? `<span class="ev-time">${ev.duration_ms}ms</span>` : ''}
+      <button type="button" class="ev-copy">Copy</button>
     </div>
-    <div class="ev-details">${escapeHtml(JSON.stringify({ event: ev.event, contact_id: ev.contact_id, entity_id: ev.entity_id, details: ev.details }, null, 2))}</div>
+    <div class="ev-details">${escapeHtml(payload)}</div>
   `;
-  div.onclick = () => div.classList.toggle('open');
+  const copyBtn = div.querySelector('.ev-copy');
+  copyBtn.onclick = async (event) => {
+    event.stopPropagation();
+    await copyTextToClipboard(payload, copyBtn);
+  };
+  div.onclick = (event) => {
+    if (event.target.closest('.ev-copy')) return;
+    div.classList.toggle('open');
+  };
   return div;
 }
 function render() {
   eventsEl.innerHTML = '';
   const filtered = state.events.filter(matchesFilter);
   emptyEl.style.display = filtered.length ? 'none' : 'block';
-  filtered.slice(-500).forEach(ev => eventsEl.appendChild(renderEvent(ev)));
-  window.scrollTo(0, document.body.scrollHeight);
+  filtered.slice(0, 500).forEach(ev => eventsEl.appendChild(renderEvent(ev)));
 }
 function refreshAreaOptions() {
   const sel = document.getElementById('area-filter');
@@ -478,8 +582,10 @@ async function refreshSummary() {
     document.getElementById('s-failed').textContent = r.queue?.failed ?? '—';
     document.getElementById('s-failed').className = 'value ' + ((r.queue?.failed ?? 0) > 0 ? 'warn' : 'ok');
 
-    (r.businesses || []).forEach(b => { if (b.business_id && !state.knownBiz.has(b.business_id)) { state.knownBiz.add(b.business_id); } });
+    state.businesses = r.businesses || [];
+    (state.businesses || []).forEach(b => { if (b.business_id && !state.knownBiz.has(b.business_id)) { state.knownBiz.add(b.business_id); } });
     refreshBizOptions();
+    refreshHistoryBusinessOptions(state.businesses);
   } catch (e) { /* summary is best-effort */ }
 }
 // Summary refresh is now manual-only. The page already uses a live
@@ -537,30 +643,63 @@ async function loadBusinesses() {
   try {
     const result = await fetch(debugUrl('/debug/businesses'), { headers: debugHeaders() }).then(r => r.json());
     if (!result.ok) throw new Error(result.error || 'Business lookup failed');
+    state.businesses = result.businesses || [];
+    refreshHistoryBusinessOptions(state.businesses);
     if (!result.businesses.length) { list.innerHTML = '<div class="empty">No businesses found.</div>'; return; }
     list.replaceChildren(...result.businesses.map(b => {
       const row = document.createElement('button');
       row.className = 'business-row';
       row.innerHTML = `<span>${escapeHtml(b.name || '(unnamed business)')}</span><span class="id">${escapeHtml(b.business_id)}</span>`;
-      row.onclick = () => startAnalysis(b);
+      row.onclick = () => openBusinessActionModal(b);
       return row;
     }));
   } catch (err) {
     list.innerHTML = `<div class="empty">${escapeHtml(err.message)}</div>`;
   }
 }
-async function startAnalysis(business) {
-  if (!confirm(`Run full lead analysis for ${business.name || business.business_id}?`)) return;
+
+let activeBusinessAction = null;
+
+function openBusinessActionModal(business) {
+  activeBusinessAction = business;
+  const modal = document.getElementById('business-run-modal');
+  const title = document.getElementById('business-run-modal-name');
+  title.textContent = `Choose what to run for ${business.name || business.business_id}.`;
+  modal.classList.add('show');
+  modal.setAttribute('aria-hidden', 'false');
+  document.getElementById('business-run-action').value = 'analysis';
+}
+
+function closeBusinessActionModal() {
+  const modal = document.getElementById('business-run-modal');
+  modal.classList.remove('show');
+  modal.setAttribute('aria-hidden', 'true');
+  activeBusinessAction = null;
+}
+
+async function startBusinessAction(business, action) {
+  const endpoint = action === 'persona' ? '/debug/persona/generate' : '/debug/analysis/start';
+  const label = action === 'persona' ? 'persona pack' : 'lead analysis';
   try {
-    const res = await fetch(debugUrl('/debug/analysis/start'), {
+    const res = await fetch(debugUrl(endpoint), {
       method: 'POST',
       headers: { ...debugHeaders(), 'Content-Type': 'application/json' },
       body: JSON.stringify({ businessId: business.business_id }),
     });
     const result = await res.json();
-    if (!res.ok) throw new Error(result.message || result.error || 'Could not start analysis');
+    if (!res.ok) throw new Error(result.message || result.error || `Could not start ${label}`);
+    alert(`${label === 'persona pack' ? 'Persona pack generation' : 'Lead analysis'} started for ${business.name || business.business_id}.`);
   } catch (err) { alert(err.message); }
 }
+
+document.getElementById('business-run-cancel').onclick = closeBusinessActionModal;
+document.getElementById('business-run-confirm').onclick = async () => {
+  const selectedBusiness = activeBusinessAction;
+  if (!selectedBusiness) return closeBusinessActionModal();
+  const action = document.getElementById('business-run-action').value;
+  closeBusinessActionModal();
+  await startBusinessAction(selectedBusiness, action);
+};
 
 document.getElementById('h-run').onclick = async () => {
   const params = new URLSearchParams();
@@ -573,14 +712,29 @@ document.getElementById('h-run').onclick = async () => {
   try {
     const r = await fetch(debugUrl(`/debug/api/logs?${params}`), { headers: debugHeaders() }).then(x => x.json());
     if (!r.ok) throw new Error(r.error || 'Search failed');
-    body.innerHTML = (r.rows || []).map(row => `
+    body.innerHTML = (r.rows || []).map(row => {
+      const raw = JSON.stringify(row, null, 2);
+      return `
       <tr>
         <td>${escapeHtml(fmtTime(row.ts))}</td>
         <td>${escapeHtml(row.level)}</td>
         <td>${escapeHtml(row.area)}</td>
         <td>${escapeHtml(row.business_id || '')}</td>
-        <td class="wrap">${escapeHtml(row.message || '')}</td>
-      </tr>`).join('') || '<tr><td colspan="5">No matching rows.</td></tr>';
+        <td class="wrap">
+          <div style="display:flex; align-items:center; justify-content:space-between; gap:8px;">
+            <span style="flex:1; min-width:0;">${escapeHtml(row.message || '')}</span>
+            <button type="button" class="btn ev-copy" data-copy="${escapeHtml(raw).replace(/"/g, '&quot;')}">Copy</button>
+          </div>
+        </td>
+      </tr>`;
+    }).join('') || '<tr><td colspan="5">No matching rows.</td></tr>';
+    body.querySelectorAll('[data-copy]').forEach(btn => {
+      btn.onclick = async (event) => {
+        event.stopPropagation();
+        const value = btn.dataset.copy || '';
+        await copyTextToClipboard(value.replace(/&quot;/g, '"').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>'), btn);
+      };
+    });
   } catch (e) {
     body.innerHTML = `<tr><td colspan="5">${escapeHtml(e.message)}</td></tr>`;
   }

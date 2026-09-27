@@ -729,9 +729,8 @@ async function saveFailed() {
 
 // ─── Main ───────────────────────────────────────────────────────────────────────
 async function main() {
-    console.log('--------------------------------------------------');
-    console.log(`🎭 Persona Pack Generator — business ${BUSINESS_ID}`);
-    console.log('--------------------------------------------------');
+    log('System', `Persona Pack Generator — business ${BUSINESS_ID}`);
+    log('System', 'Starting persona pack generation run.');
 
     await startRun();
     const business = await loadBusiness();
@@ -745,7 +744,7 @@ async function main() {
         warn('Voice', `Below threshold (need ${MIN_VOICE_MESSAGES} messages / ${MIN_VOICE_CONVERSATIONS} conversations) — marking insufficient_data instead of generating. Messages considered: ${voiceMessages.length}, conversations: ${distinctConvs}.`);
         await saveInsufficientData();
         await finishRun('insufficient_data');
-        console.log('✅ Done — insufficient data, no pack written.');
+        log('System', 'Done — insufficient data, no pack written.');
         process.exit(0);
     }
 
@@ -785,9 +784,7 @@ async function main() {
 
     await finishRun('completed');
 
-    console.log('--------------------------------------------------');
-    console.log(`✅ Done! persona_packs version ${version} is now active for ${BUSINESS_ID}.`);
-    console.log('--------------------------------------------------');
+    log('System', `Done! persona_packs version ${version} is now active for ${BUSINESS_ID}.`);
     process.exit(0);
 }
 

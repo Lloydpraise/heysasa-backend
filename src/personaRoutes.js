@@ -2,6 +2,7 @@ import express from 'express';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { supabase } from './config/supabase.js';
+import { isDebugTokenValid } from './middleware/debugAuth.js';
 import { logEvent } from './services/debugConsole.js';
 
 // Mirrors the analysisProcess spawn pattern in index.js exactly (same
@@ -24,7 +25,7 @@ function forwardPersonaLine(line, fallbackLevel) {
             // fall through to plain-text logging below
         }
     }
-    logEvent({ level: fallbackLevel, area: 'persona', message: line });
+    logEvent({ level: fallbackLevel, area: 'persona', event: 'persona.raw_output', message: line, business_id: personaBusinessId ?? null });
 }
 
 function personaStatus() {
@@ -47,6 +48,10 @@ async function resolveBusinessId(req, res) {
     if (!requestedBusinessId) {
         res.status(400).json({ ok: false, error: 'missing_business_id' });
         return null;
+    }
+
+    if (isDebugTokenValid(req)) {
+        return requestedBusinessId;
     }
 
     const authHeader = req.headers.authorization || '';

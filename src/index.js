@@ -18,7 +18,7 @@ import {
     resolveBusinessId,
 } from './services/webhookHandler.js';
 import { attachDebugClient, debugLog, logEvent, queryLogs, getStreamClientCount } from './services/debugConsole.js';
-import { requireDebugToken } from './middleware/debugAuth.js';
+import { isDebugTokenValid, requireDebugToken } from './middleware/debugAuth.js';
 import { startAlerts } from './services/alerts.js';
 import { EVOLUTION_API_KEY, EVOLUTION_URL } from './config/evolution.js';
 import {
@@ -306,25 +306,30 @@ app.post('/debug/evolution/resync/:instanceName', requireDebugToken, async (req,
 async function startAnalysis(req, res) {
     const authHeader = req.headers.authorization || '';
     const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : null;
-    if (!token) {
+    const debugAuthorized = isDebugTokenValid(req);
+    if (!token && !debugAuthorized) {
         res.status(401).json({ ok: false, error: 'missing_auth_token' });
         return;
     }
 
-    const { data: userData, error: userError } = await supabase.auth.getUser(token);
-    if (userError || !userData?.user?.email) {
-        res.status(401).json({ ok: false, error: 'invalid_auth_token' });
-        return;
-    }
+    let ownedBusiness = null;
+    if (!debugAuthorized) {
+        const { data: userData, error: userError } = await supabase.auth.getUser(token);
+        if (userError || !userData?.user?.email) {
+            res.status(401).json({ ok: false, error: 'invalid_auth_token' });
+            return;
+        }
 
-    const { data: ownedBusiness, error: businessError } = await supabase
-        .from('businesses')
-        .select('business_id')
-        .eq('owner_email', userData.user.email)
-        .single();
-    if (businessError || !ownedBusiness) {
-        res.status(403).json({ ok: false, error: 'no_business_for_user' });
-        return;
+        const { data: businessData, error: businessError } = await supabase
+            .from('businesses')
+            .select('business_id')
+            .eq('owner_email', userData.user.email)
+            .single();
+        if (businessError || !businessData) {
+            res.status(403).json({ ok: false, error: 'no_business_for_user' });
+            return;
+        }
+        ownedBusiness = businessData;
     }
 
     if (analysisProcess) {
@@ -335,8 +340,12 @@ async function startAnalysis(req, res) {
     const projectRoot = fileURLToPath(new URL('../', import.meta.url));
     const businessId = typeof req.body?.businessId === 'string' && req.body.businessId.trim()
         ? req.body.businessId.trim()
-        : ownedBusiness.business_id;
-    if (businessId !== ownedBusiness.business_id) {
+        : ownedBusiness?.business_id;
+    if (!businessId) {
+        res.status(400).json({ ok: false, error: 'missing_business_id' });
+        return;
+    }
+    if (!debugAuthorized && businessId !== ownedBusiness.business_id) {
         res.status(403).json({ ok: false, error: 'business_not_owned' });
         return;
     }
@@ -418,7 +427,11 @@ async function startAnalysis(req, res) {
     res.status(202).json({ ok: true, message: 'Analysis started', ...analysisStatus() });
 }
 
-app.post(['/analysis/start', '/debug/analysis/start'], (req, res, next) => {
+app.post('/debug/analysis/start', requireDebugToken, (req, res, next) => {
+    startAnalysis(req, res).catch(next);
+});
+
+app.post('/analysis/start', (req, res, next) => {
     startAnalysis(req, res).catch(next);
 });
 

@@ -4,11 +4,11 @@ import { logEvent } from '../services/debugConsole.js';
 
 dotenv.config();
 
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY; // service role key — server-side only, never expose to frontend
+const SUPABASE_URL = process.env.SUPABASE_URL?.trim();
+const SUPABASE_KEY = (process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_KEY)?.trim(); // service role key — server-side only, never expose to frontend
 
 if (!SUPABASE_URL || !SUPABASE_KEY) {
-    console.error('✗ Missing SUPABASE_URL or SUPABASE_SERVICE_KEY in environment');
+    console.error('✗ Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY / SUPABASE_SERVICE_KEY in environment');
     process.exit(1);
 }
 
