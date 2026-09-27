@@ -29,6 +29,7 @@ import {
 import { supabase } from './config/supabase.js';
 import { createWaitlistSignup } from './services/waitlistService.js';
 import { getPublicStats } from './services/publicStatsService.js';
+import personaRoutes from './personaRoutes.js';
 
 dotenv.config();
 
@@ -450,6 +451,8 @@ app.get('/analysis/status', async (req, res, next) => {
         return next(error);
     }
 });
+
+app.use(personaRoutes);
 
 app.get('/debug/events', requireDebugToken, (req, res) => {
     // CHANGED: added no-transform (some proxies still buffer without it),
