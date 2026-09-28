@@ -8,6 +8,7 @@ import { whatsappRouter } from './whatsappRoutes.js'
 import { campaignRouter } from './campaignRoutes.js'
 import { CORS_ORIGINS } from '../config.js'
 import { log } from '../lib/log.js'
+import { checkOpenAIAvailability, getOpenAIAvailabilityState } from '../lib/openAiGate.js'
 
 const PORT = parseInt(process.env.PORT ?? '3001')
 
@@ -42,6 +43,15 @@ app.use((req, res, next) => {
     })
   })
   next()
+})
+
+app.get('/debug/openai/status', (_req, res) => {
+  res.json(getOpenAIAvailabilityState())
+})
+
+app.post('/debug/openai/recheck', async (_req, res) => {
+  const status = await checkOpenAIAvailability({ force: true })
+  res.json({ ok: status.available, ...status })
 })
 
 app.use(requireBusinessAuth)

@@ -29,6 +29,7 @@ import {
 import { supabase } from './config/supabase.js';
 import { createWaitlistSignup } from './services/waitlistService.js';
 import { getPublicStats } from './services/publicStatsService.js';
+import { checkOpenAIAvailability, getOpenAIAvailabilityState } from './services/openAiGate.js';
 import personaRoutes from './personaRoutes.js';
 
 dotenv.config();
@@ -247,13 +248,54 @@ function analysisStatus() {
     : { running: false, businessId: null, contactIds: [] };
 }
 
-app.get('/debug/analysis/status', requireDebugToken, (_req, res) => res.json({ running: !!analysisProcess }));
+// Latest analysis run for one business, from the database. Survives restarts
+// and carries live progress written by run-local.js.
+async function latestAnalysisRun(businessId) {
+    if (!businessId) return null;
+    const { data } = await supabase
+        .from('enrichment_runs')
+        .select('id, run_type, status, phase, progress_done, progress_total, started_at, finished_at, heartbeat_at, fatal_error, summary, classify_counts, structural_enriched, nlp_enriched, nlp_errored, nlp_skipped')
+        .eq('business_id', businessId)
+        .order('started_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+    if (!data) return null;
+    const heartbeatAgeSec = data.heartbeat_at ? Math.round((Date.now() - new Date(data.heartbeat_at).getTime()) / 1000) : null;
+    return {
+        ...data,
+        percent: data.progress_total ? Math.min(100, Math.round((data.progress_done / data.progress_total) * 100)) : null,
+        heartbeatAgeSec,
+        // Process says running but nothing has been written for 3+ minutes.
+        maybeStuck: data.status === 'running' && heartbeatAgeSec !== null && heartbeatAgeSec > 180,
+    };
+}
+
+async function analysisStatusFor(businessId) {
+    const mine = !!analysisProcess && analysisBusinessId?.businessId === businessId;
+    const run = await latestAnalysisRun(businessId);
+    const state = mine ? 'running' : (run?.status === 'completed' ? 'completed' : run?.status === 'failed' ? 'failed' : 'idle');
+    return { state, running: mine, businessId, run };
+}
+
+app.get('/debug/analysis/status', requireDebugToken, async (req, res, next) => {
+    try {
+        const businessId = req.query.businessId || analysisBusinessId?.businessId || null;
+        res.json({ running: !!analysisProcess, ...(businessId ? await analysisStatusFor(businessId) : {}) });
+    } catch (error) { next(error); }
+});
 
 app.get('/debug/businesses', requireDebugToken, async (_req, res) => {
-    const { data, error } = await supabase
-        .from('businesses')
-        .select('business_id, name, created_at')
-        .order('created_at', { ascending: false });
+    const [{ data, error }, { data: runs }] = await Promise.all([
+        supabase
+            .from('businesses')
+            .select('business_id, name, created_at')
+            .order('created_at', { ascending: false }),
+        supabase
+            .from('enrichment_runs')
+            .select('business_id, run_type, status, phase, progress_done, progress_total, started_at, finished_at, heartbeat_at')
+            .in('run_type', ['full_pass', 'contact_pass', 'persona_pack'])
+            .order('started_at', { ascending: false }),
+    ]);
 
     if (error) {
         debugLog('error', 'Business lookup', 'Could not load businesses', { error });
@@ -261,7 +303,41 @@ app.get('/debug/businesses', requireDebugToken, async (_req, res) => {
         return;
     }
 
-    res.json({ ok: true, businesses: data || [] });
+    const latestByBusiness = new Map();
+    for (const run of runs || []) {
+        const businessId = run.business_id;
+        const bucket = latestByBusiness.get(businessId) || { analysis_run: null, persona_run: null };
+        if (run.run_type === 'persona_pack') {
+            if (!bucket.persona_run || new Date(run.started_at || 0).getTime() > new Date(bucket.persona_run.started_at || 0).getTime()) {
+                bucket.persona_run = run;
+            }
+        } else if (['full_pass', 'contact_pass'].includes(run.run_type)) {
+            if (!bucket.analysis_run || new Date(run.started_at || 0).getTime() > new Date(bucket.analysis_run.started_at || 0).getTime()) {
+                bucket.analysis_run = run;
+            }
+        }
+        latestByBusiness.set(businessId, bucket);
+    }
+
+    const businesses = (data || []).map((business) => {
+        const latestRuns = latestByBusiness.get(business.business_id) || { analysis_run: null, persona_run: null };
+        const analysisRun = latestRuns.analysis_run || null;
+        const personaRun = latestRuns.persona_run || null;
+        const activeRun = analysisRun?.status === 'running' ? analysisRun : personaRun?.status === 'running' ? personaRun : null;
+        const percent = activeRun?.progress_total ? Math.min(100, Math.round((Number(activeRun.progress_done || 0) / Number(activeRun.progress_total)) * 100)) : 0;
+
+        return {
+            ...business,
+            analysis_run: analysisRun,
+            persona_run: personaRun,
+            active_run: activeRun,
+            progress_percent: percent,
+            progress_phase: activeRun?.phase || null,
+            progress_label: activeRun?.run_type === 'persona_pack' ? 'Persona pack' : activeRun ? 'Analysis' : null,
+        };
+    });
+
+    res.json({ ok: true, businesses });
 });
 
 app.get('/debug/followup/status', requireDebugToken, (_req, res) => res.json({
@@ -269,6 +345,69 @@ app.get('/debug/followup/status', requireDebugToken, (_req, res) => res.json({
     pid: followupProcess?.pid ?? null,
     port: Number(followupPort),
 }));
+
+async function getCombinedOpenAIStatus() {
+    const localState = getOpenAIAvailabilityState();
+    let remoteState = null;
+
+    if (followupProcess && !followupProcess.killed) {
+        try {
+            const res = await fetch(`http://127.0.0.1:${followupPort}/debug/openai/status`);
+            remoteState = (await res.json().catch(() => null)) || null;
+        } catch (error) {
+            logEvent({ level: 'warn', area: 'system', event: 'openai.healthcheck_followup_failed', message: error.message, details: { port: followupPort } });
+        }
+    }
+
+    const nextState = {
+        available: localState.available && (!remoteState || remoteState.available !== false),
+        status: remoteState?.status ?? localState.status,
+        reason: remoteState?.reason || localState.reason,
+        message: remoteState?.available === false ? (remoteState.message || 'OpenAI Unavailable') : (localState.available === false ? localState.message : 'OpenAI available'),
+        lastCheckedAt: remoteState?.lastCheckedAt || localState.lastCheckedAt,
+        unavailableSince: remoteState?.unavailableSince || localState.unavailableSince,
+        health: (localState.available && (!remoteState || remoteState.available !== false)) ? 'ok' : 'unavailable',
+        local: localState,
+        remote: remoteState,
+    };
+    return nextState;
+}
+
+app.get('/debug/openai/status', requireDebugToken, async (_req, res) => {
+    res.json(await getCombinedOpenAIStatus());
+});
+
+app.post('/debug/openai/recheck', requireDebugToken, async (_req, res) => {
+    const localStatus = await checkOpenAIAvailability({ force: true });
+    let remoteStatus = null;
+
+    if (followupProcess && !followupProcess.killed) {
+        try {
+            const remoteRes = await fetch(`http://127.0.0.1:${followupPort}/debug/openai/recheck`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ force: true }),
+            });
+            remoteStatus = await remoteRes.json().catch(() => null);
+        } catch (error) {
+            logEvent({ level: 'warn', area: 'system', event: 'openai.recheck_followup_failed', message: error.message, details: { port: followupPort } });
+        }
+    }
+
+    const combined = {
+        available: localStatus.available && (!remoteStatus || remoteStatus.available !== false),
+        status: remoteStatus?.status ?? localStatus.status,
+        reason: remoteStatus?.reason || localStatus.reason,
+        message: remoteStatus?.available === false ? (remoteStatus.message || 'OpenAI Unavailable') : (localStatus.available === false ? localStatus.message : 'OpenAI available'),
+        lastCheckedAt: remoteStatus?.lastCheckedAt || localStatus.lastCheckedAt,
+        unavailableSince: remoteStatus?.unavailableSince || localStatus.unavailableSince,
+        health: (localStatus.available && (!remoteStatus || remoteStatus.available !== false)) ? 'ok' : 'unavailable',
+        local: localStatus,
+        remote: remoteStatus,
+    };
+
+    res.json({ ok: combined.available, ...combined });
+});
 
 // CHANGED: these two had no protection at all — anyone who found the URL
 // could create or delete a business's WhatsApp connection.
@@ -456,10 +595,9 @@ app.get('/analysis/status', async (req, res, next) => {
             return res.status(403).json({ ok: false, error: 'no_business_for_user' });
         }
 
-        if (analysisProcess && analysisBusinessId.businessId !== ownedBusiness.business_id) {
-            return res.json({ running: false, businessId: null, contactIds: [] });
-        }
-        return res.json(analysisStatus());
+        // Business-level: only ever this owner's business, never another's run.
+        const status = await analysisStatusFor(ownedBusiness.business_id);
+        return res.json({ ...status, contactIds: status.running ? analysisBusinessId.contactIds : [] });
     } catch (error) {
         return next(error);
     }
@@ -509,11 +647,14 @@ app.get('/debug/api/summary', requireDebugToken, async (_req, res) => {
         evolutionOk = { ok: false, error: error.message };
     }
 
+    const openAiState = await getCombinedOpenAIStatus();
+
     res.json({
         ok: true,
         evolution: evolutionOk,
         followupEngine: { running: !!followupProcess && !followupProcess.killed, pid: followupProcess?.pid ?? null },
         analysis: { running: !!analysisProcess },
+        openai: openAiState,
         openaiKeyPresent: !!process.env.OPENAI_API_KEY,
         streamClients: getStreamClientCount(),
         queue: { pending: pendingCount, failed: failedCount },

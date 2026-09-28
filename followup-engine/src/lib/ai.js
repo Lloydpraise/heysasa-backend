@@ -1,8 +1,14 @@
 import { OPENAI_KEY, OPENAI_MODEL } from '../config.js'
 import { getBotConfig } from './db.js'
 import { log } from './log.js'
+import { getOpenAIAvailabilityState, setOpenAIUnavailable, shouldPauseOpenAIRequest } from './openAiGate.js'
 
 export async function callOpenAI(options) {
+  if (shouldPauseOpenAIRequest()) {
+    const state = getOpenAIAvailabilityState();
+    log('warn', 'ai', 'ai.paused', state.message || 'OpenAI Unavailable', { details: { purpose: options.purpose ?? null, status: state.status } })
+    return null
+  }
   const body = {
     model: options.model ?? OPENAI_MODEL,
     temperature: options.temperature ?? 0.7,
@@ -30,6 +36,14 @@ export async function callOpenAI(options) {
 
     if (!res.ok) {
       const errText = await res.text().catch(() => '')
+      if (res.status === 401 || res.status === 429 || /insufficient_quota|rate limit|invalid_api_key|billing/i.test(errText)) {
+        setOpenAIUnavailable({ status: res.status, reason: errText.slice(0, 500) || 'OpenAI rejected the request', message: "cant call ai on debug 'openai 429 or 401 error'" })
+        log('error', 'ai', 'ai.call_failed', `OpenAI Unavailable: ${res.status}`, {
+          duration_ms: durationMs,
+          details: { purpose: options.purpose ?? null, model: body.model, status: res.status, error: errText.slice(0, 500) }
+        })
+        return null
+      }
       log('error', 'ai', 'ai.call_failed', `OpenAI returned ${res.status}`, {
         duration_ms: durationMs,
         details: { purpose: options.purpose ?? null, model: body.model, status: res.status, error: errText.slice(0, 500) }
@@ -49,7 +63,11 @@ export async function callOpenAI(options) {
     })
     return data.choices[0].message.content.trim()
   } catch (e) {
-    log('error', 'ai', 'ai.call_error', e.message, { duration_ms: Date.now() - startedAt, details: { purpose: options.purpose ?? null } })
+    const message = String(e?.message || '')
+    if (/401|429|rate limit|quota|api key|billing|insufficient/i.test(message)) {
+      setOpenAIUnavailable({ status: /429/.test(message) ? 429 : /401/.test(message) ? 401 : null, reason: message, message: "cant call ai on debug 'openai 429 or 401 error'" })
+    }
+    log('error', 'ai', 'ai.call_error', message || 'OpenAI request failed', { duration_ms: Date.now() - startedAt, details: { purpose: options.purpose ?? null } })
     return null
   }
 }

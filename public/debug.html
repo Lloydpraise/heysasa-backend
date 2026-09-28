@@ -97,9 +97,17 @@
 
   h2 { font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; margin: 20px 0 8px; }
   h2:first-child { margin-top: 0; }
-  .business-row { width: 100%; text-align: left; display: flex; justify-content: space-between; gap: 10px; padding: 10px 12px; background: var(--surface); border: 1px solid var(--border); border-radius: 6px; margin-bottom: 6px; cursor: pointer; color: var(--text); }
+  .business-row { width: 100%; text-align: left; display: flex; flex-direction: column; gap: 8px; padding: 10px 12px; background: var(--surface); border: 1px solid var(--border); border-radius: 6px; margin-bottom: 6px; cursor: pointer; color: var(--text); }
   .business-row:hover { border-color: var(--faint); }
+  .business-row .business-head { display: flex; justify-content: space-between; gap: 10px; align-items: center; }
   .business-row .id { color: var(--muted); font-family: var(--mono); font-size: 11px; }
+  .business-row .status-text { color: var(--muted); font-size: 11px; }
+  .business-row .status-text.running { color: var(--ok); }
+  .business-row .status-text.waiting { color: var(--warn); }
+  .progress-wrap { display: grid; gap: 4px; }
+  .progress-header { display: flex; justify-content: space-between; gap: 12px; font-size: 11px; color: var(--muted); }
+  .progress-track { position: relative; width: 100%; height: 10px; background: rgba(63,185,80,.12); border: 1px solid rgba(63,185,80,.35); border-radius: 999px; overflow: hidden; }
+  .progress-fill { position: absolute; inset: 0 auto 0 0; width: 0%; background: linear-gradient(90deg, #2ea043, #3fb950); border-radius: 999px; box-shadow: 0 0 14px rgba(63,185,80,.35); transition: width .25s ease; }
   .field { margin-bottom: 12px; }
   .field label { display: block; font-size: 11.5px; color: var(--muted); margin-bottom: 4px; }
   .row { display: flex; gap: 8px; flex-wrap: wrap; }
@@ -148,6 +156,7 @@
     <div class="card"><div class="label">Evolution</div><div class="value idle" id="s-evolution">—</div></div>
     <div class="card"><div class="label">Follow-up engine</div><div class="value idle" id="s-engine">—</div></div>
     <div class="card"><div class="label">Analysis</div><div class="value idle" id="s-analysis">—</div></div>
+    <div class="card"><div class="label">OpenAI</div><div class="value idle" id="s-openai">—</div></div>
     <div class="card"><div class="label">Queue pending</div><div class="value idle" id="s-pending">—</div></div>
     <div class="card"><div class="label">Queue failed</div><div class="value idle" id="s-failed">—</div></div>
     <div class="card"><div class="label">Events seen</div><div class="value idle" id="s-events">0</div></div>
@@ -202,6 +211,11 @@
   <div class="field row">
     <button class="btn" id="check-evolution">Check connection</button>
     <span id="evolution-sub" style="color:var(--muted);align-self:center"></span>
+  </div>
+  <h2>OpenAI</h2>
+  <div class="field row">
+    <button class="btn" id="check-openai">Recheck OpenAi Availability</button>
+    <span id="openai-sub" style="color:var(--muted);align-self:center">OpenAI available</span>
   </div>
   <div class="field">
     <label>Resync history for an instance (forces re-pairing)</label>
@@ -290,6 +304,16 @@ function debugUrl(path) {
   return `${path}${separator}token=${encodeURIComponent(token)}`;
 }
 
+async function readJsonResponse(res) {
+  const text = await res.text();
+  if (!text) return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { ok: false, error: 'non_json_response', raw: text.slice(0, 2000) };
+  }
+}
+
 function fetchJson(url, opts = {}) {
   return fetch(url, {
     ...opts,
@@ -298,12 +322,8 @@ function fetchJson(url, opts = {}) {
       ...(opts.headers || {}),
     },
   }).then(async (res) => {
-    const text = await res.text();
-    try {
-      return { res, data: text ? JSON.parse(text) : null };
-    } catch {
-      return { res, data: text };
-    }
+    const data = await readJsonResponse(res);
+    return { res, data };
   });
 }
 
@@ -399,7 +419,10 @@ document.querySelectorAll('nav.tabs button').forEach(btn => {
     btn.classList.add('active');
     document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
     if (btn.dataset.tab === 'queue') loadQueue();
-    if (btn.dataset.tab === 'businesses') loadBusinesses();
+    if (btn.dataset.tab === 'businesses') {
+      loadBusinesses();
+      scheduleBusinessRefresh();
+    }
   };
 });
 
@@ -565,7 +588,7 @@ newpill.onclick = () => { window.scrollTo(0, document.body.scrollHeight); newpil
 
 async function refreshSummary() {
   try {
-    const r = await fetch(debugUrl('/debug/api/summary'), { headers: debugHeaders() }).then(x => x.json());
+    const r = await fetch(debugUrl('/debug/api/summary'), { headers: debugHeaders() }).then(async (x) => readJsonResponse(x));
     const ev = document.getElementById('s-evolution');
     ev.textContent = r.evolution?.ok ? `reachable (${r.evolution.durationMs}ms)` : 'unreachable';
     ev.className = 'value ' + (r.evolution?.ok ? 'ok' : 'error');
@@ -577,6 +600,16 @@ async function refreshSummary() {
     const an = document.getElementById('s-analysis');
     an.textContent = r.analysis?.running ? 'running' : 'idle';
     an.className = 'value ' + (r.analysis?.running ? 'warn' : 'idle');
+
+    const ai = document.getElementById('s-openai');
+    const openAiState = r.openai || {};
+    if (openAiState.available === false) {
+      ai.textContent = openAiState.message || 'OpenAI Unavailable';
+      ai.className = 'value error';
+    } else {
+      ai.textContent = 'available';
+      ai.className = 'value ok';
+    }
 
     document.getElementById('s-pending').textContent = r.queue?.pending ?? '—';
     document.getElementById('s-failed').textContent = r.queue?.failed ?? '—';
@@ -594,7 +627,7 @@ async function refreshSummary() {
 
 async function loadQueue() {
   try {
-    const r = await fetch(debugUrl('/debug/api/queue'), { headers: debugHeaders() }).then(x => x.json());
+    const r = await fetch(debugUrl('/debug/api/queue'), { headers: debugHeaders() }).then(async (x) => readJsonResponse(x));
     if (!r.ok) throw new Error(r.error);
     const statusBody = document.querySelector('#queue-status tbody');
     statusBody.innerHTML = Object.entries(r.byStatus || {}).sort((a,b) => b[1]-a[1])
@@ -633,29 +666,81 @@ async function loadQueue() {
 document.getElementById('queue-refresh').onclick = loadQueue;
 document.getElementById('retry-all-btn').onclick = async () => {
   if (!confirm('Retry every currently-failed transient item?')) return;
-  const r = await fetch(debugUrl('/debug/api/queue/retry-transient'), { method: 'POST', headers: debugHeaders() }).then(x => x.json());
+  const r = await fetch(debugUrl('/debug/api/queue/retry-transient'), { method: 'POST', headers: debugHeaders() }).then(async (x) => readJsonResponse(x));
   alert(`Retried ${r.retried ?? 0} item(s).`);
   loadQueue();
 };
 
-async function loadBusinesses() {
+async function resolveBusinessProgressState(business) {
+  const analysisRun = business?.analysis_run || null;
+  const personaRun = business?.persona_run || null;
+  const activeRun = analysisRun?.status === 'running' ? analysisRun : personaRun?.status === 'running' ? personaRun : null;
+
+  if (!activeRun) {
+    return { active: false, label: '', phase: '', percent: 0 };
+  }
+
+  const total = Number(activeRun.progress_total || 0);
+  const done = Number(activeRun.progress_done || 0);
+  const percent = total > 0 ? Math.min(100, Math.max(0, Math.round((done / total) * 100))) : 0;
+
+  return {
+    active: true,
+    label: activeRun.run_type === 'persona_pack' ? 'Persona pack' : 'Analysis',
+    phase: activeRun.phase || 'working',
+    percent,
+  };
+}
+
+function loadBusinesses() {
   const list = document.getElementById('business-list');
   try {
-    const result = await fetch(debugUrl('/debug/businesses'), { headers: debugHeaders() }).then(r => r.json());
-    if (!result.ok) throw new Error(result.error || 'Business lookup failed');
-    state.businesses = result.businesses || [];
-    refreshHistoryBusinessOptions(state.businesses);
-    if (!result.businesses.length) { list.innerHTML = '<div class="empty">No businesses found.</div>'; return; }
-    list.replaceChildren(...result.businesses.map(b => {
-      const row = document.createElement('button');
-      row.className = 'business-row';
-      row.innerHTML = `<span>${escapeHtml(b.name || '(unnamed business)')}</span><span class="id">${escapeHtml(b.business_id)}</span>`;
-      row.onclick = () => openBusinessActionModal(b);
-      return row;
-    }));
+    fetch(debugUrl('/debug/businesses'), { headers: debugHeaders() })
+      .then(async (r) => readJsonResponse(r))
+      .then((result) => {
+        if (!result.ok) throw new Error(result.error || 'Business lookup failed');
+        state.businesses = result.businesses || [];
+        refreshHistoryBusinessOptions(state.businesses);
+        if (!result.businesses.length) { list.innerHTML = '<div class="empty">No businesses found.</div>'; return; }
+        list.replaceChildren(...result.businesses.map((b) => {
+          const progress = resolveBusinessProgressState(b);
+          const row = document.createElement('button');
+          row.type = 'button';
+          row.className = 'business-row';
+          row.innerHTML = `
+            <div class="business-head">
+              <span>${escapeHtml(b.name || '(unnamed business)')}</span>
+              <span class="id">${escapeHtml(b.business_id)}</span>
+            </div>
+            <div class="status-text ${progress.active ? 'running' : 'waiting'}">${progress.active ? `${escapeHtml(progress.label)} · ${escapeHtml(progress.phase || 'working')}` : 'idle'}</div>
+            ${progress.active ? `
+              <div class="progress-wrap">
+                <div class="progress-header"><span>${escapeHtml(progress.label)}</span><span>${Math.max(0, Math.min(100, Number(progress.percent) || 0))}%</span></div>
+                <div class="progress-track"><div class="progress-fill" style="width:${Math.max(2, Math.min(100, Number(progress.percent) || 0))}%"></div></div>
+              </div>
+            ` : ''}
+          `;
+          row.onclick = () => openBusinessActionModal(b);
+          return row;
+        }));
+      })
+      .catch((err) => {
+        list.innerHTML = `<div class="empty">${escapeHtml(err.message)}</div>`;
+      });
   } catch (err) {
     list.innerHTML = `<div class="empty">${escapeHtml(err.message)}</div>`;
   }
+}
+
+let businessRefreshTimer = null;
+function scheduleBusinessRefresh() {
+  if (businessRefreshTimer) clearInterval(businessRefreshTimer);
+  businessRefreshTimer = setInterval(() => {
+    const businessesTab = document.getElementById('tab-businesses');
+    if (businessesTab && businessesTab.classList.contains('active')) {
+      loadBusinesses();
+    }
+  }, 5000);
 }
 
 let activeBusinessAction = null;
@@ -686,8 +771,8 @@ async function startBusinessAction(business, action) {
       headers: { ...debugHeaders(), 'Content-Type': 'application/json' },
       body: JSON.stringify({ businessId: business.business_id }),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.message || result.error || `Could not start ${label}`);
+    const result = await readJsonResponse(res);
+    if (!res.ok) throw new Error((result && (result.message || result.error)) || `Could not start ${label}`);
     alert(`${label === 'persona pack' ? 'Persona pack generation' : 'Lead analysis'} started for ${business.name || business.business_id}.`);
   } catch (err) { alert(err.message); }
 }
@@ -710,7 +795,7 @@ document.getElementById('h-run').onclick = async () => {
   const body = document.querySelector('#history-table tbody');
   body.innerHTML = '<tr><td colspan="5">Searching…</td></tr>';
   try {
-    const r = await fetch(debugUrl(`/debug/api/logs?${params}`), { headers: debugHeaders() }).then(x => x.json());
+    const r = await fetch(debugUrl(`/debug/api/logs?${params}`), { headers: debugHeaders() }).then(async (x) => readJsonResponse(x));
     if (!r.ok) throw new Error(r.error || 'Search failed');
     body.innerHTML = (r.rows || []).map(row => {
       const raw = JSON.stringify(row, null, 2);
@@ -746,13 +831,40 @@ async function checkEvolution() {
   btn.disabled = true; subEl.textContent = 'checking…';
   try {
     const res = await fetch(debugUrl('/debug/evolution'), { headers: debugHeaders() });
-    const body = await res.json();
-    subEl.textContent = body.ok ? `reachable · status ${body.status} · ${body.durationMs}ms` : (body.error || `status ${body.status}`);
+    const body = await readJsonResponse(res);
+    subEl.textContent = body && body.ok ? `reachable · status ${body.status} · ${body.durationMs}ms` : ((body && (body.error || `status ${body.status}`)) || 'non-JSON response');
   } catch (err) {
     subEl.textContent = err.message;
   } finally { btn.disabled = false; }
 }
 document.getElementById('check-evolution').onclick = checkEvolution;
+
+async function checkOpenAI() {
+  const btn = document.getElementById('check-openai');
+  const subEl = document.getElementById('openai-sub');
+  btn.disabled = true; subEl.textContent = 'checking…';
+  try {
+    const res = await fetch(debugUrl('/debug/openai/recheck'), { method: 'POST', headers: debugHeaders() });
+    const body = await readJsonResponse(res);
+    const available = body && body.available !== false;
+    subEl.textContent = available ? 'OpenAI available' : ((body && (body.message || 'OpenAI Unavailable')) || 'OpenAI Unavailable');
+    subEl.style.color = available ? 'var(--ok)' : 'var(--error)';
+    const ai = document.getElementById('s-openai');
+    if (available) {
+      ai.textContent = 'available';
+      ai.className = 'value ok';
+    } else {
+      ai.textContent = (body && body.message) || 'OpenAI Unavailable';
+      ai.className = 'value error';
+    }
+  } catch (err) {
+    subEl.textContent = err.message || 'OpenAI Unavailable';
+    subEl.style.color = 'var(--error)';
+  } finally {
+    btn.disabled = false;
+  }
+}
+document.getElementById('check-openai').onclick = checkOpenAI;
 
 document.getElementById('resync-btn').onclick = async () => {
   const input = document.getElementById('resync-instance');
@@ -766,8 +878,8 @@ document.getElementById('resync-btn').onclick = async () => {
       method: 'POST',
       headers: debugHeaders(),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Resync failed');
+    const result = await readJsonResponse(res);
+    if (!res.ok) throw new Error((result && result.error) || 'Resync failed');
     alert(`Resync requested for ${name}. Reopen the WhatsApp connection flow to get a fresh QR.`);
   } catch (err) { alert(err.message); } finally { btn.disabled = false; }
 };

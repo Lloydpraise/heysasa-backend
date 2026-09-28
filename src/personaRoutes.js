@@ -150,16 +150,42 @@ router.post(['/persona/generate', '/debug/persona/generate'], async (req, res, n
     }
 });
 
+// Latest run of a type for one business, straight from the database, so status
+// survives restarts and shows the current phase (e.g. waiting_for_analysis).
+async function latestRun(businessId, runTypes) {
+    const { data } = await supabase
+        .from('enrichment_runs')
+        .select('id, run_type, status, phase, progress_done, progress_total, started_at, finished_at, heartbeat_at, fatal_error, summary')
+        .eq('business_id', businessId)
+        .in('run_type', runTypes)
+        .order('started_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+    return data || null;
+}
+
 router.get('/persona/status', async (req, res, next) => {
     try {
         const businessId = await resolveBusinessId(req, res);
         if (!businessId) return;
 
-        if (personaProcess && personaBusinessId !== businessId) {
-            res.json({ running: false, businessId: null });
-            return;
-        }
-        res.json(personaStatus());
+        const mine = !!personaProcess && personaBusinessId === businessId;
+        const [run, analysis] = await Promise.all([
+            latestRun(businessId, ['persona_pack']),
+            latestRun(businessId, ['full_pass', 'contact_pass']),
+        ]);
+        const state = mine ? 'running'
+            : run?.status === 'completed' ? 'ready'
+            : run?.status === 'insufficient_data' ? 'insufficient_data'
+            : run?.status === 'failed' ? 'failed'
+            : 'idle';
+        res.json({
+            state,
+            running: mine,
+            businessId,
+            run,        // phase, summary.reason (why nothing was generated), funnel counts
+            analysis,   // the analyser run this pack depends on
+        });
     } catch (error) {
         next(error);
     }
