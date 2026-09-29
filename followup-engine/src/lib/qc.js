@@ -15,20 +15,23 @@ Return ONLY valid JSON: {"passed":true,"issues":[],"suggested_fix":null}
 or {"passed":false,"issues":["RULE: reason"],"suggested_fix":"fixed message"}
 `
 
-export async function runQC(supabase, message, personaPack, previousMessages) {
+export async function runQC(supabase, message, personaPack, previousMessages, { businessId = null } = {}) {
   const prevText = previousMessages
     .map(m => m.content?.text ?? '')
     .filter(Boolean)
     .join(' | ')
 
+  // Static-per-business content first, per-lead content last: keeps the
+  // shared prefix identical across requests so OpenAI can cache it.
   const userContent = [
-    `MESSAGE TO CHECK:\n${message}`,
     `PERSONA (language mix + tone):\n${JSON.stringify(personaPack?.persona ?? {})}`,
-    `PREVIOUS 3 MESSAGES TO THIS LEAD:\n${prevText || 'None yet'}`
+    `PREVIOUS 3 MESSAGES TO THIS LEAD:\n${prevText || 'None yet'}`,
+    `MESSAGE TO CHECK:\n${message}`
   ].join('\n\n')
+  const aiOptions = { json: true, temperature: 0, maxTokens: 300, cacheKey: businessId ? `qc:${businessId}` : null }
 
   // First attempt
-  const raw = await callBot(supabase, 'followup_qc', userContent, QC_FALLBACK, { json: true })
+  const raw = await callBot(supabase, 'followup_qc', userContent, QC_FALLBACK, aiOptions)
   if (!raw) return { passed: true, issues: [], suggested_fix: null, final_message: message, attempts: 1 }
 
   let result
@@ -46,12 +49,12 @@ export async function runQC(supabase, message, personaPack, previousMessages) {
 
   // Second pass on the fix
   const fixContent = [
-    `MESSAGE TO CHECK:\n${fix}`,
-    `PERSONA:\n${JSON.stringify(personaPack?.persona ?? {})}`,
-    `PREVIOUS 3 MESSAGES:\n${prevText || 'None yet'}`
+    `PERSONA (language mix + tone):\n${JSON.stringify(personaPack?.persona ?? {})}`,
+    `PREVIOUS 3 MESSAGES TO THIS LEAD:\n${prevText || 'None yet'}`,
+    `MESSAGE TO CHECK:\n${fix}`
   ].join('\n\n')
 
-  const raw2 = await callBot(supabase, 'followup_qc', fixContent, QC_FALLBACK, { json: true })
+  const raw2 = await callBot(supabase, 'followup_qc', fixContent, QC_FALLBACK, aiOptions)
   if (!raw2) return { passed: true, issues: [], suggested_fix: fix, final_message: fix, attempts: 2 }
 
   let result2

@@ -5,7 +5,14 @@ import { spawn } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ANALYSIS_VERSION, FatalRunError } from './src/leadClassification.js';
-import { getOpenAIAvailabilityState, setOpenAIUnavailable, shouldPauseOpenAIRequest } from './src/services/openAiGate.js';
+import {
+    classifyOpenAIFailure,
+    getOpenAIAvailabilityState,
+    getOpenAICooldownMs,
+    noteOpenAIRateLimited,
+    setOpenAIUnavailable,
+    shouldPauseOpenAIRequest,
+} from './src/services/openAiGate.js';
 
 dotenv.config();
 
@@ -212,7 +219,7 @@ async function logAiUsage(promptTokens, completionTokens, purpose) {
 // generalized so every section-builder below can reuse it.
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-async function callOpenAI(systemPrompt, userPrompt, { json = true, maxTokens = 900, temperature = 0.2, purpose = 'unspecified', attempts = 3 } = {}) {
+async function callOpenAI(systemPrompt, userPrompt, { json = true, maxTokens = 900, temperature = 0.2, purpose = 'unspecified', attempts = 4 } = {}) {
     if (shouldPauseOpenAIRequest()) {
         const state = getOpenAIAvailabilityState();
         throw new FatalRunError(state.message || 'OpenAI Unavailable');
@@ -222,6 +229,14 @@ async function callOpenAI(systemPrompt, userPrompt, { json = true, maxTokens = 9
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), 45000);
         try {
+            // A rate limit elsewhere in this process: back off together.
+            const cooldown = getOpenAICooldownMs();
+            if (cooldown > 0) await sleep(Math.min(cooldown, 30000));
+            if (shouldPauseOpenAIRequest()) {
+                const state = getOpenAIAvailabilityState();
+                throw new FatalRunError(state.message || 'OpenAI Unavailable');
+            }
+
             const res = await fetch('https://api.openai.com/v1/chat/completions', {
                 method:  'POST',
                 headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${OPENAI_KEY}` },
@@ -231,6 +246,7 @@ async function callOpenAI(systemPrompt, userPrompt, { json = true, maxTokens = 9
                     max_tokens: maxTokens,
                     temperature,
                     ...(json ? { response_format: { type: 'json_object' } } : {}),
+                    prompt_cache_key: `persona:${BUSINESS_ID}`.slice(0, 64),
                     messages: [
                         { role: 'system', content: systemPrompt },
                         { role: 'user', content: userPrompt }
@@ -241,14 +257,20 @@ async function callOpenAI(systemPrompt, userPrompt, { json = true, maxTokens = 9
 
             if (!res.ok) {
                 const errorBody = await res.text();
-                // A rejected key or exhausted quota will not fix itself: stop, do not retry.
-                if (res.status === 401 || res.status === 429 || res.status === 403 || /insufficient_quota|invalid_api_key|rate limit|billing/i.test(errorBody)) {
+                const failure = classifyOpenAIFailure({ status: res.status, bodyText: errorBody, headers: res.headers });
+                // Exhausted credits / a rejected key will not fix themselves: stop, do not retry.
+                if (failure.kind === 'quota' || failure.kind === 'auth') {
                     setOpenAIUnavailable({
                         status: res.status,
-                        reason: errorBody.slice(0, 200) || 'OpenAI rejected the request',
+                        reason: errorBody.slice(0, 300) || 'OpenAI rejected the request',
                         message: "cant call ai on debug 'openai 429 or 401 error'",
                     });
-                    throw new FatalRunError(`OpenAI rejected the request (${res.status}, ${purpose}): ${errorBody.slice(0, 200)}. Check OPENAI_API_KEY and billing.`);
+                    throw new FatalRunError(`OpenAI rejected the request (${res.status}, ${failure.kind}, ${purpose}): ${errorBody.slice(0, 200)}. Check OPENAI_API_KEY, credits and the project's spend limit.`);
+                }
+                // A per-minute rate limit clears by itself: wait it out, then retry.
+                if (failure.kind === 'rate_limit') {
+                    noteOpenAIRateLimited(failure.retryAfterMs);
+                    throw new Error(`OpenAI rate limited (${res.status}, ${purpose}); retrying after cooldown`);
                 }
                 throw new Error(`OpenAI returned ${res.status} (${purpose}): ${errorBody.slice(0, 500)}`);
             }
@@ -264,19 +286,11 @@ async function callOpenAI(systemPrompt, userPrompt, { json = true, maxTokens = 9
             return JSON.parse(clean);
         } catch (e) {
             clearTimeout(timeout);
-            const message = String(e?.message || '');
-            if (/401|429|rate limit|quota|api key|billing|insufficient/i.test(message)) {
-                setOpenAIUnavailable({
-                    status: /429/.test(message) ? 429 : /401/.test(message) ? 401 : null,
-                    reason: message,
-                    message: "cant call ai on debug 'openai 429 or 401 error'",
-                });
-            }
             if (e instanceof FatalRunError) throw e;
             lastError = e;
             if (attempt < attempts) {
                 warn('OpenAI', `Attempt ${attempt}/${attempts} failed (${purpose}): ${e.message}. Retrying...`);
-                await sleep(2000 * attempt);
+                await sleep(Math.max(2000 * attempt, getOpenAICooldownMs()));
             }
         }
     }

@@ -12,6 +12,10 @@ import { resolveMediaMergeFields, resolveMergeFields } from '../lib/mergeFields.
 import { log } from '../lib/log.js'
 
 const STALL_RETRY_MS = 5 * 60_000
+// When the AI call itself failed (rate limit, outage, out of credits) the
+// follow-up is still wanted. Stall and retry later instead of skipping it
+// forever, which used to silently burn every due follow-up during an outage.
+const AI_RETRY_MS = 10 * 60_000
 
 export async function runWorker(supabase, queueItemId) {
   if (!queueItemId) throw new Error('queue_item_id required')
@@ -196,7 +200,7 @@ export async function runWorker(supabase, queueItemId) {
           }).eq('id', queueItemId)
           return { status: 'skipped', reason: 'qc_failed', issues: result.issues }
         }
-        return skipItem(result.reason)
+        return result.reason === 'generation_failed' ? stallItem('ai_unavailable', AI_RETRY_MS) : skipItem(result.reason)
       }
       finalMessage = result.finalMessage
       draft = result.draft
@@ -247,7 +251,7 @@ export async function runWorker(supabase, queueItemId) {
         }).eq('id', queueItemId)
         return { status: 'skipped', reason: 'qc_failed', issues: result.issues }
       }
-      return skipItem(result.reason)
+      return result.reason === 'generation_failed' ? stallItem('ai_unavailable', AI_RETRY_MS) : skipItem(result.reason)
     }
     finalMessage = result.finalMessage
     draft = result.draft
@@ -266,7 +270,7 @@ export async function runWorker(supabase, queueItemId) {
         }).eq('id', queueItemId)
         return { status: 'skipped', reason: 'qc_failed', issues: result.issues }
       }
-      return skipItem(result.reason)
+      return result.reason === 'generation_failed' ? stallItem('ai_unavailable', AI_RETRY_MS) : skipItem(result.reason)
     }
     finalMessage = result.finalMessage
     draft = result.draft

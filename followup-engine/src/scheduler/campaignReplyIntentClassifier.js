@@ -5,6 +5,8 @@ import { log } from '../lib/log.js'
 
 const BATCH_SIZE = 30
 const VALID_LABELS = ['action', 'opt_out', 'positive', 'negative', 'neutral']
+const MAX_PARSE_FAILURES = 3
+const parseFailures = new Map() // step event id -> unparseable AI answers so far
 
 // Classifies TEXT replies to campaign steps: action / opt_out / positive /
 // negative / neutral. Reactions are excluded (reaction_emoji is not null)
@@ -94,12 +96,25 @@ export async function runCampaignReplyIntentClassifier(supabase) {
       const raw = await callBot(supabase, 'campaign_reply_intent_classifier', userContent, CAMPAIGN_REPLY_INTENT_FALLBACK, {
         json: true,
         model: 'gpt-4o-mini',
-        maxTokens: 40
+        temperature: 0,
+        maxTokens: 40,
+        cacheKey: `reply_intent:${businessId}`
       })
       if (!raw) continue
 
+      // An unparseable answer used to be retried every 2 minutes forever, paying
+      // for the same call each time. Give up after a few tries and label it neutral.
       let result
-      try { result = JSON.parse(raw) } catch { continue }
+      try {
+        result = JSON.parse(raw)
+        parseFailures.delete(event.id)
+      } catch {
+        const n = (parseFailures.get(event.id) ?? 0) + 1
+        parseFailures.set(event.id, n)
+        if (n < MAX_PARSE_FAILURES) continue
+        parseFailures.delete(event.id)
+        result = { label: 'neutral' }
+      }
       const label = VALID_LABELS.includes(result.label) ? result.label : 'neutral'
 
       const { error: updateError } = await supabase

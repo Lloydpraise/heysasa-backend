@@ -270,6 +270,26 @@ export async function recordCampaignStepReaction(businessId, reactedMessageId, e
     }
 }
 
+// Marks a conversation as needing its lead stage re-classified. Called when a
+// lead responds. The follow-up engine's stage classifier only calls OpenAI for
+// conversations carrying this stamp (after a short quiet period), so this is
+// what turns "poll every minute" into "react to lead activity".
+// Overwriting the timestamp on every response is intentional: the classifier
+// uses it as a watermark, so a message that arrives mid-classification is not lost.
+// Never throws: a failure here must not break message ingestion.
+export async function requestStageReview(conversationId, reason = 'responded') {
+    if (!conversationId) return;
+    try {
+        const { error } = await supabase
+            .from('conversations')
+            .update({ stage_review_requested_at: new Date().toISOString(), stage_review_reason: reason })
+            .eq('id', conversationId);
+        if (error) throw error;
+    } catch (error) {
+        logDbFailure('requestStageReview', { conversationId, reason }, error);
+    }
+}
+
 export async function cancelPendingFollowUps(contactId) {
     try {
         const { error } = await supabase.from('follow_up_queue')

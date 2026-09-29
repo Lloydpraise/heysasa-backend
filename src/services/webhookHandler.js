@@ -16,7 +16,8 @@ import {
     updateLeadStateOnReply, 
     cancelPendingFollowUps,
     recordCampaignStepReply,
-    recordCampaignStepReaction
+    recordCampaignStepReaction,
+    requestStageReview
 } from './dbService.js';
 import { debugLog } from './debugConsole.js';
 import { deleteSessionRecord } from './evolutionConnections.js';
@@ -156,6 +157,10 @@ export async function processLiveMessage(messages, businessId) {
                     await recordCampaignStepReaction(businessId, reactedMessageId, text);
                 } else {
                     await recordCampaignStepReply(contactId);
+                    // The lead actually said something: queue a stage re-check.
+                    // (Reactions carry no text, and history sync deliberately
+                    // does not do this, so old chats never flood the queue.)
+                    await requestStageReview(conversationId, 'responded');
                 }
             }
 

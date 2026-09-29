@@ -46,11 +46,18 @@ export async function getConversation(s, contactId, businessId) {
 }
 
 // ── Messages ──────────────────────────────────────────────────
-export async function getMessages(s, conversationId) {
-  const { data } = await s.from('messages')
+// `limit` returns only the most recent N messages (still oldest-first), so AI
+// callers don't ship an entire multi-month thread when the tail is enough.
+// Omit it to get the full thread as before.
+export async function getMessages(s, conversationId, { limit = null } = {}) {
+  const base = s.from('messages')
     .select('direction, content, type, created_at, sentiment_score, intent_level, agent_role')
     .eq('conversation_id', conversationId)
-    .order('created_at', { ascending: true })
+  if (limit) {
+    const { data } = await base.order('created_at', { ascending: false }).limit(limit)
+    return (data ?? []).reverse()
+  }
+  const { data } = await base.order('created_at', { ascending: true })
   return data ?? []
 }
 

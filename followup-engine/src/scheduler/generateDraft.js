@@ -3,6 +3,44 @@ import { callBot } from '../lib/ai.js'
 import { runQC } from '../lib/qc.js'
 import { FOLLOWUP_FALLBACK, SUMMARISER_FALLBACK, SUGGESTION_REWRITE_FALLBACK } from './prompts.js'
 
+// Caps how much thread is sent to the model: the latest messages carry the
+// current state, and each is trimmed. Older context is what the summariser
+// (and the persona pack) are for.
+const THREAD_MESSAGES = 60
+const MESSAGE_CHARS = 300
+
+function formatThread(messages) {
+  return messages.map(m => {
+    const text = String(m.content?.text || `[${m.type}]`).replace(/\s+/g, ' ').trim().slice(0, MESSAGE_CHARS)
+    return `${m.direction === 'out' ? 'Business' : 'Customer'}: ${text}`
+  }).join('\n')
+}
+
+// A follow-up sequence drafts several steps for the SAME silent lead, so the
+// thread is usually identical from one step to the next. Summarising it again
+// each time paid for the same call repeatedly. The summary is reused until a
+// new message lands (keyed on the last message timestamp). In-memory: a
+// restart costs at most one repeat summary per lead, never a burst.
+const SUMMARY_CACHE_MAX = 500
+const summaryCache = new Map() // `${conversationId}:${lastMessageAt}` -> summary
+
+async function summariseThread(supabase, conv, messages, businessId) {
+  const thread = formatThread(messages)
+  const key = conv?.id ? `${conv.id}:${messages.at(-1)?.created_at ?? ''}` : null
+  if (key && summaryCache.has(key)) return summaryCache.get(key)
+
+  const summary = await callBot(supabase, 'conversation_summariser', thread, SUMMARISER_FALLBACK, {
+    temperature: 0.2, maxTokens: 300, cacheKey: `summary:${businessId}`
+  })
+  if (!summary) return thread // AI unavailable: fall back to the raw thread, and do not cache it
+
+  if (key) {
+    if (summaryCache.size >= SUMMARY_CACHE_MAX) summaryCache.delete(summaryCache.keys().next().value)
+    summaryCache.set(key, summary)
+  }
+  return summary
+}
+
 // Builds and QCs one follow-up draft for a queue item. Used by:
 //  - worker.js, during normal scheduled processing
 //  - the /regenerate route, when an owner asks for a fresh draft
@@ -11,7 +49,7 @@ import { FOLLOWUP_FALLBACK, SUMMARISER_FALLBACK, SUGGESTION_REWRITE_FALLBACK } f
 // checks on a row the scheduler already accepted.
 export async function generateFollowupDraft(supabase, item, contact, business, pack, conv) {
   const [messages, materials, previousFollowups] = await Promise.all([
-    conv ? getMessages(supabase, conv.id) : Promise.resolve([]),
+    conv ? getMessages(supabase, conv.id, { limit: THREAD_MESSAGES }) : Promise.resolve([]),
     getMaterialsForTouchpoint(supabase, item.business_id, item.touchpoint_type ?? 'product_reminder'),
     getLastSentFollowups(supabase, item.contact_id, 3)
   ])
@@ -29,15 +67,9 @@ export async function generateFollowupDraft(supabase, item, contact, business, p
   if (!messages.length) {
     convSummary = 'No conversation history yet.'
   } else if (messages.length <= 8) {
-    convSummary = messages.map(m =>
-      `${m.direction === 'out' ? 'Business' : 'Customer'}: ${m.content?.text || `[${m.type}]`}`
-    ).join('\n')
+    convSummary = formatThread(messages)
   } else {
-    const thread = messages.map(m =>
-      `${m.direction === 'out' ? 'Business' : 'Customer'}: ${m.content?.text || `[${m.type}]`}`
-    ).join('\n')
-    convSummary = await callBot(supabase, 'conversation_summariser', thread, SUMMARISER_FALLBACK)
-      ?? thread
+    convSummary = await summariseThread(supabase, conv, messages, item.business_id)
   }
 
   const isEcom = business.business_type === 'ecommerce'
@@ -68,10 +100,10 @@ export async function generateFollowupDraft(supabase, item, contact, business, p
     materialsBlock
   ].filter(Boolean).join('\n\n')
 
-  const draft = await callBot(supabase, 'follow_up_generator', userContent, FOLLOWUP_FALLBACK)
+  const draft = await callBot(supabase, 'follow_up_generator', userContent, FOLLOWUP_FALLBACK, { cacheKey: `draft:${item.business_id}` })
   if (!draft) return { ok: false, reason: 'generation_failed' }
 
-  const qc = await runQC(supabase, draft, pack, previousFollowups)
+  const qc = await runQC(supabase, draft, pack, previousFollowups, { businessId: item.business_id })
   if (!qc.passed && qc.attempts >= 2) {
     return { ok: false, reason: 'qc_failed', issues: qc.issues, draft }
   }
@@ -87,16 +119,13 @@ export async function generateFollowupDraft(supabase, item, contact, business, p
 // type, KLT phase, or materials, just the owner's own suggestion plus
 // conversation context.
 export async function rewriteSuggestedMessage(supabase, suggestion, contact, business, pack, conv) {
-  const messages = conv ? await getMessages(supabase, conv.id) : []
+  const messages = conv ? await getMessages(supabase, conv.id, { limit: THREAD_MESSAGES }) : []
 
   let convSummary = 'No conversation history yet.'
   if (messages.length) {
-    const thread = messages.map(m =>
-      `${m.direction === 'out' ? 'Business' : 'Customer'}: ${m.content?.text || `[${m.type}]`}`
-    ).join('\n')
     convSummary = messages.length <= 8
-      ? thread
-      : (await callBot(supabase, 'conversation_summariser', thread, SUMMARISER_FALLBACK) ?? thread)
+      ? formatThread(messages)
+      : await summariseThread(supabase, conv, messages, contact.business_id)
   }
 
   const userContent = [
@@ -106,11 +135,11 @@ export async function rewriteSuggestedMessage(supabase, suggestion, contact, bus
     `LEAD NAME: ${contact.name ?? 'Customer'}`
   ].join('\n\n')
 
-  const draft = await callBot(supabase, 'suggestion_rewriter', userContent, SUGGESTION_REWRITE_FALLBACK)
+  const draft = await callBot(supabase, 'suggestion_rewriter', userContent, SUGGESTION_REWRITE_FALLBACK, { cacheKey: `rewrite:${contact.business_id}` })
   if (!draft) return { ok: false, reason: 'generation_failed' }
 
   const previousFollowups = await getLastSentFollowups(supabase, contact.id, 3)
-  const qc = await runQC(supabase, draft, pack, previousFollowups)
+  const qc = await runQC(supabase, draft, pack, previousFollowups, { businessId: contact.business_id })
   if (!qc.passed && qc.attempts >= 2) {
     return { ok: false, reason: 'qc_failed', issues: qc.issues, draft }
   }

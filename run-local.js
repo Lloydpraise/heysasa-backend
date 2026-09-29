@@ -11,7 +11,14 @@ import {
     FailureGuard,
     isHealthyRun,
 } from './src/leadClassification.js';
-import { getOpenAIAvailabilityState, setOpenAIUnavailable, shouldPauseOpenAIRequest } from './src/services/openAiGate.js';
+import {
+    classifyOpenAIFailure,
+    getOpenAIAvailabilityState,
+    getOpenAICooldownMs,
+    noteOpenAIRateLimited,
+    setOpenAIUnavailable,
+    shouldPauseOpenAIRequest,
+} from './src/services/openAiGate.js';
 
 dotenv.config();
 
@@ -630,7 +637,19 @@ function summarizeBusiness(row) {
     return parts.join('\n');
 }
 
-async function callOpenAiJson({ model, system, user, maxTokens, attempts = 2 }) {
+// Running total of prompt tokens vs. tokens served from OpenAI's prompt cache,
+// so each pass can report a real hit rate instead of guessing.
+const cacheStats = { prompt: 0, cached: 0, calls: 0 };
+function logCacheStats(tag) {
+    if (!cacheStats.calls) return;
+    const pct = cacheStats.prompt ? Math.round((cacheStats.cached / cacheStats.prompt) * 100) : 0;
+    log(tag, `Prompt cache: ${cacheStats.cached}/${cacheStats.prompt} input tokens cached (${pct}%) across ${cacheStats.calls} calls.`);
+}
+
+// Rate limits (429 rate_limit_exceeded) are waited out and retried. Only quota
+// exhaustion or a rejected key is fatal for the run: the old code treated every
+// 429 as "out of credits" and killed the whole run on a per-minute limit.
+async function callOpenAiJson({ model, system, user, maxTokens, attempts = 4, cacheKey = null }) {
     let lastError;
     if (shouldPauseOpenAIRequest()) {
         const state = getOpenAIAvailabilityState();
@@ -638,6 +657,8 @@ async function callOpenAiJson({ model, system, user, maxTokens, attempts = 2 }) 
     }
     for (let attempt = 1; attempt <= attempts; attempt++) {
         try {
+            const cooldown = getOpenAICooldownMs();
+            if (cooldown > 0) await sleep(Math.min(cooldown, 30000));
             if (shouldPauseOpenAIRequest()) {
                 const state = getOpenAIAvailabilityState();
                 throw new FatalRunError(state.message || 'OpenAI Unavailable');
@@ -651,6 +672,7 @@ async function callOpenAiJson({ model, system, user, maxTokens, attempts = 2 }) 
                     max_tokens:  maxTokens,
                     temperature: 0.1,
                     response_format: { type: 'json_object' },
+                    ...(cacheKey ? { prompt_cache_key: String(cacheKey).slice(0, 64) } : {}),
                     messages: [
                         { role: 'system', content: system },
                         { role: 'user',   content: user }
@@ -659,13 +681,18 @@ async function callOpenAiJson({ model, system, user, maxTokens, attempts = 2 }) 
             });
             if (!res.ok) {
                 const errorBody = await res.text();
-                if (res.status === 401 || res.status === 429 || res.status === 403 || /insufficient_quota|invalid_api_key|rate limit|billing/i.test(errorBody)) {
+                const failure = classifyOpenAIFailure({ status: res.status, bodyText: errorBody, headers: res.headers });
+                if (failure.kind === 'quota' || failure.kind === 'auth') {
                     setOpenAIUnavailable({
                         status: res.status,
-                        reason: errorBody.slice(0, 200) || 'OpenAI rejected the request',
+                        reason: errorBody.slice(0, 300) || 'OpenAI rejected the request',
                         message: "cant call ai on debug 'openai 429 or 401 error'",
                     });
-                    throw new FatalRunError(`OpenAI rejected the request (${res.status}): ${errorBody.slice(0, 200)}. Check OPENAI_API_KEY and billing.`);
+                    throw new FatalRunError(`OpenAI rejected the request (${res.status}, ${failure.kind}): ${errorBody.slice(0, 200)}. Check OPENAI_API_KEY, credits and the project's spend limit.`);
+                }
+                if (failure.kind === 'rate_limit') {
+                    noteOpenAIRateLimited(failure.retryAfterMs);
+                    throw new Error(`OpenAI rate limited (${res.status}); retrying after cooldown`);
                 }
                 throw new Error(`OpenAI API returned ${res.status}: ${errorBody.slice(0, 500)}`);
             }
@@ -675,23 +702,19 @@ async function callOpenAiJson({ model, system, user, maxTokens, attempts = 2 }) 
             const raw   = choice?.message?.content?.trim() || '';
             const clean = raw.replace(/^```json\s*/i, '').replace(/```\s*$/, '').trim();
             const usage = body.usage || {};
+            cacheStats.calls += 1;
+            cacheStats.prompt += usage.prompt_tokens || 0;
+            cacheStats.cached += usage.prompt_tokens_details?.cached_tokens || 0;
             return {
                 json: JSON.parse(clean),
                 promptTokens: usage.prompt_tokens || 0,
+                cachedTokens: usage.prompt_tokens_details?.cached_tokens || 0,
                 completionTokens: usage.completion_tokens || 0
             };
         } catch (e) {
             if (e instanceof FatalRunError) throw e;
-            const message = String(e?.message || '');
-            if (/401|429|rate limit|quota|api key|billing|insufficient/i.test(message)) {
-                setOpenAIUnavailable({
-                    status: /429/.test(message) ? 429 : /401/.test(message) ? 401 : null,
-                    reason: message,
-                    message: "cant call ai on debug 'openai 429 or 401 error'",
-                });
-            }
             lastError = e;
-            if (attempt < attempts) await sleep(1500 * attempt);
+            if (attempt < attempts) await sleep(Math.max(1500 * attempt, getOpenAICooldownMs()));
         }
     }
     throw lastError;
@@ -792,7 +815,8 @@ async function runClassificationPass() {
                     model: CLASSIFY_MODEL,
                     system: CLASSIFIER_SYSTEM_PROMPT,
                     user: `BUSINESS\n${businessContext}\n\nCHAT (CUSTOMER = the other person, BUSINESS = the account owner)\n${buildTranscript(excerpt, { maxChars: 300 })}`,
-                    maxTokens: 300
+                    maxTokens: 300,
+                    cacheKey: `classify:${BUSINESS_ID || contact.business_id}`
                 });
                 llm = result.json;
                 await logAiUsage(BUSINESS_ID, crypto.randomUUID(), result.promptTokens, result.completionTokens, 'classifier_local');
@@ -850,6 +874,7 @@ async function runClassificationPass() {
         }
         await sleepBetweenContacts();
     }
+    logCacheStats('Classify');
     log('Classify', `✓ business ${counts.business}, personal ${counts.personal}, junk ${counts.junk}, unknown ${counts.unknown} (needs review), skipped ${counts.skipped}, errored ${counts.errored}.`);
     return counts;
 }
@@ -1017,10 +1042,10 @@ Return ONLY a valid JSON object matching this schema:
   "price_objection":        boolean
 }`;
 
-async function runNLPExtraction(transcript, businessContext, productsCatalog, structuralSignals) {
+async function runNLPExtraction(transcript, businessContext, productsCatalog, structuralSignals, cacheKey = null) {
     const user = `BUSINESS CONTEXT:\n${businessContext}\n\nAVAILABLE BUSINESS PRODUCTS CATALOG:\n${productsCatalog || 'No products registered.'}\n\nSTRUCTURAL SIGNALS (ground truth):\n${JSON.stringify(structuralSignals, null, 2)}\n\nCONVERSATION:\n${transcript}`;
     try {
-        const result = await callOpenAiJson({ model: OPENAI_MODEL, system: NLP_SYSTEM_PROMPT, user, maxTokens: 1100 });
+        const result = await callOpenAiJson({ model: OPENAI_MODEL, system: NLP_SYSTEM_PROMPT, user, maxTokens: 1100, cacheKey });
         return { nlp: result.json, promptTokens: result.promptTokens, completionTokens: result.completionTokens };
     } catch (e) {
         throw new Error(`NLP extraction failed: ${e.message}`);
@@ -1223,7 +1248,8 @@ async function runNLPPass() {
                 transcript,
                 businessCache.get(businessId),
                 productsCache.get(businessId),
-                structuralSignals
+                structuralSignals,
+                `nlp:${businessId}`
             );
 
             const applied = await applyNLPResults(
@@ -1244,6 +1270,7 @@ async function runNLPPass() {
         await sleepBetweenContacts();
     }
     const flagSummary = Object.entries(flagCounts).map(([k, v]) => `${k}=${v}`).join(', ') || 'none';
+    logCacheStats('NLP');
     log('NLP', `✓ ${enrichedCount} enriched, ${errored} errored, ${skipped} skipped. Guard flags: ${flagSummary}.`);
     return { enrichedCount, errored, skipped };
 }

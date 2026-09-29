@@ -83,7 +83,7 @@ export async function runOptInClassifier(supabase) {
       if (lastClassifiedAt.get(contact.id) === lastInbound.created_at) return
 
       const userContent = `Lead's WhatsApp reply:\n"${lastInbound.content.text}"`
-      const raw = await callBot(supabase, 'opt_in_classifier', userContent, OPT_IN_CLASSIFIER_FALLBACK, { json: true })
+      const raw = await callBot(supabase, 'opt_in_classifier', userContent, OPT_IN_CLASSIFIER_FALLBACK, { json: true, temperature: 0, maxTokens: 30, cacheKey: `opt_in:${contact.business_id}` })
       lastClassifiedAt.set(contact.id, lastInbound.created_at)
       if (!raw) return
 
