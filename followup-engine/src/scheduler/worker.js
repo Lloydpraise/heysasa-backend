@@ -7,6 +7,7 @@ import {
 import { checkBalance, flagInsufficientFunds } from '../lib/billing.js'
 import { leadAgeDays, hoursSince } from '../lib/timing.js'
 import { generateFollowupDraft, rewriteSuggestedMessage } from './generateDraft.js'
+import { getCustomerProfile, getAutoCampaignContext } from '../lib/campaignContext.js'
 import { normalizeOutboundMedia } from '../lib/media.js'
 import { resolveMediaMergeFields, resolveMergeFields } from '../lib/mergeFields.js'
 import { log } from '../lib/log.js'
@@ -181,7 +182,7 @@ export async function runWorker(supabase, queueItemId) {
   // ── 9. Campaign items: own toggles, no AI zone system ──────────
   if (item.campaign_id) {
     const { data: campaign } = await supabase
-      .from('campaigns').select('ai_rewrite_enabled, auto_approve').eq('id', item.campaign_id).single()
+      .from('campaigns').select('ai_rewrite_enabled, auto_approve, kind, rule_id, business_id').eq('id', item.campaign_id).single()
 
     let finalMessage = item.final_message
     let draft = item.draft_message
@@ -191,7 +192,13 @@ export async function runWorker(supabase, queueItemId) {
     item.media = resolveMediaMergeFields(item.media, contact)
 
     if (campaign?.ai_rewrite_enabled) {
-      const result = await rewriteSuggestedMessage(supabase, item.final_message, contact, business, pack, conv)
+      // Campaign context: auto-campaigns carry an objective + playbook (business override
+      // or platform default); every AI-rewritten campaign message also gets this lead's profile.
+      const extra = { profile: await getCustomerProfile(supabase, contact.id) }
+      if (campaign.kind === 'auto' && campaign.rule_id) {
+        Object.assign(extra, await getAutoCampaignContext(supabase, campaign.business_id, campaign.rule_id))
+      }
+      const result = await rewriteSuggestedMessage(supabase, item.final_message, contact, business, pack, conv, extra)
       if (!result.ok) {
         if (result.reason === 'qc_failed') {
           await supabase.from('follow_up_queue').update({

@@ -10,6 +10,14 @@ import { runStageClassifier } from './stageClassifier.js'
 import { runActivityPatterns } from './activityPatterns.js'
 import { log } from '../lib/log.js'
 
+// Keeps customer_profiles current from the analyser's signals. Hash-gated in SQL,
+// so a tick with nothing changed does no writes.
+async function runCustomerProfileSync(sb) {
+  const { data, error } = await sb.rpc('sync_customer_profiles')
+  if (error) throw new Error(`sync_customer_profiles failed: ${error.message}`)
+  return { profilesChanged: data?.profiles_changed ?? 0 }
+}
+
 // Each job gets its own guard flag so a slow run never overlaps itself,
 // and its own cadence — no reason to run activity-pattern analysis
 // every 30s when it's only useful hourly.
@@ -58,3 +66,4 @@ loop('OptInClassifier', runOptInClassifier, 2 * 60_000) // every 2 min — react
 loop('CampaignReplyIntentClassifier', runCampaignReplyIntentClassifier, 2 * 60_000) // same cadence — same reasoning
 loop('StageClassifier', runStageClassifier, 60_000) // every 1 min — DB-only check; OpenAI is called only for conversations a lead responded to (see stageClassifier.js)
 loop('ActivityPatterns', runActivityPatterns, 60 * 60_000) // hourly — cheap to run less often
+loop('CustomerProfiles', runCustomerProfileSync, 60_000) // every 1 min — SQL-only, no AI calls

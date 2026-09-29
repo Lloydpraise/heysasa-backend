@@ -101,11 +101,15 @@ async function seedCampaignEnrollments(supabase) {
     const leadIds = [...new Set((members ?? []).map(member => member.lead_id))]
     if (!leadIds.length) continue
 
-    const [{ data: contacts, error: contactsError }, { data: existing, error: existingError }] = await Promise.all([
-      supabase.from('contacts').select('id, business_id').in('id', leadIds),
+    const [{ data: contacts, error: contactsError }, { data: existingOpen, error: existingError }, { data: existingHere, error: hereError }] = await Promise.all([
+      supabase.from('contacts').select('id, business_id, do_not_contact').in('id', leadIds),
       supabase.from('campaign_enrollments').select('lead_id, campaign_id')
-        .in('lead_id', leadIds).in('status', ['pending', 'active', 'awaiting_opt_in'])
+        .in('lead_id', leadIds).in('status', ['pending', 'active', 'awaiting_opt_in']),
+      // Any status, this campaign only: a completed/exited enrollment still
+      // occupies UNIQUE(campaign_id, lead_id) and would fail the whole batch insert.
+      supabase.from('campaign_enrollments').select('lead_id').eq('campaign_id', campaign.id).in('lead_id', leadIds)
     ])
+    const existing = [...(existingOpen ?? []), ...(existingHere ?? [])]
 
     if (contactsError) {
       log('error', 'engine', 'campaign_scheduler.contact_lookup_failed', `Contact lookup failed for campaign ${campaign.id}: ${contactsError.message}`, {
@@ -113,9 +117,9 @@ async function seedCampaignEnrollments(supabase) {
       })
       continue
     }
-    if (existingError) {
-      log('error', 'engine', 'campaign_scheduler.enrollment_lookup_failed', `Enrollment lookup failed for campaign ${campaign.id}: ${existingError.message}`, {
-        entity_id: campaign.id, details: { error: existingError.message }
+    if (existingError || hereError) {
+      log('error', 'engine', 'campaign_scheduler.enrollment_lookup_failed', `Enrollment lookup failed for campaign ${campaign.id}: ${(existingError || hereError).message}`, {
+        entity_id: campaign.id, details: { error: (existingError || hereError).message }
       })
       continue
     }
@@ -125,7 +129,7 @@ async function seedCampaignEnrollments(supabase) {
     const rows = []
     for (const leadId of leadIds) {
       const contact = contactsById.get(leadId)
-      if (!contact || contact.business_id !== campaign.business_id || existingByLead.has(leadId)) continue
+      if (!contact || contact.business_id !== campaign.business_id || contact.do_not_contact || existingByLead.has(leadId)) continue
       rows.push({
         campaign_id: campaign.id,
         lead_id: leadId,

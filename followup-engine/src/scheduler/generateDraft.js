@@ -118,7 +118,10 @@ export async function generateFollowupDraft(supabase, item, contact, business, p
 // separate from generateFollowupDraft — this doesn't touch touchpoint
 // type, KLT phase, or materials, just the owner's own suggestion plus
 // conversation context.
-export async function rewriteSuggestedMessage(supabase, suggestion, contact, business, pack, conv) {
+// extra (optional): { objective, playbook, profile } — used by auto-campaigns so the
+// example message is rewritten toward the campaign's goal, following its playbook,
+// and matched to this specific lead's customer profile.
+export async function rewriteSuggestedMessage(supabase, suggestion, contact, business, pack, conv, extra = {}) {
   const messages = conv ? await getMessages(supabase, conv.id, { limit: THREAD_MESSAGES }) : []
 
   let convSummary = 'No conversation history yet.'
@@ -128,12 +131,19 @@ export async function rewriteSuggestedMessage(supabase, suggestion, contact, bus
       : await summariseThread(supabase, conv, messages, contact.business_id)
   }
 
-  const userContent = [
+  const parts = [
     `PERSONA:\n${JSON.stringify(pack?.persona ?? {})}`,
     `OWNER'S SUGGESTED MESSAGE (treat as intent, not final copy):\n${suggestion}`,
     `CONVERSATION SUMMARY:\n${convSummary}`,
     `LEAD NAME: ${contact.name ?? 'Customer'}`
-  ].join('\n\n')
+  ]
+  if (extra.objective) parts.push(`CAMPAIGN OBJECTIVE:\n${extra.objective}`)
+  if (extra.playbook) parts.push(`HOW TO FOLLOW UP (playbook):\n${extra.playbook}`)
+  if (extra.profile) parts.push(`CUSTOMER PROFILE (this lead):\n${JSON.stringify(extra.profile)}`)
+  if (extra.objective || extra.playbook || extra.profile) {
+    parts.push('HOW TO USE THIS CONTEXT: the owner message is an EXAMPLE of the message for this step. Rewrite it for this exact lead: keep the step\'s intent, serve the campaign objective, follow the playbook, use the lead\'s real product interest and objections from the profile, and match the persona voice. Fill any {{placeholder}} tokens from the lead data. Never invent prices, discounts or facts not present in the context.')
+  }
+  const userContent = parts.join('\n\n')
 
   const draft = await callBot(supabase, 'suggestion_rewriter', userContent, SUGGESTION_REWRITE_FALLBACK, { cacheKey: `rewrite:${contact.business_id}` })
   if (!draft) return { ok: false, reason: 'generation_failed' }
