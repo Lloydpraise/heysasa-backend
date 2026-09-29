@@ -19,6 +19,7 @@ import {
 } from './services/webhookHandler.js';
 import { attachDebugClient, debugLog, logEvent, queryLogs, getStreamClientCount } from './services/debugConsole.js';
 import { isDebugTokenValid, requireDebugToken } from './middleware/debugAuth.js';
+import { createAdminRouter } from './adminRoutes.js';
 import { startAlerts } from './services/alerts.js';
 import { EVOLUTION_API_KEY, EVOLUTION_URL } from './config/evolution.js';
 import {
@@ -81,6 +82,13 @@ let analysisBusinessId = null;
 let followupProcess = null;
 let shuttingDown = false;
 const followupPort = process.env.FOLLOWUP_ENGINE_PORT || '3001';
+
+// ─── /admin: campaign defaults, AI prompts, lead preview (gated by DEBUG_TOKEN for now) ───
+app.use(createAdminRouter({
+    getFollowupPort: () => followupPort,
+    isFollowupRunning: () => !!followupProcess && !followupProcess.killed,
+}));
+app.get('/admin', (_req, res) => res.sendFile(path.join(PUBLIC_DIR, 'admin.html')));
 
 // Shared by both child processes we spawn (the follow-up engine and the
 // analysis worker): if a stdout/stderr line starts with "@@LOG ", it's a

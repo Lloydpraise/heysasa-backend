@@ -6,6 +6,7 @@ import { followupSettingsRouter } from './followupSettingsRoutes.js'
 import { materialsRouter } from './materialsRoutes.js'
 import { whatsappRouter } from './whatsappRoutes.js'
 import { campaignRouter } from './campaignRoutes.js'
+import { adminRouter } from './adminRoutes.js'
 import { CORS_ORIGINS } from '../config.js'
 import { log } from '../lib/log.js'
 import { checkOpenAIAvailability, getOpenAIAvailabilityState } from '../lib/openAiGate.js'
@@ -53,6 +54,9 @@ app.post('/debug/openai/recheck', async (_req, res) => {
   const status = await checkOpenAIAvailability({ force: true })
   res.json({ ok: status.available, ...status })
 })
+
+// Internal admin endpoints: own DEBUG_TOKEN check, so they sit before business auth.
+app.use(adminRouter)
 
 app.use(requireBusinessAuth)
 app.use(queueRouter)

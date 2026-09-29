@@ -1,0 +1,399 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HeySasa Admin</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --ink:#0f172a; --mute:#64748b; --line:#e2e8f0; --green:#28A745; --red:#dc2626; --amber:#b45309; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#0b1220; --card:#111a2e; --ink:#e5e9f2; --mute:#93a0b8; --line:#22304d; } }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--ink); }
+  header { display:flex; align-items:center; gap:16px; padding:12px 20px; border-bottom:1px solid var(--line); background:var(--card); position:sticky; top:0; z-index:5; }
+  header h1 { font-size:15px; margin:0; }
+  nav { display:flex; gap:4px; }
+  nav button { border:0; background:none; color:var(--mute); padding:7px 12px; border-radius:8px; font-weight:600; cursor:pointer; }
+  nav button.on { background:var(--bg); color:var(--ink); }
+  main { max-width:1150px; margin:0 auto; padding:20px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:16px; margin-bottom:16px; }
+  .grid { display:grid; gap:16px; grid-template-columns:280px 1fr; }
+  @media (max-width:800px) { .grid { grid-template-columns:1fr; } }
+  label { display:block; font-weight:600; margin:12px 0 4px; font-size:13px; }
+  .hint { color:var(--mute); font-size:12px; margin:2px 0 6px; }
+  input, select, textarea { width:100%; padding:8px 10px; border:1px solid var(--line); border-radius:9px; background:var(--card); color:var(--ink); font:inherit; }
+  textarea { resize:vertical; min-height:60px; }
+  .row { display:flex; gap:10px; align-items:flex-start; }
+  .row > * { flex:1; }
+  .btn { border:1px solid var(--line); background:var(--card); color:var(--ink); padding:8px 14px; border-radius:9px; font-weight:600; cursor:pointer; }
+  .btn.primary { background:var(--green); border-color:var(--green); color:#fff; }
+  .btn.danger { color:var(--red); }
+  .btn:disabled { opacity:.45; cursor:not-allowed; }
+  .item { padding:9px 10px; border-radius:9px; cursor:pointer; border:1px solid transparent; }
+  .item:hover { background:var(--bg); }
+  .item.on { background:var(--bg); border-color:var(--line); }
+  .item small { display:block; color:var(--mute); }
+  .pill { display:inline-block; font-size:10px; font-weight:700; padding:2px 7px; border-radius:99px; background:var(--bg); color:var(--mute); margin-left:6px; }
+  .pill.ok { background:#dcfce7; color:#166534; } .pill.warn { background:#fef3c7; color:var(--amber); }
+  .step { border:1px solid var(--line); border-radius:11px; padding:10px; margin-bottom:10px; }
+  .step .top { display:flex; justify-content:space-between; align-items:center; margin-bottom:6px; font-weight:600; }
+  .msg { padding:9px 12px; border-radius:9px; margin:10px 0; }
+  .msg.ok { background:#dcfce7; color:#166534; } .msg.err { background:#fee2e2; color:#991b1b; }
+  .box { white-space:pre-wrap; background:var(--bg); border:1px solid var(--line); border-radius:10px; padding:10px; }
+  table { width:100%; border-collapse:collapse; } th,td { text-align:left; padding:8px; border-bottom:1px solid var(--line); font-size:13px; } th { color:var(--mute); font-size:11px; text-transform:uppercase; }
+  .hidden { display:none !important; }
+  #login { max-width:380px; margin:12vh auto; }
+</style>
+</head>
+<body>
+<div id="login" class="card hidden">
+  <h1 style="font-size:17px;margin:0 0 6px">HeySasa Admin</h1>
+  <p class="hint">Enter the debug token.</p>
+  <input id="tok" type="password" placeholder="debug token" autocomplete="current-password">
+  <div style="margin-top:12px"><button class="btn primary" id="tok-go">Sign in</button></div>
+  <div id="login-err" class="msg err hidden"></div>
+</div>
+
+<div id="app" class="hidden">
+<header>
+  <h1>HeySasa Admin</h1>
+  <nav id="nav">
+    <button data-t="defaults" class="on">Campaign defaults</button>
+    <button data-t="prompts">AI prompts</button>
+    <button data-t="preview">Preview on a lead</button>
+    <button data-t="ops">Overview &amp; ops</button>
+  </nav>
+  <span style="flex:1"></span>
+  <a class="hint" href="/debug.html">Debug console</a>
+  <button class="btn" id="signout">Sign out</button>
+</header>
+<main>
+  <div id="flash"></div>
+
+  <!-- CAMPAIGN DEFAULTS -->
+  <section id="tab-defaults">
+    <div class="grid">
+      <div class="card" style="align-self:start">
+        <div class="row" style="margin-bottom:8px"><strong>Defaults</strong><button class="btn" id="d-new" style="flex:0">+ New scope</button></div>
+        <div id="d-list"></div>
+      </div>
+      <div>
+        <div class="card">
+          <div class="row">
+            <div><label>Rule</label><div id="d-rule"></div></div>
+            <div><label>Industry</label><input id="d-industry" list="industries" placeholder="blank = all industries"><datalist id="industries"></datalist></div>
+            <div><label>Business type</label><select id="d-type"><option value="">Any</option></select></div>
+          </div>
+          <p class="hint">Most specific match wins: industry + type, then industry, then type, then global. The global default (blank industry and type) always stays on.</p>
+          <label>Campaign name</label><input id="d-name">
+          <label>Objective</label><textarea id="d-objective" rows="2"></textarea>
+          <label>How to follow up (playbook)</label><textarea id="d-playbook" rows="5"></textarea>
+          <label>Message sequence <span class="hint" style="display:inline">— examples the AI rewrites per lead. Tokens: {{first_name}}, {{product_interest}}</span></label>
+          <div id="d-steps"></div>
+          <button class="btn" id="d-add">+ Add message</button>
+          <div style="margin-top:14px" class="row">
+            <span id="d-meta" class="hint" style="flex:2"></span>
+            <button class="btn danger" id="d-off" style="flex:0;white-space:nowrap">Deactivate override</button>
+            <button class="btn primary" id="d-save" style="flex:0;white-space:nowrap">Save as new version</button>
+          </div>
+        </div>
+        <div class="card"><strong>Version history</strong><div id="d-history" class="hint" style="margin-top:8px">Select a default to see its versions.</div></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- AI PROMPTS -->
+  <section id="tab-prompts" class="hidden">
+    <div class="grid">
+      <div class="card" style="align-self:start"><strong>Systems</strong><div id="b-list" style="margin-top:8px"></div></div>
+      <div class="card">
+        <div id="b-none" class="hint">Pick a bot.</div>
+        <div id="b-form" class="hidden">
+          <div class="row"><strong id="b-title" style="flex:2"></strong><span id="b-state"></span></div>
+          <p class="hint" id="b-note"></p>
+          <label>Prompt</label><textarea id="b-prompt" rows="14" style="font-family:ui-monospace,Menlo,monospace;font-size:12px"></textarea>
+          <div class="row">
+            <div><label>Model</label><input id="b-model"></div>
+            <div><label>Temperature</label><input id="b-temp" type="number" step="0.1" min="0" max="2" placeholder="default"></div>
+            <div><label>Max tokens</label><input id="b-max" type="number" min="50" max="4000" placeholder="default"></div>
+          </div>
+          <div style="margin-top:14px" class="row">
+            <button class="btn" id="b-builtin" style="flex:0;white-space:nowrap">Load built-in text</button>
+            <label style="margin:0;flex:0;white-space:nowrap"><input type="checkbox" id="b-active" style="width:auto"> Override active</label>
+            <span style="flex:1"></span>
+            <button class="btn primary" id="b-save" style="flex:0;white-space:nowrap">Save</button>
+          </div>
+          <p class="hint">When the override is off (or doesn't exist) the system uses its built-in prompt. Changes may take up to 60 seconds to take effect.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- PREVIEW -->
+  <section id="tab-preview" class="hidden">
+    <div class="card">
+      <div class="row">
+        <div><label>Business</label><select id="p-biz"></select></div>
+        <div><label>Find a lead (name or phone)</label><input id="p-q" placeholder="type to search, Enter"></div>
+        <div><label>Auto-campaign rule (optional)</label><select id="p-rule"><option value="">— none —</option></select></div>
+      </div>
+      <div id="p-leads" style="margin-top:8px"></div>
+    </div>
+    <div class="grid" style="grid-template-columns:1fr 1fr">
+      <div class="card">
+        <strong>Test</strong> <span id="p-lead-name" class="pill">no lead picked</span>
+        <label>Example message (one step)</label><textarea id="p-msg" rows="3"></textarea>
+        <div id="p-steps" class="hint"></div>
+        <label>Objective</label><textarea id="p-obj" rows="2"></textarea>
+        <label>Playbook</label><textarea id="p-play" rows="4"></textarea>
+        <p class="hint">Leave objective / playbook blank to use what's saved for the selected rule.</p>
+        <button class="btn primary" id="p-run" disabled>Run rewrite (sends nothing)</button>
+      </div>
+      <div class="card">
+        <strong>Result</strong>
+        <div id="p-out" class="hint" style="margin-top:8px">Pick a lead, then run.</div>
+        <details style="margin-top:12px"><summary>Lead's customer profile</summary><div id="p-profile" class="box" style="margin-top:8px">—</div></details>
+      </div>
+    </div>
+  </section>
+
+  <!-- OPS -->
+  <section id="tab-ops" class="hidden">
+    <div class="card">
+      <div class="row"><strong>Auto-campaigns across businesses</strong><button class="btn" id="o-refresh" style="flex:0">Refresh</button></div>
+      <div id="o-table" style="margin-top:8px">Loading…</div>
+    </div>
+    <div class="card">
+      <strong>Run now</strong>
+      <p class="hint">Both already run on a schedule (auto-lists every 10 min, profiles every minute).</p>
+      <button class="btn" id="o-profiles">Sync customer profiles</button>
+      <button class="btn" id="o-lists">Sync auto-lists</button>
+      <div id="o-out" class="hint" style="margin-top:8px"></div>
+    </div>
+  </section>
+</main>
+</div>
+
+<script>
+const KEY = 'heysasa_debug_token';
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
+const token = () => sessionStorage.getItem(KEY) || '';
+
+async function api(path, { method = 'GET', body } = {}) {
+  const res = await fetch('/admin/api' + path, {
+    method,
+    headers: { 'Content-Type': 'application/json', 'x-debug-token': token() },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const json = await res.json().catch(() => ({}));
+  if (res.status === 401) { signOut(); throw new Error('Signed out — token rejected.'); }
+  if (!res.ok || json.ok === false) throw new Error(json.error || `HTTP ${res.status}`);
+  return json;
+}
+function flash(text, kind = 'ok') {
+  $('flash').innerHTML = `<div class="msg ${kind}">${esc(text)}</div>`;
+  clearTimeout(flash.t); flash.t = setTimeout(() => ($('flash').innerHTML = ''), kind === 'ok' ? 4000 : 9000);
+}
+const guard = (fn) => async (...a) => { try { await fn(...a); } catch (e) { flash(e.message, 'err'); } };
+
+// ── auth ─────────────────────────────────────────────────────
+function signOut() { sessionStorage.removeItem(KEY); $('app').classList.add('hidden'); $('login').classList.remove('hidden'); }
+async function signIn(t) {
+  sessionStorage.setItem(KEY, t);
+  try { await boot(); $('login').classList.add('hidden'); $('app').classList.remove('hidden'); }
+  catch (e) { sessionStorage.removeItem(KEY); $('login-err').textContent = e.message; $('login-err').classList.remove('hidden'); $('login').classList.remove('hidden'); }
+}
+$('tok-go').onclick = () => signIn($('tok').value.trim());
+$('tok').onkeydown = (e) => e.key === 'Enter' && $('tok-go').click();
+$('signout').onclick = signOut;
+
+// ── tabs ─────────────────────────────────────────────────────
+$('nav').onclick = (e) => {
+  const t = e.target.dataset.t; if (!t) return;
+  document.querySelectorAll('#nav button').forEach((b) => b.classList.toggle('on', b === e.target));
+  ['defaults', 'prompts', 'preview', 'ops'].forEach((n) => $('tab-' + n).classList.toggle('hidden', n !== t));
+  if (t === 'prompts') guard(loadBots)(); if (t === 'ops') guard(loadOps)();
+};
+
+let meta = { businesses: [], industries: [], businessTypes: [], ruleIds: [] };
+
+// ── campaign defaults ────────────────────────────────────────
+let defaults = [], cur = null; // cur: { id?, rule_id, industry, business_type, ... }
+const scopeLabel = (d) => `${d.industry || 'All industries'}${d.business_type ? ' · ' + d.business_type : ''}`;
+
+async function loadDefaults(selectId) {
+  defaults = (await api('/defaults')).defaults;
+  const groups = {};
+  defaults.forEach((d) => (groups[d.rule_id] ??= []).push(d));
+  $('d-list').innerHTML = Object.entries(groups).map(([rule, rows]) =>
+    `<div class="hint" style="margin:10px 0 2px;font-weight:700">${esc(rule)}</div>` +
+    rows.map((d) => `<div class="item ${cur?.id === d.id ? 'on' : ''}" data-id="${d.id}">${esc(scopeLabel(d))}<span class="pill">v${d.version}</span><small>${esc(d.campaign_name)}</small></div>`).join('')
+  ).join('');
+  $('d-list').querySelectorAll('.item').forEach((el) => (el.onclick = guard(() => pick(el.dataset.id))));
+  const target = selectId || cur?.id;
+  if (target && defaults.some((d) => d.id === target)) await pick(target); else if (!cur && defaults[0]) await pick(defaults[0].id);
+}
+
+function renderSteps(steps) {
+  $('d-steps').innerHTML = steps.map((s, i) => `
+    <div class="step" data-i="${i}">
+      <div class="top"><span>Message ${i + 1}</span>
+        ${i > 0 ? `<span><select class="gap" style="width:auto">${[4,12,24,48,72,96,168].map((h) => `<option value="${h}" ${Number(s.delay_hours) === h ? 'selected' : ''}>wait ${h < 24 ? h + ' hours' : h / 24 + ' day' + (h > 24 ? 's' : '')}</option>`).join('')}</select>
+        <button class="btn danger rm" style="padding:3px 9px">✕</button></span>` : '<span class="hint">sends first</span>'}
+      </div>
+      <textarea class="content" rows="3">${esc(s.content)}</textarea>
+    </div>`).join('');
+  $('d-steps').querySelectorAll('.rm').forEach((b) => (b.onclick = () => { const st = readSteps(); st.splice(+b.closest('.step').dataset.i, 1); renderSteps(st); }));
+}
+function readSteps() {
+  return [...$('d-steps').querySelectorAll('.step')].map((el, i) => ({
+    content: el.querySelector('.content').value,
+    delay_hours: i === 0 ? 0 : Number(el.querySelector('.gap')?.value || 24),
+  }));
+}
+function fillForm(d) {
+  cur = d;
+  $('d-rule').textContent = d.rule_id; $('d-industry').value = d.industry || ''; $('d-type').value = d.business_type || '';
+  $('d-name').value = d.campaign_name; $('d-objective').value = d.objective; $('d-playbook').value = d.playbook;
+  renderSteps(d.steps);
+  $('d-meta').textContent = d.id ? `Editing v${d.version}. Saving creates v${d.version + 1}; the old one stays in history.` : 'New scope — saved as v1 (or a new version if that scope already exists).';
+  $('d-off').classList.toggle('hidden', !d.id || (!d.industry && !d.business_type));
+  document.querySelectorAll('#d-list .item').forEach((el) => el.classList.toggle('on', el.dataset.id === d.id));
+}
+async function pick(id) {
+  const d = defaults.find((x) => x.id === id); if (!d) return;
+  fillForm(d); await loadHistory(d);
+}
+async function loadHistory(d) {
+  const q = new URLSearchParams({ rule_id: d.rule_id }); if (d.industry) q.set('industry', d.industry); if (d.business_type) q.set('business_type', d.business_type);
+  const { history } = await api('/defaults/history?' + q);
+  $('d-history').innerHTML = history.map((h) => `<div class="row" style="align-items:center;padding:6px 0;border-bottom:1px solid var(--line)">
+      <span style="flex:2">v${h.version} ${h.is_active ? '<span class="pill ok">live</span>' : ''} <span class="hint" style="display:inline">${new Date(h.created_at).toLocaleString()}</span></span>
+      ${h.is_active ? '' : `<button class="btn" style="flex:0" data-restore="${h.id}">Restore</button>`}</div>`).join('');
+  $('d-history').querySelectorAll('[data-restore]').forEach((b) => (b.onclick = guard(async () => {
+    if (!confirm('Restore this version as the new live version?')) return;
+    const r = await api(`/defaults/${b.dataset.restore}/restore`, { method: 'POST' });
+    flash('Restored as v' + r.default.version); await loadDefaults(r.default.id);
+  })));
+}
+$('d-add').onclick = () => { const st = readSteps(); if (st.length >= 8) return flash('Max 8 messages', 'err'); st.push({ content: '', delay_hours: 24 }); renderSteps(st); };
+$('d-new').onclick = () => fillForm({ rule_id: meta.ruleIds[0], industry: '', business_type: '', campaign_name: '', objective: '', playbook: '', steps: [{ content: '', delay_hours: 0 }], version: 0 });
+$('d-save').onclick = guard(async () => {
+  const body = { rule_id: cur.rule_id, industry: $('d-industry').value, business_type: $('d-type').value,
+    campaign_name: $('d-name').value, objective: $('d-objective').value, playbook: $('d-playbook').value, sequence_mode: 'linear', steps: readSteps() };
+  const r = await api('/defaults', { method: 'PUT', body });
+  flash(`Saved ${body.rule_id} (${body.industry || 'global'}) as v${r.default.version}`); cur = null; await loadDefaults(r.default.id);
+});
+$('d-off').onclick = guard(async () => {
+  if (!cur?.id || !confirm('Deactivate this override? Businesses fall back to the next most specific default.')) return;
+  await api('/defaults/' + cur.id, { method: 'DELETE' }); flash('Override deactivated'); cur = null; await loadDefaults();
+});
+
+// ── AI prompts ───────────────────────────────────────────────
+let botData = { bots: [], fallbacks: {}, defaultModel: '' }, botCur = null;
+async function loadBots() {
+  botData = await api('/bots');
+  const ids = [...new Set([...Object.keys(botData.catalog || {}), ...Object.keys(botData.fallbacks), ...botData.bots.map((b) => b.bot_id)])].sort();
+  const groups = {};
+  ids.forEach((id) => {
+    const info = botData.catalog?.[id] || {};
+    const system = info.system || 'Other';
+    (groups[system] ??= []).push(id);
+  });
+  $('b-list').innerHTML = Object.entries(groups).sort(([a], [b]) => a.localeCompare(b)).map(([system, groupIds]) =>
+    `<div class="hint" style="margin:12px 0 3px;font-weight:700">${esc(system)}</div>` + groupIds.map((id) => {
+    const row = botData.bots.find((b) => b.bot_id === id);
+    const st = row?.is_active ? '<span class="pill ok">override</span>' : '<span class="pill">built-in</span>';
+    const info = botData.catalog?.[id] || {};
+    return `<div class="item ${botCur === id ? 'on' : ''}" data-id="${esc(id)}">${esc(info.bot_name || row?.bot_name || id)}${st}<small>${esc(id)}</small></div>`;
+  }).join('')
+  ).join('');
+  $('b-list').querySelectorAll('.item').forEach((el) => (el.onclick = () => pickBot(el.dataset.id)));
+}
+function pickBot(id) {
+  botCur = id;
+  const row = botData.bots.find((b) => b.bot_id === id), fb = botData.catalog?.[id]?.prompt ?? botData.fallbacks[id];
+  $('b-none').classList.add('hidden'); $('b-form').classList.remove('hidden');
+  $('b-title').textContent = `${botData.catalog?.[id]?.bot_name || row?.bot_name || id} · ${id}`;
+  $('b-state').innerHTML = row?.is_active ? '<span class="pill ok">override active</span>' : '<span class="pill">using built-in</span>';
+  $('b-note').textContent = row ? '' : 'No override yet. The built-in text is loaded below as a starting point — edit and save to create one.';
+  $('b-prompt').value = row?.prompt ?? fb ?? '';
+  $('b-model').value = row?.model ?? botData.defaultModel;
+  $('b-temp').value = row?.temperature ?? ''; $('b-max').value = row?.max_tokens ?? '';
+  $('b-active').checked = row ? !!row.is_active : true;
+  $('b-builtin').disabled = !fb;
+  document.querySelectorAll('#b-list .item').forEach((el) => el.classList.toggle('on', el.dataset.id === id));
+}
+$('b-builtin').onclick = () => { $('b-prompt').value = botData.fallbacks[botCur] || ''; };
+$('b-save').onclick = guard(async () => {
+  const r = await api('/bots/' + botCur, { method: 'PUT', body: { prompt: $('b-prompt').value, model: $('b-model').value, temperature: $('b-temp').value, max_tokens: $('b-max').value, is_active: $('b-active').checked, bot_name: botData.catalog?.[botCur]?.bot_name || botCur } });
+  flash('Saved. ' + (r.note || '')); await loadBots(); pickBot(botCur);
+});
+
+// ── preview ──────────────────────────────────────────────────
+let lead = null;
+async function searchLeads() {
+  const { leads } = await api(`/leads?business_id=${encodeURIComponent($('p-biz').value)}&q=${encodeURIComponent($('p-q').value)}`);
+  $('p-leads').innerHTML = leads.length ? leads.map((l) => `<div class="item" data-id="${l.id}" data-name="${esc(l.name || l.phone)}">${esc(l.name || '(no name)')} <span class="pill">${esc(l.phone || '')}</span>${l.intent_score ? `<span class="pill">intent ${l.intent_score}</span>` : ''}<small>${esc((l.product_interests || []).join(', '))}</small></div>`).join('') : '<span class="hint">No leads found.</span>';
+  $('p-leads').querySelectorAll('.item').forEach((el) => (el.onclick = guard(async () => {
+    lead = { id: Number(el.dataset.id), name: el.dataset.name };
+    $('p-lead-name').textContent = lead.name; $('p-run').disabled = false;
+    $('p-leads').querySelectorAll('.item').forEach((x) => x.classList.toggle('on', x === el));
+    const { profile } = await api('/customer-profile/' + lead.id);
+    $('p-profile').textContent = profile ? JSON.stringify(Object.fromEntries(Object.entries(profile).filter(([k, v]) => v != null && !['source_hash', 'profile_id'].includes(k))), null, 2) : 'No profile row yet for this lead.';
+  })));
+}
+$('p-q').onkeydown = (e) => e.key === 'Enter' && guard(searchLeads)();
+$('p-biz').onchange = guard(searchLeads);
+$('p-rule').onchange = guard(async () => {
+  $('p-steps').innerHTML = '';
+  if (!$('p-rule').value) return;
+  const { effective } = await api(`/defaults/effective?business_id=${encodeURIComponent($('p-biz').value)}&rule_id=${encodeURIComponent($('p-rule').value)}`);
+  if (!effective) return flash('No default for that rule', 'err');
+  $('p-obj').value = effective.objective; $('p-play').value = effective.playbook;
+  $('p-steps').innerHTML = 'Load a step: ' + effective.steps.map((s, i) => `<a href="#" data-i="${i}">message ${i + 1}</a>`).join(' · ');
+  $('p-steps').querySelectorAll('a').forEach((a) => (a.onclick = (e) => { e.preventDefault(); $('p-msg').value = effective.steps[+a.dataset.i].content; }));
+  $('p-msg').value ||= effective.steps[0].content;
+});
+$('p-run').onclick = guard(async () => {
+  $('p-run').disabled = true; $('p-out').textContent = 'Running the real rewrite…';
+  try {
+    const r = await api('/preview-rewrite', { method: 'POST', body: { contact_id: lead.id, message: $('p-msg').value, rule_id: $('p-rule').value || undefined, objective: $('p-obj').value, playbook: $('p-play').value } });
+    const res = r.result;
+    $('p-out').innerHTML =
+      (r.hasPersonaPack ? '' : '<div class="msg err">This business has no active persona pack — the AI ran without its voice.</div>') +
+      (res.ok
+        ? `<div class="hint">AI message ${res.qcPassed ? '<span class="pill ok">QC passed</span>' : '<span class="pill warn">QC issues</span>'}</div><div class="box">${esc(res.finalMessage)}</div>${res.qcNotes ? `<div class="hint">QC: ${esc(res.qcNotes)}</div>` : ''}`
+        : `<div class="msg err">Rewrite failed: ${esc(res.reason)} ${esc((res.issues || []).join(', '))}</div>${res.draft ? `<div class="box">${esc(res.draft)}</div>` : ''}`) +
+      `<div class="hint" style="margin-top:12px">If AI rewrite is OFF this is what sends:</div><div class="box">${esc(r.mergeOnly)}</div>`;
+  } finally { $('p-run').disabled = false; }
+});
+
+// ── ops ──────────────────────────────────────────────────────
+async function loadOps() {
+  const { campaigns } = await api('/auto-campaigns');
+  $('o-table').innerHTML = campaigns.length ? `<table><tr><th>Business</th><th>Rule</th><th>Status</th><th>Enrolments</th><th>AI</th><th>Approval</th></tr>` +
+    campaigns.map((c) => `<tr><td>${esc(c.business_name)}</td><td>${esc(c.rule_id)}</td><td>${esc(c.status)}</td><td>${Object.entries(c.enrollments).map(([k, v]) => `${v} ${k}`).join(', ') || '—'}</td><td>${c.ai_rewrite_enabled ? 'on' : 'off'}</td><td>${c.auto_approve ? 'auto' : 'manual'}</td></tr>`).join('') + '</table>'
+    : '<span class="hint">No auto-campaigns yet.</span>';
+}
+$('o-refresh').onclick = guard(loadOps);
+$('o-profiles').onclick = guard(async () => { const r = await api('/run/sync-customer-profiles', { method: 'POST' }); $('o-out').textContent = JSON.stringify(r.result); });
+$('o-lists').onclick = guard(async () => { const r = await api('/run/sync-auto-lists', { method: 'POST' }); $('o-out').textContent = r.result; });
+
+// ── boot ─────────────────────────────────────────────────────
+async function boot() {
+  meta = await api('/meta');
+  $('industries').innerHTML = meta.industries.map((i) => `<option value="${esc(i)}">`).join('');
+  $('d-type').innerHTML = '<option value="">Any</option>' + meta.businessTypes.map((t) => `<option>${esc(t)}</option>`).join('');
+  $('p-biz').innerHTML = meta.businesses.map((b) => `<option value="${esc(b.business_id)}">${esc(b.name || b.business_id)}${b.industry ? ' — ' + esc(b.industry) : ''}</option>`).join('');
+  $('p-rule').innerHTML = '<option value="">— none —</option>' + meta.ruleIds.map((r) => `<option>${esc(r)}</option>`).join('');
+  await loadDefaults();
+}
+(async () => {
+  const t = token() || new URLSearchParams(location.search).get('token') || '';
+  if (t) { await signIn(t); if (location.search.includes('token=')) history.replaceState(null, '', location.pathname); }
+  else $('login').classList.remove('hidden');
+})();
+</script>
+</body>
+</html>

@@ -1,19 +1,7 @@
 import { callBot } from './ai.js'
+import { AI_PROMPT_CATALOG } from '../../../src/aiPromptCatalog.js'
 
-const QC_FALLBACK = `
-You are a quality control system for WhatsApp follow-up messages sent by Kenyan businesses.
-Check the message against these rules:
-1. LENGTH: Soft warn over 300 chars, hard fail over 500
-2. LANGUAGE: Matches business language mix
-3. NO_COMPETITOR: No competitor brand mentions
-4. PRICE_ACCURACY: Any prices match the persona pack context
-5. NO_REPEAT: Not repeating the same point as previous messages
-6. NO_SPAM: No ALL CAPS words, max 2 exclamation marks
-7. ONE_CTA: Exactly one call to action
-8. APPROPRIATE: Professional and culturally appropriate for Kenya
-Return ONLY valid JSON: {"passed":true,"issues":[],"suggested_fix":null}
-or {"passed":false,"issues":["RULE: reason"],"suggested_fix":"fixed message"}
-`
+export const QC_FALLBACK = AI_PROMPT_CATALOG.followup_qc.prompt
 
 export async function runQC(supabase, message, personaPack, previousMessages, { businessId = null } = {}) {
   const prevText = previousMessages

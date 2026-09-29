@@ -19,6 +19,8 @@ import {
     setOpenAIUnavailable,
     shouldPauseOpenAIRequest,
 } from './src/services/openAiGate.js';
+import { AI_PROMPT_CATALOG } from './src/aiPromptCatalog.js';
+import { getAiPromptConfig } from './src/services/aiPromptConfig.js';
 
 dotenv.config();
 
@@ -649,8 +651,13 @@ function logCacheStats(tag) {
 // Rate limits (429 rate_limit_exceeded) are waited out and retried. Only quota
 // exhaustion or a rejected key is fatal for the run: the old code treated every
 // 429 as "out of credits" and killed the whole run on a per-minute limit.
-async function callOpenAiJson({ model, system, user, maxTokens, attempts = 4, cacheKey = null }) {
+async function callOpenAiJson({ model, system, user, maxTokens, promptId = null, attempts = 4, cacheKey = null }) {
     let lastError;
+    const promptConfig = promptId ? await getAiPromptConfig(supabase, promptId) : null;
+    const resolvedSystem = promptConfig?.prompt ?? system;
+    const resolvedModel = promptConfig?.model ?? model;
+    const resolvedMaxTokens = promptConfig?.max_tokens ?? maxTokens;
+    const resolvedTemperature = promptConfig?.temperature ?? 0.1;
     if (shouldPauseOpenAIRequest()) {
         const state = getOpenAIAvailabilityState();
         throw new FatalRunError(state.message || 'OpenAI Unavailable');
@@ -668,13 +675,13 @@ async function callOpenAiJson({ model, system, user, maxTokens, attempts = 4, ca
                 headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${OPENAI_KEY}` },
                 signal:  AbortSignal.timeout(60000),
                 body: JSON.stringify({
-                    model,
-                    max_tokens:  maxTokens,
-                    temperature: 0.1,
+                    model: resolvedModel,
+                    max_tokens: resolvedMaxTokens,
+                    temperature: resolvedTemperature,
                     response_format: { type: 'json_object' },
                     ...(cacheKey ? { prompt_cache_key: String(cacheKey).slice(0, 64) } : {}),
                     messages: [
-                        { role: 'system', content: system },
+                        { role: 'system', content: resolvedSystem },
                         { role: 'user',   content: user }
                     ]
                 })
@@ -723,30 +730,6 @@ async function callOpenAiJson({ model, system, user, maxTokens, attempts = 4, ca
 // ─── Step 0: Personal / Business Separation ───────────────────────────────────
 // Runs BEFORE any scoring. Nothing that is not a confirmed business chat is
 // scored, analysed, or used to build persona packs.
-const CLASSIFIER_SYSTEM_PROMPT = `You decide whether a WhatsApp chat belongs to a business's commercial pipeline. The chat happened on the business owner's WhatsApp number. Owners also use that number for their private life, so many chats are NOT customers.
-
-LABELS
-- business: the other person buys, enquires about, negotiates, pays for or receives the business's products or services; OR the business is selling, quoting or following up with them; OR they are a supplier, vendor, delivery or agency partner for the business's operations.
-- personal: family, friends, church or community groups, landlord or rent, staff or colleagues chatting internally, favours, personal errands, money asked for or lent between individuals, social chit-chat. Nothing of the business's products or services is being sold or bought.
-- junk: spam, wrong numbers, bots, system notices, OTP codes, or a chat with no usable content.
-
-RULES
-1. Judge by what is actually being exchanged, not by tone. Formal language or calling someone "sir" does not make a chat commercial.
-2. Money counts as commercial only when it is payment for the business's products or services, or a vendor cost of the business. Requests for personal money, rent, transport, or help are personal.
-3. Church, fellowship, family or friend matters are personal even when the person is prominent or the owner does volunteer work for them.
-4. Messages sent by BUSINESS show what the owner said; messages by CUSTOMER show the other person. Both together tell you the relationship.
-5. A chat with only a greeting or a very few messages is uncertain: keep confidence at 0.5 or lower.
-6. Mixed chats: choose by the dominant and most recent pattern and say so in the reason.
-7. Personal or junk is a valid answer. Do not force a chat into business.
-
-Return ONLY JSON:
-{
-  "lead_type": "business | personal | junk",
-  "confidence": number between 0 and 1,
-  "reason": "one sentence naming what is being exchanged",
-  "evidence": "a short verbatim excerpt (5-20 words) copied exactly from the chat that supports your label"
-}`;
-
 function classificationExcerpt(messages) {
     if (messages.length <= 50) return messages;
     return [...messages.slice(0, 10), ...messages.slice(-40)];
@@ -813,9 +796,10 @@ async function runClassificationPass() {
                 const excerpt = classificationExcerpt(messages);
                 const result = await callOpenAiJson({
                     model: CLASSIFY_MODEL,
-                    system: CLASSIFIER_SYSTEM_PROMPT,
+                    system: AI_PROMPT_CATALOG.lead_classifier.prompt,
                     user: `BUSINESS\n${businessContext}\n\nCHAT (CUSTOMER = the other person, BUSINESS = the account owner)\n${buildTranscript(excerpt, { maxChars: 300 })}`,
                     maxTokens: 300,
+                    promptId: 'lead_classifier',
                     cacheKey: `classify:${BUSINESS_ID || contact.business_id}`
                 });
                 llm = result.json;
@@ -979,73 +963,10 @@ async function runStructuralEnrichment() {
 }
 
 // ─── Step 3: NLP AI Extraction ────────────────────────────────────────────────
-const NLP_SYSTEM_PROMPT = `You are a sales intelligence system reading WhatsApp conversations for small businesses in Kenya and East Africa (English, Swahili and Sheng are all common). This chat has ALREADY been confirmed as a business chat: the other person is a customer, prospect or client. Do not decide whether it is personal.
-
-Report what the CUSTOMER actually said. Precision matters more than optimism: a wrong "hot" wastes the sales team's time, and a wrong "cold" loses a sale. Never infer intent that the customer's own words do not show. BUSINESS lines show what was offered or said by the owner, not what the customer wants.
-
-STRUCTURAL SIGNALS are hard facts computed from the raw data. Do not contradict them.
-
-STAGE DEFINITIONS (use exactly one):
-- Awareness: customer just arrived, hasn't stated a need yet.
-- Consideration: customer has described a need or asked general questions, no specific product picked.
-- Product interest: customer has named or clearly implied a specific product/service.
-- Negotiation: price, quantity, delivery, or terms are actively being discussed.
-- Stalled: the conversation trailed off without a next step, or days_since_last_inbound is high.
-- Closed: a sale, refusal, or explicit end was reached.
-- Ghosted: long silence from the customer after a clear buying signal, with the business having replied last.
-
-INTENT DEFINITIONS:
-- buying: the customer states they want to purchase, hire or book.
-- price_check: the customer asks for a price, rate or quote.
-- browsing: general questions about what is offered, no commitment.
-- support: an existing customer with an issue about something already bought.
-- referral: they were sent by someone else or are asking on someone's behalf.
-- unknown: the customer's messages show no commercial need.
-
-QUALITY SCORE (1-10):
-1-2 no commercial signal. 3-4 vague or passing interest. 5-6 clear interest but no specifics. 7-8 specific need with price, quantity, timeline or a next step being discussed. 9-10 ready to pay, paid, or closing now.
-
-FOLLOW_UP_URGENCY: hot = the customer is waiting for our reply and has shown buying or price interest recently. warm = a live conversation or real interest, but nothing needs answering right now. cold = no signal, closed, or long silent. (The system applies the final urgency using the structural signals; give your honest read.)
-
-RULES
-1. Intent and quality come only from CUSTOMER lines. If the customer never shows a commercial need, intent is "unknown" and quality_score is 1-3.
-2. intent_evidence: copy one verbatim excerpt (max 25 words) from a CUSTOMER line that supports your intent and quality_score. Copy it exactly, in its original language, do NOT translate or paraphrase. If intent is "unknown", set intent_evidence to null. A quality_score above 4 requires evidence.
-3. If structural_signals.days_since_last_inbound is large (>7) and there was no clear close, lean toward "Stalled" or "Ghosted" rather than inventing progress.
-4. Cross-reference product mentions against the catalog: match the exact product_id/name if found; otherwise infer the rough item name, set product_id null, and set match_status "no match".
-5. Never invent a number, date, or promise the customer didn't state.
-6. Leave a field null or empty rather than guessing.
-
-Return ONLY a valid JSON object matching this schema:
-{
-  "intent":                 "buying | browsing | support | price_check | referral | unknown",
-  "intent_evidence":        "verbatim customer excerpt or null",
-  "follow_up_urgency":      "hot | warm | cold",
-  "quality_score":          integer 1-10,
-  "lead_summary":           "one sentence what this lead wants (max 20 words)",
-  "customer_intent":        "short CRM phrase (max 8 words)",
-  "psychology":             "one sentence buyer psychology",
-  "conv_stage":             "Awareness | Consideration | Product interest | Negotiation | Stalled | Closed | Ghosted",
-  "vibe_check":             "2 sentences max: what the sales rep should know right now",
-  "next_action_plan":       "single most impactful next action (one sentence); if the customer is awaiting a reply it must be about replying",
-  "competitor_mentions":    ["string"],
-  "objection_tags":         ["price | not_ready | found_elsewhere | needs_more_info | trust_concerns | size_availability"],
-  "pre_purchase_questions": ["verbatim questions before buying (max 5)"],
-  "product_tags":           ["product categories mentioned"],
-  "matched_products":       [
-    {
-      "product_id": "Exact product ID string from catalog if matched, otherwise null",
-      "product_name": "Exact product name from catalog if matched, otherwise the rough/inferred item name",
-      "match_status": "matched | no match"
-    }
-  ],
-  "sentiment_score":        number -1.0 to 1.0,
-  "price_objection":        boolean
-}`;
-
 async function runNLPExtraction(transcript, businessContext, productsCatalog, structuralSignals, cacheKey = null) {
     const user = `BUSINESS CONTEXT:\n${businessContext}\n\nAVAILABLE BUSINESS PRODUCTS CATALOG:\n${productsCatalog || 'No products registered.'}\n\nSTRUCTURAL SIGNALS (ground truth):\n${JSON.stringify(structuralSignals, null, 2)}\n\nCONVERSATION:\n${transcript}`;
     try {
-        const result = await callOpenAiJson({ model: OPENAI_MODEL, system: NLP_SYSTEM_PROMPT, user, maxTokens: 1100, cacheKey });
+        const result = await callOpenAiJson({ model: OPENAI_MODEL, system: AI_PROMPT_CATALOG.lead_nlp_extractor.prompt, user, maxTokens: 1100, promptId: 'lead_nlp_extractor', cacheKey });
         return { nlp: result.json, promptTokens: result.promptTokens, completionTokens: result.completionTokens };
     } catch (e) {
         throw new Error(`NLP extraction failed: ${e.message}`);

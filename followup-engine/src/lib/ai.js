@@ -129,7 +129,7 @@ export async function callBot(supabase, botId, userContent, fallbackPrompt, opti
     userContent,
     model: config?.model ?? options.model ?? OPENAI_MODEL,
     temperature: config?.temperature ?? options.temperature ?? 0.7,
-    maxTokens: options.maxTokens ?? config?.max_tokens ?? 500,
+    maxTokens: config?.max_tokens ?? options.maxTokens ?? 500,
     json: options.json,
     purpose: options.purpose ?? botId,
     businessId: options.businessId ?? null,

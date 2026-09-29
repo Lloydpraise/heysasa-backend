@@ -13,6 +13,8 @@ import {
     setOpenAIUnavailable,
     shouldPauseOpenAIRequest,
 } from './src/services/openAiGate.js';
+import { AI_PROMPT_CATALOG } from './src/aiPromptCatalog.js';
+import { getAiPromptConfig } from './src/services/aiPromptConfig.js';
 
 dotenv.config();
 
@@ -219,7 +221,13 @@ async function logAiUsage(promptTokens, completionTokens, purpose) {
 // generalized so every section-builder below can reuse it.
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-async function callOpenAI(systemPrompt, userPrompt, { json = true, maxTokens = 900, temperature = 0.2, purpose = 'unspecified', attempts = 4 } = {}) {
+async function callOpenAI(systemPrompt, userPrompt, { json = true, maxTokens = 900, temperature = 0.2, purpose = 'unspecified', businessName = BUSINESS_ID, attempts = 4 } = {}) {
+    const promptConfig = AI_PROMPT_CATALOG[purpose]
+        ? await getAiPromptConfig(supabase, purpose, { business_name: businessName })
+        : null;
+    systemPrompt = promptConfig?.prompt ?? systemPrompt;
+    maxTokens = promptConfig?.max_tokens ?? maxTokens;
+    temperature = promptConfig?.temperature ?? temperature;
     if (shouldPauseOpenAIRequest()) {
         const state = getOpenAIAvailabilityState();
         throw new FatalRunError(state.message || 'OpenAI Unavailable');
@@ -242,7 +250,7 @@ async function callOpenAI(systemPrompt, userPrompt, { json = true, maxTokens = 9
                 headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${OPENAI_KEY}` },
                 signal:  controller.signal,
                 body: JSON.stringify({
-                    model: OPENAI_MODEL,
+                    model: promptConfig?.model ?? OPENAI_MODEL,
                     max_tokens: maxTokens,
                     temperature,
                     ...(json ? { response_format: { type: 'json_object' } } : {}),
@@ -582,7 +590,7 @@ function explainShortfall(funnel) {
 }
 
 // ─── Step 2: voice/tone — map-reduce over the sampled messages ─────────────────
-async function extractVoiceBatch(batch) {
+async function extractVoiceBatch(batch, businessName) {
     const transcript = batch.map(m => messageText(m)).filter(Boolean).join('\n---\n');
     const systemPrompt = `You are analyzing real WhatsApp messages written by a business owner/staff member to customers in Kenya. Extract observable STYLE signals only — do not summarize content or invent anything not visibly present.
 
@@ -599,7 +607,7 @@ Return ONLY valid JSON:
 "language_counts" should count messages by dominant language, roughly — a rough tally is fine, this gets aggregated across many batches.`;
 
     return callOpenAI(systemPrompt, `MESSAGES (one per line, separated by ---):\n${transcript}`, {
-        maxTokens: 700, temperature: 0.1, purpose: 'voice_batch_extract'
+        maxTokens: 700, temperature: 0.1, purpose: 'voice_batch_extract', businessName
     });
 }
 
@@ -649,7 +657,7 @@ language_mix is NOT part of your output — it's computed separately and will be
         `COMPUTED LANGUAGE MIX (for your reference, don't repeat it): ${JSON.stringify(language_mix)}`
     ].join('\n\n');
 
-    const persona = await callOpenAI(systemPrompt, userPrompt, { maxTokens: 900, temperature: 0.4, purpose: 'voice_reduce' });
+    const persona = await callOpenAI(systemPrompt, userPrompt, { maxTokens: 900, temperature: 0.4, purpose: 'voice_reduce', businessName });
 
     // Grounding: every phrase, greeting and closing must really occur in the
     // owner's own messages. Anything the model invented or reworded is dropped
@@ -682,7 +690,7 @@ async function buildPersonaSection(sampledMessages, businessName, corpus) {
     let failedBatches = 0;
     for (const batch of batches) {
         try {
-            batchResults.push(await extractVoiceBatch(batch));
+            batchResults.push(await extractVoiceBatch(batch, businessName));
         } catch (e) {
             if (e instanceof FatalRunError) throw e;
             failedBatches++;
@@ -736,7 +744,7 @@ Return ONLY valid JSON:
         `SAMPLE OF REAL OUTBOUND MESSAGES (for recurring language only):\n${phraseSample.slice(0, 6000)}`
     ].filter(Boolean).join('\n\n');
 
-    const context = await callOpenAI(systemPrompt, userPrompt, { maxTokens: 700, temperature: 0.2, purpose: 'business_context' });
+    const context = await callOpenAI(systemPrompt, userPrompt, { maxTokens: 700, temperature: 0.2, purpose: 'business_context', businessName: business.name });
 
     // Payment methods are only allowed if they appear in real messages, the catalog or the owner's own notes.
     const groundingText = corpus + squash([productsCatalog, business.business_sops_and_kb, business.sales_persona].filter(Boolean).join(' '));
@@ -823,7 +831,7 @@ Return ONLY valid JSON: {"objection_playbook": [
 ]}`;
 
     const userPrompt = `TAGGED CONVERSATION EXAMPLES:\n${JSON.stringify(examples, null, 2).slice(0, 12000)}`;
-    const result = await callOpenAI(systemPrompt, userPrompt, { maxTokens: 1400, temperature: 0.3, purpose: 'objection_playbook' });
+    const result = await callOpenAI(systemPrompt, userPrompt, { maxTokens: 1400, temperature: 0.3, purpose: 'objection_playbook', businessName: business.name });
     return result.objection_playbook || [];
 }
 
@@ -861,7 +869,7 @@ Return ONLY valid JSON: {"customer_profiles": [
 ]}`;
 
     const userPrompt = `PER-CONVERSATION SIGNALS:\n${JSON.stringify(signals, null, 2).slice(0, 10000)}`;
-    const result = await callOpenAI(systemPrompt, userPrompt, { maxTokens: 1200, temperature: 0.3, purpose: 'customer_profiles' });
+    const result = await callOpenAI(systemPrompt, userPrompt, { maxTokens: 1200, temperature: 0.3, purpose: 'customer_profiles', businessName: business.name });
     return result.customer_profiles || [];
 }
 
@@ -880,7 +888,7 @@ Return ONLY valid JSON with exactly these 8 keys, each a short instruction (1-2 
         `OBJECTION PLAYBOOK (for consistency):\n${JSON.stringify(objectionPlaybook).slice(0, 3000)}`
     ].join('\n\n');
 
-    return callOpenAI(systemPrompt, userPrompt, { maxTokens: 700, temperature: 0.3, purpose: 'sentiment_map' });
+    return callOpenAI(systemPrompt, userPrompt, { maxTokens: 700, temperature: 0.3, purpose: 'sentiment_map', businessName: business.name });
 }
 
 // ─── Step 7: closing_triggers + human_handoff_triggers ─────────────────────────
@@ -938,7 +946,7 @@ Return ONLY valid JSON: {"closing_triggers": ["short signal phrases, max 8"], "h
         negativeTranscripts.length ? `NEGATIVE-SENTIMENT CONVERSATION EXAMPLES:\n${negativeTranscripts.join('\n===\n').slice(0, 6000)}` : 'No negative-sentiment examples available — use general best practice.'
     ].join('\n\n');
 
-    return callOpenAI(systemPrompt, userPrompt, { maxTokens: 700, temperature: 0.3, purpose: 'closing_handoff' });
+    return callOpenAI(systemPrompt, userPrompt, { maxTokens: 700, temperature: 0.3, purpose: 'closing_handoff', businessName: business.name });
 }
 
 // ─── Normalize — guarantee the exact shape PersonaPackEditor.jsx expects ───────
