@@ -1,7 +1,8 @@
 import { supabase } from '../supabaseClient.js'
 import { getBusiness, getContact } from '../lib/db.js'
 import { sendContentViaEvolution } from './evolutionSender.js'
-import { checkAntiban, recordSend } from './antiban.js'
+import { checkAntiban, recordSend, primeAntiban } from './antiban.js'
+import { effectiveDailyCap, sentTodayCount, noteSent, logWarmupHold } from '../lib/warmup.js'
 import { recordSuccessfulSend, recordFailedDispatch } from './postSend.js'
 import { log } from '../lib/log.js'
 
@@ -117,8 +118,17 @@ export async function processBaileysBatch() {
 
       // Antiban gate — if not allowed yet, leave it ready_to_send and try
       // again next poll cycle. Don't count this as a failed attempt.
+      await primeAntiban(supabase, item.business_id)
       const gate = checkAntiban(item.business_id, business.followup_daily_cap)
       if (!gate.allowed) continue
+
+      // Slow start for new numbers: only during a business's first week is the
+      // daily total held lower. After that this check does nothing.
+      const warm = await effectiveDailyCap(supabase, item.business_id, business.followup_daily_cap)
+      if (warm.warmupActive && (await sentTodayCount(supabase, item.business_id)) >= warm.cap) {
+        logWarmupHold(item.business_id, warm.day, warm.cap)
+        continue
+      }
 
       const { data: claimedItem, error: claimError } = await supabase
         .from('follow_up_queue')
@@ -161,6 +171,7 @@ export async function processBaileysBatch() {
       }
 
       recordSend(item.business_id)
+      noteSent(item.business_id)
       await recordSuccessfulSend(supabase, {
         item,
         contact,

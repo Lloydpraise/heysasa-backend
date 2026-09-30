@@ -11,6 +11,7 @@ import { getCustomerProfile, getAutoCampaignContext } from '../lib/campaignConte
 import { normalizeOutboundMedia } from '../lib/media.js'
 import { resolveMediaMergeFields, resolveMergeFields } from '../lib/mergeFields.js'
 import { log } from '../lib/log.js'
+import { effectiveDailyCap } from '../lib/warmup.js'
 
 const STALL_RETRY_MS = 5 * 60_000
 // When the AI call itself failed (rate limit, outage, out of credits) the
@@ -148,7 +149,7 @@ export async function runWorker(supabase, queueItemId) {
   }
 
   // ── 5. Daily cap check ───────────────────────────────────────
-  const dailyCap = business.followup_daily_cap ?? DEFAULT_DAILY_CAP
+  const dailyCap = (await effectiveDailyCap(supabase, item.business_id, business.followup_daily_cap ?? DEFAULT_DAILY_CAP)).cap
   const dailyCount = await getDailyCount(supabase, item.business_id)
   if (dailyCount >= dailyCap) return stallItem('daily_cap_reached')
 

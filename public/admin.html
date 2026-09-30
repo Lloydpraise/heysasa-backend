@@ -61,6 +61,7 @@
     <button data-t="prompts">AI prompts</button>
     <button data-t="preview">Preview on a lead</button>
     <button data-t="ops">Overview &amp; ops</button>
+    <button data-t="waitlist">Waitlist</button>
   </nav>
   <span style="flex:1"></span>
   <a class="hint" href="/debug.html">Debug console</a>
@@ -170,6 +171,15 @@
       <div id="o-out" class="hint" style="margin-top:8px"></div>
     </div>
   </section>
+  <!-- WAITLIST -->
+  <section id="tab-waitlist" class="hidden">
+    <div class="card">
+      <div class="row"><strong>Waitlist</strong><button class="btn" id="w-refresh" style="flex:0">Refresh</button></div>
+      <div id="w-summary" class="hint" style="margin:8px 0"></div>
+      <div style="overflow-x:auto"><div id="w-table">Loading…</div></div>
+      <p class="hint">Moving someone to conversation, demo done, trial, paid, lost or opted out stops their follow-up messages.</p>
+    </div>
+  </section>
 </main>
 </div>
 
@@ -211,8 +221,8 @@ $('signout').onclick = signOut;
 $('nav').onclick = (e) => {
   const t = e.target.dataset.t; if (!t) return;
   document.querySelectorAll('#nav button').forEach((b) => b.classList.toggle('on', b === e.target));
-  ['defaults', 'prompts', 'preview', 'ops'].forEach((n) => $('tab-' + n).classList.toggle('hidden', n !== t));
-  if (t === 'prompts') guard(loadBots)(); if (t === 'ops') guard(loadOps)();
+  ['defaults', 'prompts', 'preview', 'ops', 'waitlist'].forEach((n) => $('tab-' + n).classList.toggle('hidden', n !== t));
+  if (t === 'prompts') guard(loadBots)(); if (t === 'ops') guard(loadOps)(); if (t === 'waitlist') guard(loadWaitlist)();
 };
 
 let meta = { businesses: [], industries: [], businessTypes: [], ruleIds: [] };
@@ -379,6 +389,32 @@ async function loadOps() {
 $('o-refresh').onclick = guard(loadOps);
 $('o-profiles').onclick = guard(async () => { const r = await api('/run/sync-customer-profiles', { method: 'POST' }); $('o-out').textContent = JSON.stringify(r.result); });
 $('o-lists').onclick = guard(async () => { const r = await api('/run/sync-auto-lists', { method: 'POST' }); $('o-out').textContent = r.result; });
+
+
+// ── waitlist ─────────────────────────────────────────────────
+const W_STATUSES = ['new','welcomed','nurturing','conversation','demo_done','trial','paid','lost','opted_out'];
+async function loadWaitlist() {
+  const { leads, summary, totalSteps } = await api('/waitlist');
+  const days = Object.entries(summary.byDay).sort().slice(-7).map(([d, n]) => `${d.slice(5)}: ${n}`).join(' · ');
+  $('w-summary').innerHTML = `<b>${summary.total}</b> signed up · ` +
+    Object.entries(summary.byStatus).map(([k, v]) => `${esc(k)} ${v}`).join(' · ') +
+    `<br>Sources: ${Object.entries(summary.bySource).map(([k, v]) => `${esc(k)} ${v}`).join(' · ') || '—'}<br>Last 7 days: ${days || '—'}`;
+  $('w-table').innerHTML = leads.length ? `<table><tr><th>Joined</th><th>Name</th><th>Business</th><th>Phone</th><th>Source</th><th>Messages sent</th><th>Status</th><th>Notes</th></tr>` +
+    leads.map((l) => `<tr data-id="${l.id}">
+      <td>${esc(new Date(l.created_at).toLocaleDateString('en-GB', { day: '2-digit', month: 'short' }))}</td>
+      <td>${esc(l.name)}</td><td>${esc(l.business_name)}<br><span class="hint">${esc(l.industry)}</span></td><td>${esc(l.phone)}</td>
+      <td>${esc(l.utm_source || 'direct')}</td>
+      <td>${l.step == null ? '—' : `${l.step}${totalSteps ? ' of ' + totalSteps : ''}`}<br><span class="hint">${esc(l.drip)}</span></td>
+      <td><select class="w-status">${W_STATUSES.map((s) => `<option ${s === l.status ? 'selected' : ''}>${s}</option>`).join('')}</select></td>
+      <td><input class="w-notes" value="${esc(l.notes || '')}" placeholder="add a note"></td></tr>`).join('') + '</table>'
+    : '<span class="hint">Nobody yet.</span>';
+  $('w-table').querySelectorAll('tr[data-id]').forEach((tr) => {
+    const id = tr.dataset.id;
+    tr.querySelector('.w-status').onchange = guard(async (e) => { const r = await api('/waitlist/' + id, { method: 'POST', body: { status: e.target.value } }); flash(r.stopped ? 'Saved. Their follow-ups are stopped.' : 'Saved.'); });
+    tr.querySelector('.w-notes').onchange = guard(async (e) => { await api('/waitlist/' + id, { method: 'POST', body: { notes: e.target.value } }); flash('Note saved.'); });
+  });
+}
+$('w-refresh').onclick = guard(loadWaitlist);
 
 // ── boot ─────────────────────────────────────────────────────
 async function boot() {

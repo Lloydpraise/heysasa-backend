@@ -2,6 +2,12 @@ import { supabase } from '../config/supabase.js';
 import { normalizeKenyanPhone } from '../utils/phone.js';
 import { logEvent } from './debugConsole.js';
 
+// The HeySasa business itself (business_type 'heysasa'). Waitlist people become
+// contacts of this business so the normal auto-list + auto-campaign machinery
+// can message them, and their replies land like any other business's.
+const HEYSASA_BUSINESS_ID = process.env.HEYSASA_BUSINESS_ID || 'heysasa';
+const WAITLIST_RULE_ID = 'waitinglist';
+
 const INDUSTRIES = new Set([
     'beauty_wellness', 'retail_ecommerce', 'restaurant_food', 'fashion_apparel',
     'real_estate', 'education', 'health_medical', 'professional_services',
@@ -62,6 +68,8 @@ export async function createWaitlistSignup(body, ip) {
     if (!INDUSTRIES.has(industry)) return { ok: false, status: 400, error: 'industry_invalid' };
     if (!phone) return { ok: false, status: 400, error: 'phone_invalid' };
     if (!isPlausibleWebsite(website)) return { ok: false, status: 400, error: 'website_invalid' };
+    // Nobody gets messaged on WhatsApp unless they ticked the box, and we keep the record.
+    if (body.consent_whatsapp !== true) return { ok: false, status: 400, error: 'consent_required' };
 
     // Dedupe on phone — someone re-submitting (double-tap, or joining
     // twice out of eagerness) gets their existing spot back, not a
@@ -91,6 +99,7 @@ export async function createWaitlistSignup(body, ip) {
         .insert({
             name, business_name: businessName, industry, phone, website,
             ref_code: refCode, referred_by: referredBy,
+            consent_whatsapp: true, consent_at: new Date().toISOString(),
             utm_source: body.utm_source || null, utm_medium: body.utm_medium || null,
             utm_campaign: body.utm_campaign || null, fbclid: body.fbclid || null,
         })
@@ -107,6 +116,13 @@ export async function createWaitlistSignup(body, ip) {
         }
         logEvent({ level: 'error', area: 'waitlist', event: 'waitlist.insert_failed', message: insertError.message, details: { businessName, industry } });
         return { ok: false, status: 500, error: 'insert_failed' };
+    }
+
+    // Best effort: never fail a signup because the welcome plumbing had a problem.
+    try {
+        await attachContactAndEnroll(inserted.id, { name, phone });
+    } catch (error) {
+        logEvent({ level: 'error', area: 'waitlist', event: 'waitlist.enroll_failed', message: error.message, details: { leadId: inserted.id } });
     }
 
     const position = await getPositionForCreatedAt(inserted.created_at);
@@ -126,4 +142,44 @@ async function getPositionForCreatedAt(createdAt) {
 export async function getWaitlistCount() {
     const { count } = await supabase.from('waitlist_leads').select('id', { count: 'exact', head: true });
     return count || 0;
+}
+
+// Creates (or finds) the person as a contact of the HeySasa business, links it to
+// the waitlist row, then does the same enrolment the 10-minute list sweep and the
+// 5-minute campaign seeder would do, so the welcome goes out within about a minute
+// instead of up to 15. If the list or campaign is not switched on yet, it simply
+// stops here and the sweep picks the person up later. Each person starts at message 1.
+async function attachContactAndEnroll(leadId, { name, phone }) {
+    const plusPhone = `+${phone}`;
+    let { data: contact, error: findError } = await supabase
+        .from('contacts').select('id')
+        .eq('business_id', HEYSASA_BUSINESS_ID).in('phone', [phone, plusPhone]).limit(1).maybeSingle();
+    if (findError) throw new Error(`contact lookup failed: ${findError.message}`);
+
+    if (!contact) {
+        const { data: created, error: createError } = await supabase
+            .from('contacts')
+            .insert({ business_id: HEYSASA_BUSINESS_ID, name, phone: plusPhone, country_code: '254', lead_state: 'new' })
+            .select('id').single();
+        if (createError) throw new Error(`contact create failed: ${createError.message}`);
+        contact = created;
+    }
+
+    const { error: linkError } = await supabase.from('waitlist_leads').update({ contact_id: contact.id }).eq('id', leadId);
+    if (linkError) throw new Error(`waitlist link failed: ${linkError.message}`);
+
+    const { data: list } = await supabase.from('lists').select('id')
+        .eq('business_id', HEYSASA_BUSINESS_ID).eq('rule_id', WAITLIST_RULE_ID).eq('type', 'auto').eq('archived', false).maybeSingle();
+    if (!list) return;
+
+    const member = await supabase.from('list_members').insert({ list_id: list.id, lead_id: contact.id });
+    if (member.error && member.error.code !== '23505') throw new Error(`list member failed: ${member.error.message}`);
+
+    const { data: campaign } = await supabase.from('campaigns').select('id')
+        .eq('business_id', HEYSASA_BUSINESS_ID).eq('list_id', list.id).eq('kind', 'auto').eq('status', 'active').maybeSingle();
+    if (!campaign) return;
+
+    const enrol = await supabase.from('campaign_enrollments')
+        .insert({ campaign_id: campaign.id, lead_id: contact.id, status: 'pending', current_step: 0, next_send_at: null });
+    if (enrol.error && enrol.error.code !== '23505' && enrol.error.code !== 'P0001') throw new Error(`enrol failed: ${enrol.error.message}`);
 }

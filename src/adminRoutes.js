@@ -255,6 +255,75 @@ export function createAdminRouter({ getFollowupPort, isFollowupRunning }) {
         return { campaigns: campaigns.map((c) => ({ ...c, business_name: names[c.business_id] ?? c.business_id, enrollments: counts[c.id] ?? {} })) };
     }));
 
+    // ── Waitlist ─────────────────────────────────────────────────────────
+    const WAITLIST_STATUSES = ['new', 'welcomed', 'nurturing', 'conversation', 'demo_done', 'trial', 'paid', 'lost', 'opted_out'];
+    // These stop the follow-up messages for that person.
+    const WAITLIST_STOP_STATUSES = ['conversation', 'demo_done', 'trial', 'paid', 'lost', 'opted_out'];
+    const HEYSASA_ID = process.env.HEYSASA_BUSINESS_ID || 'heysasa';
+
+    async function waitlistCampaignIds() {
+        const rows = must(await supabase.from('campaigns').select('id').eq('business_id', HEYSASA_ID).eq('rule_id', 'waitinglist').eq('kind', 'auto'));
+        return rows.map((r) => r.id);
+    }
+
+    router.get('/admin/api/waitlist', wrap(async () => {
+        const leads = must(await supabase.from('waitlist_leads')
+            .select('id, created_at, name, business_name, industry, phone, utm_source, utm_campaign, status, notes, consent_whatsapp, contact_id')
+            .order('created_at', { ascending: false }).limit(1000));
+        const campaignIds = await waitlistCampaignIds();
+        const contactIds = leads.map((l) => l.contact_id).filter(Boolean);
+        const byContact = {};
+        let totalSteps = null;
+        if (campaignIds.length && contactIds.length) {
+            const enrol = must(await supabase.from('campaign_enrollments')
+                .select('lead_id, status, current_step').in('campaign_id', campaignIds).in('lead_id', contactIds));
+            for (const e of enrol) byContact[e.lead_id] = e;
+            const steps = must(await supabase.from('campaign_steps').select('step_number').in('campaign_id', campaignIds));
+            totalSteps = steps.length ? Math.max(...steps.map((s) => s.step_number)) : null;
+        }
+        const count = (keyFn) => leads.reduce((acc, l) => { const k = keyFn(l); acc[k] = (acc[k] ?? 0) + 1; return acc; }, {});
+        const nairobiDay = (iso) => new Date(iso).toLocaleDateString('en-CA', { timeZone: 'Africa/Nairobi' });
+        return {
+            totalSteps,
+            summary: {
+                total: leads.length,
+                byStatus: count((l) => l.status),
+                bySource: count((l) => l.utm_source || 'direct'),
+                byDay: count((l) => nairobiDay(l.created_at)),
+            },
+            leads: leads.map((l) => ({
+                ...l,
+                step: byContact[l.contact_id]?.current_step ?? null,
+                drip: byContact[l.contact_id]?.status ?? (l.contact_id ? 'not_enrolled' : 'no_contact'),
+            })),
+        };
+    }));
+
+    router.post('/admin/api/waitlist/:id', wrap(async (req) => {
+        const patch = {};
+        if (req.body?.status !== undefined) {
+            if (!WAITLIST_STATUSES.includes(req.body.status)) throw httpError(400, 'invalid_status');
+            patch.status = req.body.status;
+        }
+        if (req.body?.notes !== undefined) patch.notes = String(req.body.notes).slice(0, 2000);
+        if (!Object.keys(patch).length) throw httpError(400, 'nothing_to_update');
+
+        const lead = must(await supabase.from('waitlist_leads').update(patch).eq('id', req.params.id).select('id, contact_id, status').single());
+
+        // Moving someone to a "we are talking now / done" status stops their follow-up messages.
+        let stopped = 0;
+        if (patch.status && WAITLIST_STOP_STATUSES.includes(patch.status) && lead.contact_id) {
+            const campaignIds = await waitlistCampaignIds();
+            if (campaignIds.length) {
+                const rows = must(await supabase.from('campaign_enrollments').update({ status: 'exited' })
+                    .in('campaign_id', campaignIds).eq('lead_id', lead.contact_id).in('status', ['pending', 'active']).select('id'));
+                stopped = rows.length;
+            }
+        }
+        logEvent({ level: 'info', area: 'waitlist', event: 'waitlist.updated', message: `Waitlist ${req.params.id} -> ${patch.status ?? 'notes'}`, details: { stopped } });
+        return { stopped };
+    }));
+
     router.post('/admin/api/run/sync-customer-profiles', wrap(async () => ({ result: must(await supabase.rpc('sync_customer_profiles')) })));
     router.post('/admin/api/run/sync-auto-lists', wrap(async () => {
         must(await supabase.rpc('sync_auto_lists'));

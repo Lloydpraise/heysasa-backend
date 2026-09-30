@@ -1,13 +1,29 @@
 import { DEFAULT_MIN_CHARGE, DEFAULT_MAX_CHARGE } from '../config.js'
 import { getBillingConfig, getStageWeight } from './db.js'
 
+// HeySasa's own business (business_type = 'heysasa') sends the waitlist
+// messages. It must never be charged, never be blocked for "no balance", and
+// above all must never have its follow-ups switched off by flagInsufficientFunds.
+// Cached for a minute so this costs one lookup per business per minute.
+const freeCache = new Map()
+async function isFreeBusiness(s, businessId) {
+  const hit = freeCache.get(businessId)
+  if (hit && Date.now() - hit.at < 60_000) return hit.free
+  const { data } = await s.from('businesses').select('business_type').eq('business_id', businessId).maybeSingle()
+  const free = data?.business_type === 'heysasa'
+  freeCache.set(businessId, { free, at: Date.now() })
+  return free
+}
+
 export async function checkBalance(s, businessId, required) {
+  if (await isFreeBusiness(s, businessId)) return true
   const { data } = await s.from('business_balances')
     .select('balance_usd').eq('business_id', businessId).single()
   return !!data && data.balance_usd >= required
 }
 
 export async function deductBalance(s, businessId, amount, reason) {
+  if (await isFreeBusiness(s, businessId)) return
   const { data } = await s.from('business_balances')
     .select('balance_usd').eq('business_id', businessId).single()
   if (!data) return
@@ -25,10 +41,12 @@ export async function deductBalance(s, businessId, amount, reason) {
 }
 
 export async function flagInsufficientFunds(s, businessId) {
+  if (await isFreeBusiness(s, businessId)) return
   await s.from('businesses').update({ followup_ai_enabled: false }).eq('business_id', businessId)
 }
 
 export async function chargeLeadStageChange(s, businessId, contactId, fromStage, toStage, businessType) {
+  if (await isFreeBusiness(s, businessId)) return
   const [minCharge, maxCharge] = await Promise.all([
     getBillingConfig(s, 'min_charge_usd', DEFAULT_MIN_CHARGE),
     getBillingConfig(s, 'max_charge_usd', DEFAULT_MAX_CHARGE)

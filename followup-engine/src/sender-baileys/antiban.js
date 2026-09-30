@@ -5,11 +5,36 @@ import {
   ANTIBAN_WINDOW_MS,
 } from '../config.js'
 
-// Per-business in-memory state. Lives only as long as this process —
-// on restart it resets, which is fine: worst case is one instance
-// sends slightly sooner than ideal right after a deploy, not a burst.
+// Per-business in-memory state. It used to start empty after every deploy,
+// which let a number send a second full hour's worth right after a restart.
+// primeAntiban() below reloads the last hour of sends from the database the
+// first time a business is seen, so a restart no longer resets the count.
 const lastSentAt = new Map()          // business_id -> timestamp (ms)
 const sentTimestamps = new Map()      // business_id -> [timestamp, ...] within the last hour
+
+const primed = new Set()
+
+// Reads this business's sends from the last hour (and the time of the very last one)
+// back into memory. Runs once per business per process start; if the read fails it
+// tries again on the next poll instead of sending unprimed.
+export async function primeAntiban(supabase, businessId) {
+  if (primed.has(businessId)) return
+  primed.add(businessId)
+  const since = new Date(Date.now() - ANTIBAN_WINDOW_MS).toISOString()
+  const { data, error } = await supabase
+    .from('follow_up_queue')
+    .select('processed_at')
+    .eq('business_id', businessId)
+    .eq('status', 'sent')
+    .gte('processed_at', since)
+    .order('processed_at', { ascending: true })
+    .limit(200)
+  if (error) { primed.delete(businessId); return }
+  const fromDb = (data ?? []).map(r => new Date(r.processed_at).getTime()).filter(Number.isFinite)
+  const merged = [...new Set([...(sentTimestamps.get(businessId) ?? []), ...fromDb])].sort((a, b) => a - b)
+  sentTimestamps.set(businessId, merged)
+  if (merged.length) lastSentAt.set(businessId, Math.max(lastSentAt.get(businessId) ?? 0, merged[merged.length - 1]))
+}
 
 function pruneOldTimestamps(businessId) {
   const cutoff = Date.now() - ANTIBAN_WINDOW_MS

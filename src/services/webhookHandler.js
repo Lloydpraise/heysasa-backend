@@ -21,6 +21,7 @@ import {
 } from './dbService.js';
 import { debugLog } from './debugConsole.js';
 import { deleteSessionRecord } from './evolutionConnections.js';
+import { scheduleDisconnectNotice } from './disconnectNotice.js';
 
 export async function resolveBusinessId(payload) {
     const instanceName = payload?.instance || payload?.data?.instance;
@@ -51,8 +52,12 @@ export async function processConnectionUpdate(payload, businessId) {
     const instanceName = payload?.instance || data.instance;
     if (isDisconnected) {
         if (!instanceName) throw new Error('evolution_instance_missing');
+        // Only a number that was actually connected counts as "dropped" (not a QR that timed out).
+        const { data: wasConnected } = await supabase.from('whatsapp_sessions').select('id')
+            .eq('instance_name', instanceName).eq('status', 'connected').limit(1);
         await deleteSessionRecord(instanceName, businessId);
         console.log(`[Webhook] Removed inactive WhatsApp session ${instanceName}`);
+        if (wasConnected?.length) scheduleDisconnectNotice({ businessId, instanceName });
         return;
     }
     const sessionStatus = isConnected ? 'connected' : 'pending';
