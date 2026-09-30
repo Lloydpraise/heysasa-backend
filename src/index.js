@@ -45,8 +45,11 @@ app.use(cors({
     origin: (origin, callback) => {
         callback(null, isAllowedOrigin(origin, configuredOrigins));
     },
-    methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'apikey'],
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    // X-Business-Id is sent by the analyser and persona buttons. Without it here the browser's
+    // pre-flight check failed and the call never reached the server (the follow-up API on
+    // port 3001 already allowed it, which is why only these buttons broke).
+    allowedHeaders: ['Content-Type', 'Authorization', 'apikey', 'X-Business-Id'],
 }));
 app.use(express.json({ limit: '50mb' }));
 // CHANGED: 'public' was a path relative to whatever directory the process
@@ -450,6 +453,24 @@ app.post('/debug/evolution/resync/:instanceName', requireDebugToken, async (req,
     }
 });
 
+// Which business is this signed-in user talking about? Uses the one they asked for
+// (body, X-Business-Id header or query) and checks they own it. If they did not ask
+// for one, it only guesses when they own exactly one.
+async function resolveOwnedBusiness(req, email) {
+    const requested = [req.body?.businessId, req.headers['x-business-id'], req.query?.businessId]
+        .find((value) => typeof value === 'string' && value.trim());
+    if (requested) {
+        const { data, error } = await supabase.from('businesses').select('business_id')
+            .eq('business_id', requested.trim()).eq('owner_email', email).maybeSingle();
+        if (error || !data) return { error: 'business_not_owned', status: 403 };
+        return { business: data };
+    }
+    const { data, error } = await supabase.from('businesses').select('business_id').eq('owner_email', email).limit(2);
+    if (error || !data?.length) return { error: 'no_business_for_user', status: 403 };
+    if (data.length > 1) return { error: 'business_id_required', status: 400 };
+    return { business: data[0] };
+}
+
 async function startAnalysis(req, res) {
     const authHeader = req.headers.authorization || '';
     const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : null;
@@ -467,16 +488,12 @@ async function startAnalysis(req, res) {
             return;
         }
 
-        const { data: businessData, error: businessError } = await supabase
-            .from('businesses')
-            .select('business_id')
-            .eq('owner_email', userData.user.email)
-            .single();
-        if (businessError || !businessData) {
-            res.status(403).json({ ok: false, error: 'no_business_for_user' });
+        const resolved = await resolveOwnedBusiness(req, userData.user.email);
+        if (resolved.error) {
+            res.status(resolved.status).json({ ok: false, error: resolved.error });
             return;
         }
-        ownedBusiness = businessData;
+        ownedBusiness = resolved.business;
     }
 
     if (analysisProcess) {
@@ -594,14 +611,9 @@ app.get('/analysis/status', async (req, res, next) => {
             return res.status(401).json({ ok: false, error: 'invalid_auth_token' });
         }
 
-        const { data: ownedBusiness, error: businessError } = await supabase
-            .from('businesses')
-            .select('business_id')
-            .eq('owner_email', userData.user.email)
-            .single();
-        if (businessError || !ownedBusiness) {
-            return res.status(403).json({ ok: false, error: 'no_business_for_user' });
-        }
+        const resolved = await resolveOwnedBusiness(req, userData.user.email);
+        if (resolved.error) return res.status(resolved.status).json({ ok: false, error: resolved.error });
+        const ownedBusiness = resolved.business;
 
         // Business-level: only ever this owner's business, never another's run.
         const status = await analysisStatusFor(ownedBusiness.business_id);

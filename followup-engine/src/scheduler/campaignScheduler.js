@@ -102,7 +102,7 @@ async function seedCampaignEnrollments(supabase) {
     if (!leadIds.length) continue
 
     const [{ data: contacts, error: contactsError }, { data: existingOpen, error: existingError }, { data: existingHere, error: hereError }] = await Promise.all([
-      supabase.from('contacts').select('id, business_id, do_not_contact').in('id', leadIds),
+      supabase.from('contacts').select('id, business_id, do_not_contact, wa_exists').in('id', leadIds),
       supabase.from('campaign_enrollments').select('lead_id, campaign_id')
         .in('lead_id', leadIds).in('status', ['pending', 'active', 'awaiting_opt_in']),
       // Any status, this campaign only: a completed/exited enrollment still
@@ -129,7 +129,7 @@ async function seedCampaignEnrollments(supabase) {
     const rows = []
     for (const leadId of leadIds) {
       const contact = contactsById.get(leadId)
-      if (!contact || contact.business_id !== campaign.business_id || contact.do_not_contact || existingByLead.has(leadId)) continue
+      if (!contact || contact.business_id !== campaign.business_id || contact.do_not_contact || contact.wa_exists === false || existingByLead.has(leadId)) continue
       rows.push({
         campaign_id: campaign.id,
         lead_id: leadId,
@@ -298,6 +298,12 @@ export async function runCampaignScheduler(supabase) {
         log('warn', 'engine', 'campaign_scheduler.contact_not_found', `Skipped enrollment ${enrollment.id}: contact ${enrollment.lead_id} not found`, {
           entity_id: enrollment.id, details: { leadId: enrollment.lead_id }
         })
+        continue
+      }
+
+      // Known not to be on WhatsApp: nothing will ever go, so close their spot instead of leaving it stuck.
+      if (contact.wa_exists === false) {
+        await supabase.from('campaign_enrollments').update({ status: 'exited' }).eq('id', enrollment.id)
         continue
       }
 

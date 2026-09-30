@@ -4,6 +4,7 @@ import { sendContentViaEvolution } from './evolutionSender.js'
 import { checkAntiban, recordSend, primeAntiban } from './antiban.js'
 import { effectiveDailyCap, sentTodayCount, noteSent, logWarmupHold } from '../lib/warmup.js'
 import { recordSuccessfulSend, recordFailedDispatch } from './postSend.js'
+import { ensureNumberOnWhatsApp } from '../lib/numberCheck.js'
 import { log } from '../lib/log.js'
 
 const BATCH_SIZE = 25
@@ -130,6 +131,24 @@ export async function processBaileysBatch() {
         continue
       }
 
+      // Check the number is on WhatsApp before we ever try to message it. A number that is not
+      // on WhatsApp is skipped (not failed, not retried) and its campaign spot is closed.
+      const numberCheck = await ensureNumberOnWhatsApp(supabase, {
+        instanceName: activeSession.instance_name, contact, businessId: item.business_id
+      })
+      if (numberCheck.status === 'wait') continue
+      if (numberCheck.status === 'not_on_whatsapp') {
+        await supabase.from('follow_up_queue').update({
+          status: 'skipped', skip_reason: 'number_not_on_whatsapp', failure_class: 'not_on_whatsapp', processed_at: new Date().toISOString()
+        }).eq('id', item.id).eq('status', 'ready_to_send')
+        if (item.campaign_id) {
+          await supabase.from('campaign_enrollments').update({ status: 'exited' })
+            .eq('campaign_id', item.campaign_id).eq('lead_id', item.contact_id).in('status', ['pending', 'active'])
+        }
+        await logSendEvent(item.business_id, { queueId: item.id, contactId: item.contact_id, instanceName: activeSession.instance_name, eventType: 'skipped', reason: 'number_not_on_whatsapp' })
+        continue
+      }
+
       const { data: claimedItem, error: claimError } = await supabase
         .from('follow_up_queue')
         .update({ status: 'sending' })
@@ -162,7 +181,7 @@ export async function processBaileysBatch() {
           eventType: 'failed',
           reason: result.error ?? 'send_failed'
         })
-        log('error', 'sender', 'sender.send_failed', `Send failed to ${contact.phone}: ${result.error ?? 'send_failed'}`, {
+        log('warn', 'sender', 'sender.send_failed', `Send failed to ${contact.phone}: ${result.error ?? 'send_failed'}`, {
           business_id: item.business_id, contact_id: item.contact_id, entity_id: item.id,
           duration_ms: sendDurationMs,
           details: { instance: activeSession.instance_name, campaignId: item.campaign_id ?? null, error: result.error ?? 'send_failed' }

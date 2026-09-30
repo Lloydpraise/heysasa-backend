@@ -1,10 +1,9 @@
 import { deductBalance } from '../lib/billing.js'
 import { getBillingConfig } from '../lib/db.js'
 import { DEFAULT_MSG_COST, DEFAULT_CONSENT_COST } from '../config.js'
-import { isPermanentSendFailure } from '../lib/sendFailures.js'
+import { decideRetry } from '../lib/sendFailures.js'
 import { log } from '../lib/log.js'
 
-const SEND_RETRY_DELAY_MS = 60 * 60_000 // retry non-permanent send failures about an hour later
 
 export async function recordSuccessfulSend(supabase, { item, contact, business, finalMessage, whatsappMessageId }) {
   const now = new Date().toISOString()
@@ -209,19 +208,31 @@ export async function recordSuccessfulSend(supabase, { item, contact, business, 
 // recoverable — it stays ready_to_send and comes back up for another
 // attempt in the next retry pass, indefinitely, rather than being given
 // up on after a fixed attempt count.
+// What happens to a message that did not go through (see lib/sendFailures.js for the rules):
+//   - number not on WhatsApp / invalid number: given up at once, never retried
+//   - anything else: retried a few times, spaced out, then given up and reported
+// When a message is given up on, the person's campaign enrolment is closed too, so they do not
+// sit in the campaign forever waiting for a message that will never go.
 export async function recordFailedDispatch(supabase, item, errorMessage) {
   const attempts = (item.dispatch_attempts ?? 0) + 1
-  const permanent = isPermanentSendFailure(errorMessage)
+  const decision = decideRetry(errorMessage, attempts)
 
-  await supabase.from('follow_up_queue').update({
-    status: permanent ? 'failed' : 'ready_to_send',
-    scheduled_at: permanent ? item.scheduled_at : new Date(Date.now() + SEND_RETRY_DELAY_MS).toISOString(),
-    dispatch_attempts: attempts,
-    last_dispatch_error: errorMessage
-  }).eq('id', item.id)
+  await supabase.from('follow_up_queue').update(decision.giveUp
+    ? { status: 'failed', dispatch_attempts: attempts, last_dispatch_error: errorMessage, failure_class: decision.failureClass, processed_at: new Date().toISOString() }
+    : { status: 'ready_to_send', scheduled_at: new Date(Date.now() + decision.retryInMs).toISOString(), dispatch_attempts: attempts, last_dispatch_error: errorMessage, failure_class: decision.failureClass }
+  ).eq('id', item.id)
 
-  log('error', 'sender', 'sender.dispatch_failed', `Dispatch failed for ${item.id} (attempt ${attempts}${permanent ? ', not on WhatsApp — giving up' : ', retrying in ~1h'}): ${errorMessage}`, {
+  if (decision.giveUp && item.campaign_id) {
+    await supabase.from('campaign_enrollments').update({ status: 'exited' })
+      .eq('campaign_id', item.campaign_id).eq('lead_id', item.contact_id).in('status', ['pending', 'active'])
+  }
+
+  const what = decision.giveUp
+    ? `giving up (${decision.failureClass})`
+    : `${decision.failureClass}, retrying in ${Math.round(decision.retryInMs / 60_000)} min`
+  log(decision.reportAs, 'sender', decision.giveUp ? 'sender.dispatch_failed' : 'sender.dispatch_retry',
+    `Dispatch failed for ${item.id} (attempt ${attempts}, ${what}): ${String(errorMessage).slice(0, 200)}`, {
     business_id: item.business_id, contact_id: item.contact_id, entity_id: item.id,
-    details: { attempts, permanent, error: errorMessage }
+    details: { attempts, failureClass: decision.failureClass, permanent: decision.permanent, giveUp: decision.giveUp, error: errorMessage }
   })
 }

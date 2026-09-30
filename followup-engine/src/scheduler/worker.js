@@ -116,6 +116,7 @@ export async function runWorker(supabase, queueItemId) {
   // opting a lead out happens explicitly from the lead detail panel
   // and is what sets do_not_contact.
   if (contact.do_not_contact) return skipItem('do_not_contact')
+  if (contact.wa_exists === false) return skipItem('number_not_on_whatsapp')
 
   // Business-level pause: this is now an active blocker (campaigns for
   // this business get paused at the scheduler level too — see
