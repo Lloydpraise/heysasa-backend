@@ -9,6 +9,9 @@ import * as prompts from '../scheduler/prompts.js'
 import { QC_FALLBACK } from '../lib/qc.js'
 import { getContact, getBusiness, getPersonaPack, getConversation } from '../lib/db.js'
 import { rewriteSuggestedMessage } from '../scheduler/generateDraft.js'
+import { runOptInClassifier } from '../scheduler/optInClassifier.js'
+import { runCampaignReplyIntentClassifier } from '../scheduler/campaignReplyIntentClassifier.js'
+import { runStageClassifier, STAGE_REVIEW_DEBOUNCE_MS } from '../scheduler/stageClassifier.js'
 import { resolveMergeFields } from '../lib/mergeFields.js'
 import { getCustomerProfile, getAutoCampaignContext } from '../lib/campaignContext.js'
 
@@ -22,11 +25,59 @@ function tokenOk(req) {
 }
 
 export const adminRouter = Router()
+const stageReviewTimers = new Map()
+const optInReviewTimers = new Map()
+
+function scheduleOptInReview(contactId) {
+  const existing = optInReviewTimers.get(contactId)
+  if (existing) clearTimeout(existing)
+
+  const timer = setTimeout(async () => {
+    optInReviewTimers.delete(contactId)
+    try {
+      await runOptInClassifier(supabase, contactId)
+    } catch (error) {
+      console.error(`[Opt-in classifier] ${error.message}`)
+    }
+  }, STAGE_REVIEW_DEBOUNCE_MS)
+  optInReviewTimers.set(contactId, timer)
+}
+
+function scheduleStageReview(conversationId) {
+  const existing = stageReviewTimers.get(conversationId)
+  if (existing) clearTimeout(existing)
+
+  const timer = setTimeout(async () => {
+    stageReviewTimers.delete(conversationId)
+    try {
+      await runStageClassifier(supabase, undefined, conversationId)
+    } catch (error) {
+      console.error(`[Stage classifier] ${error.message}`)
+    }
+  }, STAGE_REVIEW_DEBOUNCE_MS)
+  stageReviewTimers.set(conversationId, timer)
+}
 
 adminRouter.use('/admin/engine', (req, res, next) => {
   if (!process.env.DEBUG_TOKEN) return res.status(503).json({ ok: false, error: 'debug_token_not_configured' })
   if (!tokenOk(req)) return res.status(401).json({ ok: false, error: 'invalid_debug_token' })
   next()
+})
+
+adminRouter.post('/admin/engine/lead-activity', (req, res) => {
+  const contactId = req.body?.contact_id
+  const conversationId = req.body?.conversation_id
+  const campaignStepEventId = req.body?.campaign_step_event_id
+  const inbound = req.body?.inbound === true
+  if (!contactId || !conversationId) return res.status(400).json({ ok: false, error: 'contact_and_conversation_required' })
+
+  res.status(202).json({ ok: true })
+  scheduleStageReview(conversationId)
+  if (inbound) scheduleOptInReview(contactId)
+  if (inbound && campaignStepEventId) {
+    runCampaignReplyIntentClassifier(supabase, campaignStepEventId)
+      .catch(error => console.error(`[Campaign reply classifier] ${error.message}`))
+  }
 })
 
 // bot_id -> built-in prompt used when ai_bots_config has no active row for it

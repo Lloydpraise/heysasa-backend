@@ -24,15 +24,16 @@ const parseFailures = new Map() // step event id -> unparseable AI answers so fa
 // does not touch do_not_contact or the campaign enrollment. That stays
 // optInClassifier.js's job alone, so only one place ever flips
 // subscription state.
-export async function runCampaignReplyIntentClassifier(supabase) {
-  const { data: pendingEvents, error } = await supabase
+export async function runCampaignReplyIntentClassifier(supabase, onlyEventId = null) {
+  let pendingEventsQuery = supabase
     .from('campaign_step_events')
     .select('id, enrollment_id, step_id, replied_at')
     .not('replied_at', 'is', null)
     .is('reply_intent', null)
     .is('reaction_emoji', null)
     .order('replied_at', { ascending: true })
-    .limit(BATCH_SIZE)
+  if (onlyEventId) pendingEventsQuery = pendingEventsQuery.eq('id', onlyEventId)
+  const { data: pendingEvents, error } = await pendingEventsQuery.limit(BATCH_SIZE)
 
   if (error) {
     log('error', 'engine', 'campaign_reply_intent.fetch_failed', `Fetch failed: ${error.message}`, { details: { error: error.message } })

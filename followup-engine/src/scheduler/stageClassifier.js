@@ -2,17 +2,16 @@ import { STAGE_CLASSIFIER_FALLBACK } from './prompts.js'
 import { log } from '../lib/log.js'
 import { shouldPauseOpenAIRequest } from '../lib/openAiGate.js'
 
-// EVENT-DRIVEN. This loop still ticks every minute, but a tick is one cheap
-// database query. It only calls OpenAI for conversations a lead has actually
-// responded to (the webhook stamps conversations.stage_review_requested_at),
-// after the lead has been quiet for DEBOUNCE_MS so a burst of messages costs
-// one classification, not one per message. No lead activity = no OpenAI call.
+// Activity-gated. The three-hour poll only sees conversations stamped by a
+// live lead reply or owner message, then waits for DEBOUNCE_MS so a burst of
+// messages costs one classification, not one per message. No activity stamp
+// means no lead query and no OpenAI call.
 //
 // The old version re-sent the full thread of every conversation with a message
 // in the last 15 minutes on EVERY tick, so a single customer message could be
 // classified ~15 times.
 const BATCH_SIZE = 20
-const DEBOUNCE_MS = parseInt(process.env.STAGE_REVIEW_DEBOUNCE_MS ?? `${2 * 60_000}`)
+export const STAGE_REVIEW_DEBOUNCE_MS = parseInt(process.env.STAGE_REVIEW_DEBOUNCE_MS ?? `${2 * 60_000}`)
 const THREAD_MESSAGES = 40   // the current stage is passed in, so the tail is enough
 const MESSAGE_CHARS = 300
 const MAX_FAILURES = 3       // stop retrying a conversation whose calls keep failing
@@ -37,21 +36,22 @@ function formatThread(messages) {
   }).join('\n')
 }
 
-export async function runStageClassifier(supabase, deps) {
+export async function runStageClassifier(supabase, deps, onlyConversationId = null) {
   // While the gate is latched (credits/key), leave requests queued; they are
   // picked up automatically once OpenAI is back. Nothing is lost or re-billed.
   if (shouldPauseOpenAIRequest()) return { classified: 0 }
 
   const { getBusiness, getMessages, callBot, chargeLeadStageChange } = deps ?? await defaultDeps()
 
-  const dueBefore = new Date(Date.now() - DEBOUNCE_MS).toISOString()
-  const { data: convs, error } = await supabase
+  const dueBefore = new Date(Date.now() - STAGE_REVIEW_DEBOUNCE_MS).toISOString()
+  let dueQuery = supabase
     .from('conversations')
     .select('id, business_id, contact_id, lead_stage_ecom, lead_stage_service, is_business_chat, stage_review_requested_at')
     .not('stage_review_requested_at', 'is', null)
     .lte('stage_review_requested_at', dueBefore)
     .order('stage_review_requested_at', { ascending: true })
-    .limit(BATCH_SIZE)
+  if (onlyConversationId) dueQuery = dueQuery.eq('id', onlyConversationId)
+  const { data: convs, error } = await dueQuery.limit(BATCH_SIZE)
 
   if (error) throw new Error(error.message)
   if (!convs?.length) return { classified: 0 }

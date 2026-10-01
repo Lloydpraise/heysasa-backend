@@ -22,20 +22,22 @@ const lastClassifiedAt = new Map() // contact_id -> ISO timestamp of last-seen i
 //  3. ALREADY opted in and currently receiving follow-ups or a campaign —
 //     checked for opt_out only ("stop disturbing me" etc. from someone
 //     already subscribed), since they can't "opt in" again
-export async function runOptInClassifier(supabase) {
-  const { data: consentPending } = await supabase
+export async function runOptInClassifier(supabase, onlyContactId = null) {
+  let consentPendingQuery = supabase
     .from('contacts')
     .select('id, business_id, name')
     .eq('follow_up_opted_in', false)
     .eq('do_not_contact', false)
     .not('consent_message_sent_at', 'is', null)
-    .limit(BATCH_SIZE)
+  if (onlyContactId) consentPendingQuery = consentPendingQuery.eq('id', onlyContactId)
+  const { data: consentPending } = await consentPendingQuery.limit(BATCH_SIZE)
 
-  const { data: enrollments } = await supabase
+  let enrollmentsQuery = supabase
     .from('campaign_enrollments')
     .select('lead_id')
     .in('status', ['pending', 'active', 'awaiting_opt_in'])
-    .limit(BATCH_SIZE)
+  if (onlyContactId) enrollmentsQuery = enrollmentsQuery.eq('lead_id', onlyContactId)
+  const { data: enrollments } = await enrollmentsQuery.limit(BATCH_SIZE)
 
   const enrolledIds = [...new Set((enrollments ?? []).map(e => e.lead_id))]
 
@@ -44,24 +46,27 @@ export async function runOptInClassifier(supabase) {
 
   const stillNeedLookup = enrolledIds.filter(id => !notYetOptedIn.has(id))
   if (stillNeedLookup.length) {
-    const { data } = await supabase
+    let contactLookup = supabase
       .from('contacts')
       .select('id, business_id, name')
       .in('id', stillNeedLookup)
       .eq('follow_up_opted_in', false)
       .eq('do_not_contact', false)
+    if (onlyContactId) contactLookup = contactLookup.eq('id', onlyContactId)
+    const { data } = await contactLookup
     for (const c of data ?? []) notYetOptedIn.set(c.id, c)
   }
 
   // Already opted in, but actively receiving campaign messages or
   // follow-ups — still worth checking for a stop-signal.
-  const { data: activeOptedIn } = await supabase
+  let activeOptedInQuery = supabase
     .from('contacts')
     .select('id, business_id, name')
     .eq('follow_up_opted_in', true)
     .eq('do_not_contact', false)
     .or(`id.in.(${enrolledIds.length ? enrolledIds.join(',') : '0'}),follow_up_count.gt.0`)
-    .limit(BATCH_SIZE)
+  if (onlyContactId) activeOptedInQuery = activeOptedInQuery.eq('id', onlyContactId)
+  const { data: activeOptedIn } = await activeOptedInQuery.limit(BATCH_SIZE)
 
   const alreadyOptedIn = new Map()
   for (const c of activeOptedIn ?? []) {

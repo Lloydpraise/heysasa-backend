@@ -23,6 +23,29 @@ import { debugLog } from './debugConsole.js';
 import { deleteSessionRecord } from './evolutionConnections.js';
 import { scheduleDisconnectNotice } from './disconnectNotice.js';
 
+async function notifyFollowupEngineActivity(contactId, conversationId, campaignStepEventId, inbound) {
+    const token = process.env.DEBUG_TOKEN;
+    if (!token) return;
+
+    try {
+        const port = process.env.FOLLOWUP_ENGINE_PORT || '3001';
+        const response = await fetch(`http://127.0.0.1:${port}/admin/engine/lead-activity`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'x-debug-token': token },
+            body: JSON.stringify({
+                contact_id: contactId,
+                conversation_id: conversationId,
+                campaign_step_event_id: campaignStepEventId,
+                inbound,
+            }),
+            signal: AbortSignal.timeout(5000),
+        });
+        if (!response.ok) throw new Error(`follow-up engine returned ${response.status}`);
+    } catch (error) {
+        debugLog('error', 'Lead activity', 'Failed to trigger follow-up classifiers', { contactId, error: error.message });
+    }
+}
+
 export async function resolveBusinessId(payload) {
     const instanceName = payload?.instance || payload?.data?.instance;
     if (!instanceName) throw new Error('evolution_instance_missing');
@@ -140,6 +163,7 @@ export async function processLiveMessage(messages, businessId) {
                 continue;
             }
             const contactId = contact.id;
+            let campaignStepEventId = null;
 
             // 2. Resolve Conversation
             const conversationId = await getOrCreateConversation(businessId, contactId, jid);
@@ -161,12 +185,14 @@ export async function processLiveMessage(messages, businessId) {
                 if (type === 'reaction') {
                     await recordCampaignStepReaction(businessId, reactedMessageId, text);
                 } else {
-                    await recordCampaignStepReply(contactId);
+                    campaignStepEventId = await recordCampaignStepReply(contactId);
                     // The lead actually said something: queue a stage re-check.
                     // (Reactions carry no text, and history sync deliberately
                     // does not do this, so old chats never flood the queue.)
                     await requestStageReview(conversationId, 'responded');
                 }
+            } else if (type !== 'reaction') {
+                await requestStageReview(conversationId, 'business_sent');
             }
 
             // 5. Store message record — real `messages` columns are
@@ -195,6 +221,8 @@ export async function processLiveMessage(messages, businessId) {
 
             if (msgError) {
                 debugLog('error', 'Message Insert', 'Failed to store incoming message', { businessId, keyId, error: msgError });
+            } else if (type !== 'reaction') {
+                void notifyFollowupEngineActivity(contactId, conversationId, campaignStepEventId, !isFromMe);
             }
 
         } catch (error) {

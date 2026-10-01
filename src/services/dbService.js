@@ -189,7 +189,7 @@ export async function recordCampaignStepReply(contactId) {
             .in('status', ['pending', 'active', 'awaiting_opt_in'])
             .maybeSingle();
         if (enrollmentError) throw enrollmentError;
-        if (!enrollment?.id) return;
+        if (!enrollment?.id) return null;
 
         const { data: stepEvent, error: stepEventError } = await supabase
             .from('campaign_step_events')
@@ -207,7 +207,7 @@ export async function recordCampaignStepReply(contactId) {
                 message: 'Inbound reply received but no pending campaign step event to attribute it to',
                 contact_id: contactId, details: { enrollmentId: enrollment.id },
             });
-            return;
+            return null;
         }
 
         const { error } = await supabase
@@ -221,8 +221,10 @@ export async function recordCampaignStepReply(contactId) {
             message: 'Inbound reply attributed to a campaign step',
             contact_id: contactId, entity_id: stepEvent.id, details: { enrollmentId: enrollment.id },
         });
+        return stepEvent.id;
     } catch (error) {
         logDbFailure('recordCampaignStepReply', { contactId }, error, 'campaign');
+        return null;
     }
 }
 

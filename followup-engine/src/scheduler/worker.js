@@ -6,7 +6,7 @@ import {
 } from '../lib/db.js'
 import { checkBalance, flagInsufficientFunds } from '../lib/billing.js'
 import { leadAgeDays, hoursSince } from '../lib/timing.js'
-import { generateFollowupDraft, rewriteSuggestedMessage } from './generateDraft.js'
+import { rewriteSuggestedMessage } from './generateDraft.js'
 import { getCustomerProfile, getAutoCampaignContext } from '../lib/campaignContext.js'
 import { normalizeOutboundMedia } from '../lib/media.js'
 import { resolveMediaMergeFields, resolveMergeFields } from '../lib/mergeFields.js'
@@ -71,6 +71,9 @@ export async function runWorker(supabase, queueItemId) {
     item.media = normalizeOutboundMedia(item.media)
   } catch (error) {
     return skipItem(error.message)
+  }
+  if (!String(item.final_message ?? item.draft_message ?? '').trim() && !item.media) {
+    return skipItem('message_required')
   }
 
   if (item.campaign_id) {
@@ -186,14 +189,14 @@ export async function runWorker(supabase, queueItemId) {
     const { data: campaign } = await supabase
       .from('campaigns').select('ai_rewrite_enabled, auto_approve, kind, rule_id, business_id').eq('id', item.campaign_id).single()
 
-    let finalMessage = item.final_message
-    let draft = item.draft_message
+    let finalMessage = item.final_message || item.draft_message || ''
+    let draft = item.draft_message || finalMessage
     let qcPassed = item.qc_passed ?? true
     let qcNotes = item.qc_notes ?? null
     finalMessage = resolveMergeFields(finalMessage, contact)
     item.media = resolveMediaMergeFields(item.media, contact)
 
-    if (campaign?.ai_rewrite_enabled) {
+    if (campaign?.ai_rewrite_enabled && finalMessage.trim()) {
       // Campaign context: auto-campaigns carry an objective + playbook (business override
       // or platform default); every AI-rewritten campaign message also gets this lead's profile.
       const extra = { profile: await getCustomerProfile(supabase, contact.id) }
@@ -242,13 +245,13 @@ export async function runWorker(supabase, queueItemId) {
   }
 
   // ── 10-16. Standalone items: resolve the message first ─────────
-  let finalMessage = item.final_message || item.draft_message
+  let finalMessage = item.final_message || item.draft_message || ''
   let draft = item.draft_message
   let qcPassed = item.qc_passed ?? true
   let qcNotes = item.qc_notes ?? null
   const preWritten = !!(item.final_message || item.draft_message || item.media)
 
-  if (preWritten && item.ai_rewrite_enabled) {
+  if (preWritten && item.ai_rewrite_enabled && finalMessage.trim()) {
     // Owner wrote it but asked AI to expand/personalize — treat as a
     // suggestion, not final copy.
     const result = await rewriteSuggestedMessage(supabase, finalMessage, contact, business, pack, conv)
@@ -266,27 +269,8 @@ export async function runWorker(supabase, queueItemId) {
     draft = result.draft
     qcPassed = result.qcPassed
     qcNotes = result.qcNotes
-  } else if (!preWritten) {
-    const result = await generateFollowupDraft(supabase, item, contact, business, pack, conv)
-    if (!result.ok) {
-      if (result.reason === 'qc_failed') {
-        await supabase.from('follow_up_queue').update({
-          status: 'skipped',
-          skip_reason: 'qc_failed',
-          qc_passed: false,
-          qc_notes: result.issues.join(', '),
-          draft_message: result.draft
-        }).eq('id', queueItemId)
-        return { status: 'skipped', reason: 'qc_failed', issues: result.issues }
-      }
-      return result.reason === 'generation_failed' ? stallItem('ai_unavailable', AI_RETRY_MS) : skipItem(result.reason)
-    }
-    finalMessage = result.finalMessage
-    draft = result.draft
-    qcPassed = result.qcPassed
-    qcNotes = result.qcNotes
   }
-  // else: preWritten && !ai_rewrite_enabled — owner wrote it verbatim, used as-is below
+  // Existing owner/campaign text is used verbatim unless AI rewrite is enabled.
 
   // ── 17a. Owner-written bypass ───────────────────────────────────
   // "If I wrote a follow-up message myself, let it go through" — a
