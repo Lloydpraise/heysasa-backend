@@ -147,6 +147,97 @@ export function createAdminRouter({ getFollowupPort, isFollowupRunning }) {
         return { default: row };
     }));
 
+    // ── Bulk import of defaults from a file ─────────────────────────────
+    // The browser reads the xlsx/json and sends plain rows here. dryRun:true only checks every
+    // row (nothing is saved); dryRun:false saves the rows that pass, each as a new version, so an
+    // import can always be undone by restoring the previous version.
+    const KNOWN_TOKENS = new Set(['first_name', 'product_interest']);
+
+    async function checkImportRow(raw, ctx) {
+        const errors = [];
+        const warnings = [];
+        const row = {
+            rule_id: norm(raw?.rule_id),
+            industry: norm(raw?.industry),
+            business_type: norm(raw?.business_type),
+            campaign_name: norm(raw?.campaign_name),
+            objective: norm(raw?.objective),
+            playbook: norm(raw?.playbook),
+            sequence_mode: norm(raw?.sequence_mode) ?? 'linear',
+            steps: Array.isArray(raw?.steps) ? raw.steps : [],
+        };
+        if (!row.rule_id) errors.push('rule_id is missing');
+        else if (!ctx.ruleIds.has(row.rule_id)) errors.push(`rule_id "${row.rule_id}" is not a known rule (known: ${[...ctx.ruleIds].join(', ')})`);
+        if (!row.campaign_name) errors.push('campaign_name is missing');
+        if (!row.objective) errors.push('objective is missing');
+        if (!row.playbook) errors.push('playbook is missing');
+        if (!['linear', 'conditional'].includes(row.sequence_mode)) errors.push('sequence_mode must be linear or conditional');
+        if (row.business_type && !ctx.businessTypes.has(row.business_type)) {
+            errors.push(`business_type "${row.business_type}" matches no business (existing: ${[...ctx.businessTypes].join(', ')})`);
+        }
+        if (row.industry && !ctx.industries.has(row.industry.toLowerCase())) {
+            warnings.push(`industry "${row.industry}" matches no business yet, so no one will get this default until a business has that industry`);
+        }
+        if (!row.industry && !row.business_type) warnings.push('no industry or business_type: this replaces the global default for this rule');
+
+        try {
+            row.steps = cleanSteps(row.steps);
+            row.steps.forEach((st) => {
+                for (const m of st.content.matchAll(/\{\{\s*([a-z_]+)\s*\}\}/gi)) {
+                    if (!KNOWN_TOKENS.has(m[1].toLowerCase())) warnings.push(`message ${st.step_number} uses {{${m[1]}}}, which is not filled in and would be sent as typed`);
+                }
+            });
+        } catch (error) {
+            errors.push(error.message);
+        }
+        const key = `${row.rule_id}|${(row.industry ?? '').toLowerCase()}|${row.business_type ?? ''}`;
+        if (ctx.seen.has(key)) errors.push('same rule + industry + business_type appears twice in this file');
+        ctx.seen.add(key);
+        return { row, errors, warnings };
+    }
+
+    router.post('/admin/api/defaults/import', wrap(async (req) => {
+        const rows = req.body?.rows;
+        const dryRun = req.body?.dryRun !== false;
+        if (!Array.isArray(rows) || !rows.length) throw httpError(400, 'no rows to import');
+        if (rows.length > 200) throw httpError(400, 'too many rows (max 200 per file)');
+
+        const [biz, rules] = await Promise.all([
+            supabase.from('businesses').select('industry, business_type'),
+            supabase.from('auto_campaign_defaults').select('rule_id'),
+        ]);
+        const ctx = {
+            ruleIds: new Set(must(rules).map((r) => r.rule_id)),
+            businessTypes: new Set(must(biz).map((b) => b.business_type).filter(Boolean)),
+            industries: new Set(must(biz).map((b) => (b.industry || '').trim().toLowerCase()).filter(Boolean)),
+            seen: new Set(),
+        };
+
+        const results = [];
+        for (const [index, raw] of rows.entries()) {
+            const checked = await checkImportRow(raw, ctx);
+            const result = { line: index + 1, label: `${checked.row.rule_id ?? '?'} · ${checked.row.industry ?? 'all industries'}${checked.row.business_type ? ' · ' + checked.row.business_type : ''}`,
+                ok: checked.errors.length === 0, errors: checked.errors, warnings: checked.warnings, version: null };
+            if (result.ok && !dryRun) {
+                try {
+                    const saved = await publishVersion({
+                        ruleId: checked.row.rule_id, industry: checked.row.industry, businessType: checked.row.business_type,
+                        campaignName: checked.row.campaign_name, objective: checked.row.objective, playbook: checked.row.playbook,
+                        sequenceMode: checked.row.sequence_mode, steps: checked.row.steps,
+                    });
+                    result.version = saved.version;
+                } catch (error) {
+                    result.ok = false;
+                    result.errors.push(`could not save: ${error.message}`);
+                }
+            }
+            results.push(result);
+        }
+        const summary = { total: results.length, valid: results.filter((r) => r.ok).length, invalid: results.filter((r) => !r.ok).length, saved: results.filter((r) => r.version).length, dryRun };
+        if (!dryRun) logEvent({ level: 'info', area: 'admin', event: 'admin.defaults_imported', message: `Imported ${summary.saved} of ${summary.total} campaign defaults from a file` });
+        return { summary, results };
+    }));
+
     router.post('/admin/api/defaults/:id/restore', wrap(async (req) => {
         const old = must(await supabase.from('auto_campaign_defaults').select('*').eq('id', req.params.id).single());
         const row = await publishVersion({

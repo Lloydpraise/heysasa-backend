@@ -4,7 +4,7 @@ import { sendContentViaEvolution } from './evolutionSender.js'
 import { checkAntiban, recordSend, primeAntiban } from './antiban.js'
 import { effectiveDailyCap, sentTodayCount, noteSent, logWarmupHold } from '../lib/warmup.js'
 import { recordSuccessfulSend, recordFailedDispatch } from './postSend.js'
-import { ensureNumberOnWhatsApp } from '../lib/numberCheck.js'
+import { ensureNumberOnWhatsApp, needsNumberLookup } from '../lib/numberCheck.js'
 import { log } from '../lib/log.js'
 
 const BATCH_SIZE = 25
@@ -131,11 +131,13 @@ export async function processBaileysBatch() {
         continue
       }
 
-      // Check the number is on WhatsApp before we ever try to message it. A number that is not
-      // on WhatsApp is skipped (not failed, not retried) and its campaign spot is closed.
-      const numberCheck = await ensureNumberOnWhatsApp(supabase, {
-        instanceName: activeSession.instance_name, contact, businessId: item.business_id
-      })
+      // Manual-campaign numbers are checked on WhatsApp just before their turn, at random times
+      // (see lib/numberCheck.js). Auto campaigns and AI follow-ups are never looked up, because
+      // those people already messaged us. A number known not to be on WhatsApp is skipped
+      // (not failed, not retried) and its campaign spot is closed.
+      const numberCheck = (await needsNumberLookup(supabase, item))
+        ? await ensureNumberOnWhatsApp(supabase, { instanceName: activeSession.instance_name, contact, businessId: item.business_id })
+        : (contact.wa_exists === false ? { status: 'not_on_whatsapp' } : { status: 'ok' })
       if (numberCheck.status === 'wait') continue
       if (numberCheck.status === 'not_on_whatsapp') {
         await supabase.from('follow_up_queue').update({

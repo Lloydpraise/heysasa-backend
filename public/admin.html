@@ -43,6 +43,7 @@
   .hidden { display:none !important; }
   #login { max-width:380px; margin:12vh auto; }
 </style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 </head>
 <body>
 <div id="login" class="card hidden">
@@ -74,10 +75,21 @@
   <section id="tab-defaults">
     <div class="grid">
       <div class="card" style="align-self:start">
-        <div class="row" style="margin-bottom:8px"><strong>Defaults</strong><button class="btn" id="d-new" style="flex:0">+ New scope</button></div>
+        <div class="row" style="margin-bottom:8px"><strong>Defaults</strong><button class="btn" id="d-new" style="flex:0;white-space:nowrap">Upload / create</button></div>
         <div id="d-list"></div>
       </div>
       <div>
+        <div class="card hidden" id="d-import">
+          <div class="row"><strong>Upload campaigns from a file</strong><button class="btn" id="di-close" style="flex:0">Close</button></div>
+          <p class="hint">Write your campaigns anywhere, save as an Excel (.xlsx) or .json file, and upload. Every row is checked first and nothing is saved until you press Import. Each saved row becomes a new version, so an import can be undone from Version history.</p>
+          <div class="row" style="align-items:center">
+            <input type="file" id="di-file" accept=".xlsx,.xls,.json" style="flex:2">
+            <button class="btn" id="di-tpl-x" style="flex:0;white-space:nowrap">Template (.xlsx)</button>
+            <button class="btn" id="di-tpl-j" style="flex:0;white-space:nowrap">Template (.json)</button>
+          </div>
+          <div id="di-report" style="margin-top:10px"></div>
+          <div class="row" style="margin-top:10px"><span id="di-sum" class="hint" style="flex:2"></span><button class="btn primary hidden" id="di-go" style="flex:0;white-space:nowrap">Import</button></div>
+        </div>
         <div class="card">
           <div class="row">
             <div><label>Rule</label><div id="d-rule"></div></div>
@@ -287,7 +299,67 @@ async function loadHistory(d) {
   })));
 }
 $('d-add').onclick = () => { const st = readSteps(); if (st.length >= 8) return flash('Max 8 messages', 'err'); st.push({ content: '', delay_hours: 24 }); renderSteps(st); };
-$('d-new').onclick = () => fillForm({ rule_id: meta.ruleIds[0], industry: '', business_type: '', campaign_name: '', objective: '', playbook: '', steps: [{ content: '', delay_hours: 0 }], version: 0 });
+
+// ── upload / create (import campaign defaults from xlsx or json) ──
+const DI_COLS = { rule: ['rule_id', 'rule'], industry: ['industry'], type: ['business_type', 'type'], name: ['campaign_name', 'name', 'title'], objective: ['objective', 'goal'], playbook: ['playbook', 'how_to_follow_up', 'instructions'], mode: ['sequence_mode', 'mode'], key: ['campaign', 'key', 'id'], step: ['step', 'order', 'number'], msg: ['message', 'content', 'text', 'body'], wait: ['wait_hours', 'delay_hours', 'gap_hours', 'wait', 'delay', 'gap'] };
+let diRows = [];
+const diNorm = (o) => Object.fromEntries(Object.entries(o).map(([k, v]) => [String(k).trim().toLowerCase().replace(/[\s-]+/g, '_'), v]));
+const diPick = (o, names) => { for (const n of names) if (o[n] !== undefined && String(o[n]).trim() !== '') return o[n]; return ''; };
+function diFromJson(text) {
+  let data; try { data = JSON.parse(text); } catch { throw new Error('That file is not valid JSON. Check for a missing comma, quote or bracket.'); }
+  const list = Array.isArray(data) ? data : (data.campaigns || data.defaults || [data]);
+  return list.map((c) => { const o = diNorm(c); return { rule_id: diPick(o, DI_COLS.rule), industry: diPick(o, DI_COLS.industry), business_type: diPick(o, DI_COLS.type), campaign_name: diPick(o, DI_COLS.name), objective: diPick(o, DI_COLS.objective), playbook: diPick(o, DI_COLS.playbook), sequence_mode: diPick(o, DI_COLS.mode) || 'linear',
+    steps: (c.steps || c.messages || []).map((st, i) => { const x = diNorm(st); return { content: String(diPick(x, DI_COLS.msg)), delay_hours: i === 0 ? 0 : Number(diPick(x, DI_COLS.wait) || 24) }; }) }; });
+}
+function diFromWorkbook(wb) {
+  const sheet = (names) => { const n = wb.SheetNames.find((x) => names.includes(x.trim().toLowerCase())); return n ? XLSX.utils.sheet_to_json(wb.Sheets[n], { defval: '' }).map(diNorm) : null; };
+  const camps = sheet(['campaigns', 'campaign', 'defaults']); const steps = sheet(['steps', 'messages']);
+  if (!camps || !steps) throw new Error('The file needs two sheets named "Campaigns" and "Steps". Download the template to see the layout.');
+  const byKey = {};
+  steps.forEach((r) => { const k = String(diPick(r, DI_COLS.key)).trim(); if (!k || (!String(diPick(r, DI_COLS.msg)).trim() && !String(diPick(r, DI_COLS.step)).trim())) return; (byKey[k] ||= []).push(r); });
+  return camps.filter((c) => Object.values(c).some((v) => String(v).trim())).map((c) => {
+    const key = String(diPick(c, DI_COLS.key) || diPick(c, DI_COLS.name)).trim();
+    const own = (byKey[key] || []).sort((a, b) => Number(diPick(a, DI_COLS.step) || 0) - Number(diPick(b, DI_COLS.step) || 0));
+    return { rule_id: diPick(c, DI_COLS.rule), industry: diPick(c, DI_COLS.industry), business_type: diPick(c, DI_COLS.type), campaign_name: diPick(c, DI_COLS.name), objective: diPick(c, DI_COLS.objective), playbook: diPick(c, DI_COLS.playbook), sequence_mode: diPick(c, DI_COLS.mode) || 'linear',
+      steps: own.map((r, i) => ({ content: String(diPick(r, DI_COLS.msg)), delay_hours: i === 0 ? 0 : Number(diPick(r, DI_COLS.wait) || 24) })) };
+  });
+}
+const DI_SAMPLE = [{ rule_id: 'cold_dormant', industry: 'Beauty', business_type: '', campaign_name: 'Beauty - win back quiet leads', objective: 'Bring back leads who went quiet.', playbook: 'Warm and short. One question per message. Never pushy.', sequence_mode: 'linear',
+  steps: [{ content: 'Hi {{first_name}}, still thinking about {{product_interest}}?', delay_hours: 0 }, { content: 'Quick check-in, {{first_name}}. Any questions I can answer?', delay_hours: 48 }] }];
+function diDownload(name, blob) { const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 2000); }
+$('di-tpl-j').onclick = () => diDownload('campaign-defaults-template.json', new Blob([JSON.stringify({ campaigns: DI_SAMPLE }, null, 2)], { type: 'application/json' }));
+$('di-tpl-x').onclick = () => {
+  if (typeof XLSX === 'undefined') return flash('The Excel helper did not load. Use the .json template instead.', 'err');
+  const wb = XLSX.utils.book_new(); const c = DI_SAMPLE[0];
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([['campaign', 'rule_id', 'industry', 'business_type', 'campaign_name', 'objective', 'playbook', 'sequence_mode'], ['beauty-cold', c.rule_id, c.industry, c.business_type, c.campaign_name, c.objective, c.playbook, c.sequence_mode]]), 'Campaigns');
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([['campaign', 'step', 'message', 'wait_hours'], ...c.steps.map((st, i) => ['beauty-cold', i + 1, st.content, st.delay_hours])]), 'Steps');
+  XLSX.writeFile(wb, 'campaign-defaults-template.xlsx');
+};
+function diRender(res) {
+  $('di-report').innerHTML = `<table><tr><th>#</th><th>Campaign</th><th>Result</th></tr>` + res.results.map((r) => `<tr><td>${r.line}</td><td>${esc(r.label)}</td><td>${r.version ? `<span class="pill ok">saved v${r.version}</span>` : r.ok ? '<span class="pill ok">ready</span>' : '<span class="pill">blocked</span>'}${r.errors.concat(r.warnings.map((w) => 'Note: ' + w)).map((m) => `<div class="hint">${esc(m)}</div>`).join('')}</td></tr>`).join('') + '</table>';
+  const s = res.summary;
+  $('di-sum').textContent = s.dryRun ? `${s.valid} of ${s.total} ready to import${s.invalid ? `, ${s.invalid} blocked (fix them in the file and upload again)` : ''}.` : `Imported ${s.saved} of ${s.total}.`;
+  $('di-go').classList.toggle('hidden', !s.dryRun || s.valid === 0);
+  $('di-go').textContent = `Import ${s.valid} valid`;
+}
+$('di-file').onchange = guard(async (e) => {
+  const f = e.target.files[0]; if (!f) return;
+  diRows = []; $('di-go').classList.add('hidden'); $('di-report').innerHTML = ''; $('di-sum').textContent = 'Reading file…';
+  try {
+    if (/\.json$/i.test(f.name)) diRows = diFromJson(await f.text());
+    else { if (typeof XLSX === 'undefined') throw new Error('The Excel helper did not load. Save the file as .json, or reload this page.'); diRows = diFromWorkbook(XLSX.read(await f.arrayBuffer(), { type: 'array' })); }
+  } catch (err) { $('di-sum').textContent = ''; return flash('Could not read the file: ' + err.message, 'err'); }
+  if (!diRows.length) { $('di-sum').textContent = 'No campaigns found in that file.'; return; }
+  diRender(await api('/defaults/import', { method: 'POST', body: { rows: diRows, dryRun: true } }));
+});
+$('di-go').onclick = guard(async () => {
+  if (!confirm('Save the valid campaigns as new live versions?')) return;
+  const res = await api('/defaults/import', { method: 'POST', body: { rows: diRows, dryRun: false } });
+  diRender(res); flash(`Imported ${res.summary.saved} campaign default${res.summary.saved === 1 ? '' : 's'}`); cur = null; await loadDefaults();
+});
+$('di-close').onclick = () => $('d-import').classList.add('hidden');
+
+$('d-new').onclick = () => { $('d-import').classList.remove('hidden'); fillForm({ rule_id: meta.ruleIds[0], industry: '', business_type: '', campaign_name: '', objective: '', playbook: '', steps: [{ content: '', delay_hours: 0 }], version: 0 }); };
 $('d-save').onclick = guard(async () => {
   const body = { rule_id: cur.rule_id, industry: $('d-industry').value, business_type: $('d-type').value,
     campaign_name: $('d-name').value, objective: $('d-objective').value, playbook: $('d-playbook').value, sequence_mode: 'linear', steps: readSteps() };
