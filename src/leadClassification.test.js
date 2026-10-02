@@ -10,6 +10,12 @@ import {
   FailureGuard,
   FatalRunError,
   isHealthyRun,
+  findOpenerTemplates,
+  isOpenerOnly,
+  normalizeText,
+  CLASSIFIER_VERSION,
+  ANALYSIS_VERSION,
+  cleanCorruptedText,
 } from './leadClassification.js';
 
 test('marks personal chats as personal when NLP says it is not a business chat', () => {
@@ -59,7 +65,7 @@ test('confident personal verdict makes the contact personal and not a business c
 
 test('low-confidence verdicts stay unknown and are flagged for review', () => {
   const d = decideClassification({
-    llm: { lead_type: 'business', confidence: 0.5, reason: 'unclear', evidence: 'Send me the deposit details' },
+    llm: { lead_type: 'business', confidence: 0.4, reason: 'unclear', evidence: 'Send me the deposit details' },
     transcriptText: CHAT,
   });
   assert.equal(d.leadType, 'unknown');
@@ -179,4 +185,179 @@ test('healthy: tiny error counts are fine, large ones are not', () => {
   assert.equal(isHealthyRun(25, 500), true);    // 5%
   assert.equal(isHealthyRun(26, 500), false);
   assert.equal(isHealthyRun(4, 20), false);
+});
+
+// ── Analyser v3: roles, openers, stages ──────────────────────────────────────
+const VENDOR_CHAT = 'Google review of the whole website is clear. Ads are now on. 40 of above products added.';
+
+test('versions were bumped so every existing contact is re-checked', () => {
+  assert.equal(ANALYSIS_VERSION, 3);
+  assert.equal(CLASSIFIER_VERSION, 2);
+});
+
+test('a confident vendor verdict is stored as vendor and kept out of the pipeline', () => {
+  const d = decideClassification({
+    llm: { lead_type: 'vendor', confidence: 0.85, reason: 'Agency running the owner ads', evidence: 'Ads are now on' },
+    transcriptText: VENDOR_CHAT,
+  });
+  assert.equal(d.leadType, 'vendor');
+  assert.equal(d.isBusinessChat, false);
+});
+
+test('staff verdicts are stored as staff and are not business chats', () => {
+  const d = decideClassification({
+    llm: { lead_type: 'staff', confidence: 0.8, reason: 'Welder being vetted for hire', evidence: 'Ads are now on' },
+    transcriptText: VENDOR_CHAT,
+  });
+  assert.equal(d.leadType, 'staff');
+  assert.equal(d.isBusinessChat, false);
+});
+
+test('the model label "customer" (and legacy "business") both mean business', () => {
+  const llm = { confidence: 0.8, reason: 'asks the price of a sink', evidence: 'Ads are now on' };
+  assert.equal(decideClassification({ llm: { ...llm, lead_type: 'customer' }, transcriptText: VENDOR_CHAT }).leadType, 'business');
+  assert.equal(decideClassification({ llm: { ...llm, lead_type: 'business' }, transcriptText: VENDOR_CHAT }).leadType, 'business');
+});
+
+test('a one-line product enquiry at 0.5 confidence is kept as a customer', () => {
+  const d = decideClassification({
+    llm: { lead_type: 'customer', confidence: 0.5, reason: 'asks about a shawarma machine', evidence: 'Shawarma machine please' },
+    transcriptText: 'Shawarma machine please',
+  });
+  assert.equal(d.leadType, 'business');
+});
+
+test('exclusions keep the higher bar: a 0.6 vendor/personal verdict stays unknown', () => {
+  const llm = { confidence: 0.6, reason: 'x', evidence: 'Ads are now on' };
+  assert.equal(decideClassification({ llm: { ...llm, lead_type: 'vendor' }, transcriptText: VENDOR_CHAT }).leadType, 'unknown');
+  assert.equal(decideClassification({ llm: { ...llm, lead_type: 'personal' }, transcriptText: VENDOR_CHAT }).leadType, 'unknown');
+});
+
+test('an unknown label is never guessed into a bucket', () => {
+  assert.equal(decideClassification({ llm: { lead_type: 'supplier-ish', confidence: 0.9, evidence: 'Ads are now on' }, transcriptText: VENDOR_CHAT }).leadType, 'unknown');
+});
+
+const OPENER = 'I have A project I would like you to work on. Can I get more info?';
+const firsts = [...Array(6).fill(OPENER), 'Hello', 'Hi', 'Sink price?', OPENER.toUpperCase()];
+
+test('openers: text many contacts opened with word for word is detected, greetings are not', () => {
+  const t = findOpenerTemplates(firsts);
+  assert.equal(t.size, 1);
+  assert.ok(t.has(normalizeText(OPENER)));
+  assert.equal(t.has('hello'), false);
+});
+
+test('openers: a text only a few contacts used is not a template', () => {
+  assert.equal(findOpenerTemplates([OPENER, OPENER, OPENER, OPENER]).size, 0);
+});
+
+test('openers: isOpenerOnly is true only when everything typed is the opener', () => {
+  const t = findOpenerTemplates(firsts);
+  assert.equal(isOpenerOnly([OPENER, OPENER], t), true);
+  assert.equal(isOpenerOnly([OPENER, 'Tomorrow at 9am'], t), false);
+  assert.equal(isOpenerOnly([], t), false);
+  assert.equal(isOpenerOnly([OPENER], new Map()), false);
+});
+
+test('openers: an opener-only chat is always browsing / quality 3, whatever the model said', () => {
+  const t = findOpenerTemplates(firsts);
+  for (const raw of [
+    { intent: 'buying', quality_score: 8, intent_evidence: OPENER },
+    { intent: 'unknown', quality_score: 2, intent_evidence: null },
+    { intent: 'price_check', quality_score: 7, intent_evidence: OPENER },
+  ]) {
+    const { nlp, flags } = normalizeNlp(raw, { customerText: OPENER, customerMessages: [OPENER], openerTemplates: t });
+    assert.equal(nlp.intent, 'browsing');
+    assert.equal(nlp.quality_score, 3);
+    assert.ok(nlp.intent_evidence.startsWith('I have A project'));
+    assert.ok(flags.includes('opener_only'));
+  }
+});
+
+test('openers: a customer who typed more after the opener is judged on the model answer', () => {
+  const t = findOpenerTemplates(firsts);
+  const text = `${OPENER}\nI want like this banner. Pin P051106414K`;
+  const { nlp, flags } = normalizeNlp(
+    { intent: 'buying', quality_score: 8, intent_evidence: 'I want like this banner' },
+    { customerText: text, customerMessages: [OPENER, 'I want like this banner.', 'Pin P051106414K'], openerTemplates: t }
+  );
+  assert.equal(nlp.intent, 'buying');
+  assert.equal(nlp.quality_score, 8);
+  assert.equal(flags.includes('opener_only'), false);
+});
+
+test('openers: evidence that is just the opener is flagged when more was said', () => {
+  const t = findOpenerTemplates(firsts);
+  const { flags } = normalizeNlp(
+    { intent: 'buying', quality_score: 7, intent_evidence: OPENER },
+    { customerText: `${OPENER}\nTomorrow at 9am`, customerMessages: [OPENER, 'Tomorrow at 9am'], openerTemplates: t }
+  );
+  assert.ok(flags.includes('evidence_is_opener'));
+});
+
+test('stage: free text is mapped to the closed list, "Closing" is not Closed', () => {
+  const run = (conv_stage, extra = {}) => normalizeNlp({ intent: 'browsing', quality_score: 3, conv_stage, ...extra }, { customerText: CHAT }).nlp.conv_stage;
+  assert.equal(run('closed'), 'Closed');
+  assert.equal(run('Product interest'), 'Product interest');
+  assert.equal(run('Closing'), 'Negotiation');
+  assert.equal(run('Totally made up'), null);
+  assert.equal(run(undefined), null);
+});
+
+test('stage: a support chat (already ordered or paid) is Closed, not Negotiation', () => {
+  const { nlp, flags } = normalizeNlp(
+    { intent: 'support', quality_score: 6, intent_evidence: 'Please naomba tumalizie Leo', conv_stage: 'Negotiation' },
+    { customerText: 'Please naomba tumalizie Leo' }
+  );
+  assert.equal(nlp.conv_stage, 'Closed');
+  assert.ok(flags.includes('support_stage_closed'));
+});
+
+test('relationship: a quoted vendor verdict is accepted and flagged', () => {
+  const { nlp, flags } = normalizeNlp(
+    { relationship_check: 'vendor', relationship_evidence: 'Ads are now on', intent: 'buying', quality_score: 8, intent_evidence: 'Ads are now on' },
+    { customerText: VENDOR_CHAT, fullText: VENDOR_CHAT }
+  );
+  assert.equal(nlp.relationship_check, 'vendor');
+  assert.ok(flags.includes('not_a_customer'));
+});
+
+test('relationship: a vendor verdict with an invented quote is ignored', () => {
+  const { nlp, flags } = normalizeNlp(
+    { relationship_check: 'vendor', relationship_evidence: 'completely made up line about invoices', intent: 'price_check', quality_score: 6, intent_evidence: 'Ads are now on' },
+    { customerText: VENDOR_CHAT, fullText: VENDOR_CHAT }
+  );
+  assert.equal(nlp.relationship_check, 'customer');
+  assert.ok(flags.includes('relationship_unsupported'));
+});
+
+test('relationship: a missing or odd value means customer', () => {
+  assert.equal(normalizeNlp({ intent: 'browsing', quality_score: 3 }, { customerText: CHAT }).nlp.relationship_check, 'customer');
+  assert.equal(normalizeNlp({ relationship_check: 'bank', intent: 'browsing', quality_score: 3 }, { customerText: CHAT }).nlp.relationship_check, 'customer');
+});
+
+test('lead quality: a support customer is never hot, a closed sale stays out of the hot list', () => {
+  assert.equal(resolveLeadQuality({ leadType: 'business', leadState: 'engaged', aiQuality: 8, aiIntent: 'support' }), 'warm');
+  assert.equal(resolveLeadQuality({ leadType: 'vendor', leadState: 'engaged', aiQuality: 8, aiIntent: 'buying' }), null);
+  assert.equal(resolveFollowUpUrgency({ leadType: 'staff', awaiting: true }), null);
+});
+
+
+// ── Found in the VVStudios results ───────────────────────────────────────────
+test('silent chat: a customer verdict at 0.5-0.64 is NOT kept when the other person never wrote', () => {
+  const llm = { lead_type: 'customer', confidence: 0.6, reason: 'owner sent a number', evidence: 'Ads are now on' };
+  assert.equal(decideClassification({ llm, transcriptText: VENDOR_CHAT, otherPersonSilent: true }).leadType, 'unknown');
+  assert.equal(decideClassification({ llm, transcriptText: VENDOR_CHAT, otherPersonSilent: false }).leadType, 'business');
+});
+
+test('silent chat: a clear owner pitch at 0.7 is still a customer (prospect)', () => {
+  const llm = { lead_type: 'customer', confidence: 0.7, reason: 'owner pitches marketing services', evidence: 'Ads are now on' };
+  assert.equal(decideClassification({ llm, transcriptText: VENDOR_CHAT, otherPersonSilent: true }).leadType, 'business');
+});
+
+test('corrupted emoji text is replaced so a real reply is not read as spam', () => {
+  assert.equal(cleanCorruptedText('Okay ?f\uFFFD\uFFFD'), 'Okay [emoji]');
+  assert.equal(cleanCorruptedText('?f\uFFFD\uFFFD?f\uFFFD?'), '[emoji]');
+  assert.equal(cleanCorruptedText('Hello, normal text 👍'), 'Hello, normal text 👍');
+  assert.equal(cleanCorruptedText(null), '');
 });

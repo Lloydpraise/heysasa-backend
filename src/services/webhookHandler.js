@@ -132,7 +132,10 @@ function parseMessagePayload(rawMessage) {
 
     return {
         jid,
-        pushName: rawMessage?.pushName || rawMessage?.verifiedBizName || null,
+        // pushName on an outgoing message is the OWNER's own display name, not the
+        // contact's. Using it renamed customers to the business's own name
+        // ("Kitchen And All", "Lloyd Praise"). Only incoming messages carry the contact's name.
+        pushName: rawMessage?.key?.fromMe === true ? null : (rawMessage?.pushName || rawMessage?.verifiedBizName || null),
         isFromMe: rawMessage?.key?.fromMe === true,
         keyId: rawMessage?.key?.id || null,
         timestamp: rawMessage?.messageTimestamp,
@@ -321,7 +324,7 @@ export async function processHistorySync(payload, businessIdOverride) {
         let contactId = contactMap[jid];
         if (!contactId) {
             try {
-                const contact = await getOrCreateContact(businessId, jid, msg.pushName);
+                const contact = await getOrCreateContact(businessId, jid, msg?.key?.fromMe === true ? null : msg.pushName);
                 contactId = contact?.id || null;
                 if (contactId) contactMap[jid] = contactId;
             } catch (error) {

@@ -3,7 +3,11 @@ import dotenv from 'dotenv';
 import crypto from 'crypto';
 import {
     ANALYSIS_VERSION,
+    CLASSIFIER_VERSION,
     decideClassification,
+    findOpenerTemplates,
+    cleanCorruptedText,
+    normalizeText,
     normalizeNlp,
     resolveLeadQuality,
     resolveFollowUpUrgency,
@@ -603,7 +607,7 @@ const isInbound = (m) => m.direction === 'in' || m.direction === 'inbound';
 
 function messageText(m) {
     const raw = m.content?.text || (typeof m.content === 'string' ? m.content : '') || '';
-    return String(raw).replace(/\s+/g, ' ').trim();
+    return cleanCorruptedText(String(raw).replace(/\s+/g, ' ').trim());
 }
 
 // Day headers give the model a sense of time and gaps; long messages are trimmed.
@@ -727,6 +731,36 @@ async function callOpenAiJson({ model, system, user, maxTokens, promptId = null,
     throw lastError;
 }
 
+// The classifier version column must exist before anything else runs, otherwise
+// every contact would silently be treated as already classified.
+async function assertMigrationApplied() {
+    const { error } = await supabase.from('contacts').select('classifier_version').limit(1);
+    if (error) {
+        throw new FatalRunError(`Database is missing contacts.classifier_version (${error.message}). Run supabase/migrations/20261001000000_analyser_roles.sql first.`);
+    }
+}
+
+// A contact that is not a customer must leave no analysis behind: not on the
+// contact, the conversation, the enrichment rows or the sentiment history.
+async function clearAnalysisFor(contactId, businessId) {
+    const { error: enrichError } = await supabase.from('conversation_enrichment').delete().eq('contact_id', contactId);
+    if (enrichError) throw new Error(`conversation_enrichment cleanup failed: ${enrichError.message}`);
+    const { error: sentimentError } = await supabase.from('sentiment_snapshots').delete().eq('contact_id', contactId);
+    if (sentimentError) throw new Error(`sentiment_snapshots cleanup failed: ${sentimentError.message}`);
+    const { error: convError } = await supabase.from('conversations')
+        .update({ is_business_chat: false, lead_quality: null, customer_intent: null, psychology: null, vibe_check: null, context_summary: null })
+        .eq('contact_id', contactId)
+        .eq('business_id', businessId);
+    if (convError) throw new Error(`conversation cleanup failed: ${convError.message}`);
+}
+
+const NON_CUSTOMER_CONTACT_RESET = {
+    lead_quality: null, intent_score: null, follow_up_urgency: null,
+    intent: null, quality_score: null, intent_evidence: null,
+    nlp_enriched_at: null, analysis_version: null,
+    lead_summary: null, product_interests: [],
+};
+
 // ─── Step 0: Personal / Business Separation ───────────────────────────────────
 // Runs BEFORE any scoring. Nothing that is not a confirmed business chat is
 // scored, analysed, or used to build persona packs.
@@ -737,7 +771,7 @@ function classificationExcerpt(messages) {
 
 async function runClassificationPass() {
     log('Classify', 'Starting personal/business separation pass...');
-    const counts = { business: 0, personal: 0, junk: 0, unknown: 0, skipped: 0, errored: 0 };
+    const counts = { business: 0, personal: 0, junk: 0, vendor: 0, staff: 0, unknown: 0, skipped: 0, errored: 0 };
 
     let bizRow = null;
     try {
@@ -752,7 +786,7 @@ async function runClassificationPass() {
 
     let contactsQuery = applyContactScope(supabase
         .from('contacts')
-        .select('id, business_id, name, lead_type, lead_state, is_ad_lead, lead_type_source, lead_type_classified_at')
+        .select('id, business_id, name, lead_type, lead_state, is_ad_lead, lead_type_source, lead_type_classified_at, classifier_version')
         .order('id'));
     if (BUSINESS_ID) contactsQuery = contactsQuery.eq('business_id', BUSINESS_ID);
 
@@ -775,7 +809,8 @@ async function runClassificationPass() {
                 || (contact.lead_type === 'personal' && !contact.lead_type_source);
             if (protectedManual) { counts.skipped++; continue; }
 
-            const alreadyDone = !!contact.lead_type_classified_at;
+            // Only a classification made under the current classifier rules counts as done.
+            const alreadyDone = !!contact.lead_type_classified_at && contact.classifier_version === CLASSIFIER_VERSION;
             if (alreadyDone && !FORCE && contact.lead_type !== 'unknown') { counts.skipped++; continue; }
 
             const messages = await fetchContactMessages(contact.id);
@@ -797,7 +832,7 @@ async function runClassificationPass() {
                 const result = await callOpenAiJson({
                     model: CLASSIFY_MODEL,
                     system: AI_PROMPT_CATALOG.lead_classifier.prompt,
-                    user: `BUSINESS\n${businessContext}\n\nCHAT (CUSTOMER = the other person, BUSINESS = the account owner)\n${buildTranscript(excerpt, { maxChars: 300 })}`,
+                    user: `BUSINESS\n${businessContext}\n\nCHAT (BUSINESS = lines sent from the owner's number; CUSTOMER = the other person, whoever they turn out to be)\n${buildTranscript(excerpt, { maxChars: 300 })}`,
                     maxTokens: 300,
                     promptId: 'lead_classifier',
                     cacheKey: `classify:${BUSINESS_ID || contact.business_id}`
@@ -811,7 +846,8 @@ async function runClassificationPass() {
                 hasAdReferral: !!ad,
                 leadState: contact.lead_state,
                 llm,
-                transcriptText: messages.map(messageText).join('\n')
+                transcriptText: messages.map(messageText).join('\n'),
+                otherPersonSilent: !messages.some((m) => isInbound(m) && messageText(m))
             });
 
             const update = {
@@ -819,30 +855,31 @@ async function runClassificationPass() {
                 lead_type_source: decision.source,
                 lead_type_reason: decision.reason.slice(0, 300),
                 lead_type_confidence: decision.confidence,
-                lead_type_classified_at: new Date().toISOString()
+                lead_type_classified_at: new Date().toISOString(),
+                classifier_version: CLASSIFIER_VERSION
             };
-            // Anything that is not a confirmed business chat carries no lead scores.
-            if (decision.leadType !== 'business') {
-                Object.assign(update, {
-                    lead_quality: null, intent_score: null, follow_up_urgency: null,
-                    intent: null, quality_score: null, intent_evidence: null,
-                    nlp_enriched_at: null, analysis_version: null
-                });
-            }
+            // Anything that is not a confirmed customer chat carries no lead scores.
+            if (decision.leadType !== 'business') Object.assign(update, NON_CUSTOMER_CONTACT_RESET);
 
             const { error: contactError } = await supabase.from('contacts').update(update).eq('id', contact.id);
             if (contactError) throw new Error(`contact classification write failed: ${contactError.message}`);
 
-            const convUpdate = { is_business_chat: decision.isBusinessChat };
-            if (decision.leadType !== 'business') {
+            if (decision.leadType === 'business') {
+                const { error: convError } = await supabase.from('conversations')
+                    .update({ is_business_chat: true })
+                    .eq('contact_id', contact.id)
+                    .eq('business_id', contact.business_id);
+                if (convError) throw new Error(`conversation flag write failed: ${convError.message}`);
+            } else {
                 // Old analysis of a chat now known not to be a customer chat must not leak into anything downstream.
-                Object.assign(convUpdate, { lead_quality: null, customer_intent: null, psychology: null, vibe_check: null });
+                // 'unknown' keeps its flag as null so nothing treats it as confirmed either way.
+                await clearAnalysisFor(contact.id, contact.business_id);
+                if (decision.leadType === 'unknown') {
+                    const { error: unknownError } = await supabase.from('conversations')
+                        .update({ is_business_chat: null }).eq('contact_id', contact.id).eq('business_id', contact.business_id);
+                    if (unknownError) throw new Error(`conversation flag write failed: ${unknownError.message}`);
+                }
             }
-            const { error: convError } = await supabase.from('conversations')
-                .update(convUpdate)
-                .eq('contact_id', contact.id)
-                .eq('business_id', contact.business_id);
-            if (convError) throw new Error(`conversation flag write failed: ${convError.message}`);
 
             counts[decision.leadType] = (counts[decision.leadType] || 0) + 1;
             guard.ok();
@@ -859,7 +896,7 @@ async function runClassificationPass() {
         await sleepBetweenContacts();
     }
     logCacheStats('Classify');
-    log('Classify', `✓ business ${counts.business}, personal ${counts.personal}, junk ${counts.junk}, unknown ${counts.unknown} (needs review), skipped ${counts.skipped}, errored ${counts.errored}.`);
+    log('Classify', `✓ customers ${counts.business}, vendors ${counts.vendor}, staff ${counts.staff}, personal ${counts.personal}, junk ${counts.junk}, unknown ${counts.unknown} (needs review), skipped ${counts.skipped}, errored ${counts.errored}.`);
     return counts;
 }
 
@@ -962,18 +999,49 @@ async function runStructuralEnrichment() {
     return { enriched, errored };
 }
 
+// ─── Prefilled openers ────────────────────────────────────────────────────────
+// A click-to-chat button or ad pre-types the same first message for everyone who
+// taps it. Find those so every such chat is scored the same way.
+async function loadOpenerTemplates() {
+    const firstByContact = new Map();
+    let from = 0;
+    while (true) {
+        let query = supabase.from('messages')
+            .select('id, contact_id, content, created_at')
+            .eq('business_id', BUSINESS_ID)
+            .in('direction', ['in', 'inbound'])
+            .eq('type', 'text')
+            .order('created_at', { ascending: true })
+            .order('id', { ascending: true })
+            .range(from, from + PAGE_SIZE - 1);
+        const { data, error } = await query;
+        if (error) throw new Error(`opener scan failed: ${error.message}`);
+        if (!data || !data.length) break;
+        for (const row of data) {
+            if (!firstByContact.has(row.contact_id)) firstByContact.set(row.contact_id, messageText(row));
+        }
+        if (data.length < PAGE_SIZE) break;
+        from += PAGE_SIZE;
+    }
+    const templates = findOpenerTemplates([...firstByContact.values()]);
+    if (templates.size) {
+        for (const text of templates.values()) log('NLP', `Prefilled opener detected (scored consistently): "${text.slice(0, 90)}"`);
+    }
+    return templates;
+}
+
 // ─── Step 3: NLP AI Extraction ────────────────────────────────────────────────
 async function runNLPExtraction(transcript, businessContext, productsCatalog, structuralSignals, cacheKey = null) {
     const user = `BUSINESS CONTEXT:\n${businessContext}\n\nAVAILABLE BUSINESS PRODUCTS CATALOG:\n${productsCatalog || 'No products registered.'}\n\nSTRUCTURAL SIGNALS (ground truth):\n${JSON.stringify(structuralSignals, null, 2)}\n\nCONVERSATION:\n${transcript}`;
     try {
-        const result = await callOpenAiJson({ model: OPENAI_MODEL, system: AI_PROMPT_CATALOG.lead_nlp_extractor.prompt, user, maxTokens: 1100, promptId: 'lead_nlp_extractor', cacheKey });
+        const result = await callOpenAiJson({ model: OPENAI_MODEL, system: AI_PROMPT_CATALOG.lead_nlp_extractor.prompt, user, maxTokens: 1300, promptId: 'lead_nlp_extractor', cacheKey });
         return { nlp: result.json, promptTokens: result.promptTokens, completionTokens: result.completionTokens };
     } catch (e) {
         throw new Error(`NLP extraction failed: ${e.message}`);
     }
 }
 
-async function applyNLPResults(businessId, contactId, conversationId, rawNlp, callRunId, promptTokens, completionTokens, signals, customerText) {
+async function applyNLPResults(businessId, contactId, conversationId, rawNlp, callRunId, promptTokens, completionTokens, signals, text) {
     if (!rawNlp) return { flags: [] };
 
     await logAiUsage(businessId, callRunId, promptTokens, completionTokens);
@@ -991,7 +1059,32 @@ async function applyNLPResults(businessId, contactId, conversationId, rawNlp, ca
         return { flags: ['skipped_not_business'] };
     }
 
-    const { nlp, flags } = normalizeNlp(rawNlp, { customerText });
+    const { nlp, flags } = normalizeNlp(rawNlp, {
+        customerText: text.customerText,
+        fullText: text.fullText,
+        customerMessages: text.customerMessages,
+        openerTemplates: text.openerTemplates,
+    });
+
+    // Second gate: the analysis can see the whole chat and the product catalog.
+    // If it quotes a line proving the owner is the buyer (or the other person is
+    // staff / personal), the contact leaves the pipeline instead of being scored.
+    if (nlp.relationship_check !== 'customer') {
+        const demotedTo = nlp.relationship_check;
+        const { error: demoteError } = await supabase.from('contacts').update({
+            lead_type: demotedTo,
+            lead_type_source: 'nlp',
+            lead_type_reason: `Analysis found the other person is ${demotedTo}: "${nlp.relationship_evidence}"`.slice(0, 300),
+            lead_type_confidence: 0.75,
+            lead_type_classified_at: new Date().toISOString(),
+            classifier_version: CLASSIFIER_VERSION,
+            ...NON_CUSTOMER_CONTACT_RESET,
+        }).eq('id', contactId);
+        if (demoteError) throw new Error(`contact demotion failed: ${demoteError.message}`);
+        await clearAnalysisFor(contactId, businessId);
+        warn('NLP', `Contact ${contactId} moved out of the pipeline as ${demotedTo}: ${nlp.relationship_evidence}`);
+        return { flags: [...flags, 'reclassified_out_of_pipeline'] };
+    }
 
     const leadQuality = resolveLeadQuality({
         leadType: 'business',
@@ -1094,9 +1187,16 @@ async function runNLPPass() {
 
     if (!conversations.length) {
         warn('NLP', 'No business conversations found.');
-        return { enrichedCount, errored, skipped };
+        return { enrichedCount, errored, skipped, flagCounts };
     }
     log('NLP', `${conversations.length} business conversations found.`);
+
+    let openerTemplates = new Map();
+    try {
+        openerTemplates = await loadOpenerTemplates();
+    } catch (e) {
+        warn('NLP', `Opener scan skipped, prefilled openers will not be normalised this run: ${e.message}`);
+    }
 
     const businessCache = new Map();
     const productsCache = new Map();
@@ -1161,7 +1261,15 @@ async function runNLPPass() {
 
             const window = messages.slice(-MAX_TRANSCRIPT_MSGS);
             const transcript = buildTranscript(window);
-            const customerText = customerTextOf(window);
+            const customerMessages = window.filter(isInbound).map(messageText).filter(Boolean);
+            const text = {
+                customerText: customerTextOf(window),
+                fullText: window.map(messageText).filter(Boolean).join('\n'),
+                customerMessages,
+                openerTemplates,
+            };
+            const openersSeen = [...new Set(customerMessages.filter(t => openerTemplates.has(normalizeText(t))))];
+            if (openersSeen.length) structuralSignals.prefilled_opener_texts = openersSeen;
             const callRunId = crypto.randomUUID();
             log('NLP', `Analyzing business ${businessId} -> contact ${conv.contact_id} -> conversation ${conv.id} (${messages.length} messages)...`);
 
@@ -1176,7 +1284,7 @@ async function runNLPPass() {
             const applied = await applyNLPResults(
                 businessId, conv.contact_id, conv.id, result.nlp,
                 callRunId, result.promptTokens, result.completionTokens,
-                structuralSignals, customerText
+                structuralSignals, text
             );
             for (const f of applied.flags) flagCounts[f] = (flagCounts[f] || 0) + 1;
             enrichedCount++;
@@ -1193,7 +1301,7 @@ async function runNLPPass() {
     const flagSummary = Object.entries(flagCounts).map(([k, v]) => `${k}=${v}`).join(', ') || 'none';
     logCacheStats('NLP');
     log('NLP', `✓ ${enrichedCount} enriched, ${errored} errored, ${skipped} skipped. Guard flags: ${flagSummary}.`);
-    return { enrichedCount, errored, skipped };
+    return { enrichedCount, errored, skipped, flagCounts };
 }
 
 // ─── Step 4: Recompute Ad Attribution Rollups ──────────────────────────────────
@@ -1259,6 +1367,7 @@ async function main() {
     console.log('--------------------------------------------------');
 
     await resolveActiveInstance();
+    await assertMigrationApplied();
     await startRun(REQUESTED_CONTACT_IDS.length ? 'contact_pass' : 'full_pass');
 
     // Order matters: separate personal from business FIRST so nothing that is
@@ -1270,12 +1379,14 @@ async function main() {
     await recomputeAdAttributionRollups();
 
     const totalErrors = nlpResult.errored + classifyResult.errored + structuralResult.errored;
-    const attempted = classifyResult.business + classifyResult.personal + classifyResult.junk + classifyResult.unknown
+    const attempted = classifyResult.business + classifyResult.personal + classifyResult.junk
+        + classifyResult.vendor + classifyResult.staff + classifyResult.unknown
         + classifyResult.errored + structuralResult.enriched + structuralResult.errored
         + nlpResult.enrichedCount + nlpResult.errored;
     const summary = {
-        business: classifyResult.business, personal: classifyResult.personal,
-        junk: classifyResult.junk, needs_review: classifyResult.unknown,
+        business: classifyResult.business, vendor: classifyResult.vendor, staff: classifyResult.staff,
+        personal: classifyResult.personal, junk: classifyResult.junk, needs_review: classifyResult.unknown,
+        analysis_flags: nlpResult.flagCounts,
         analysed: nlpResult.enrichedCount, analysis_errors: nlpResult.errored,
         classify_errors: classifyResult.errored, structural_errors: structuralResult.errored,
         total_errors: totalErrors,
@@ -1297,9 +1408,9 @@ async function main() {
     });
 
     if (summary.healthy) {
-        log('Summary', `✅ ANALYSIS COMPLETE for ${BUSINESS_ID}: ${summary.business} business, ${summary.personal} personal, ${summary.junk} junk, ${summary.needs_review} need review; ${summary.analysed} analysed; ${totalErrors} errors.`);
+        log('Summary', `✅ ANALYSIS COMPLETE for ${BUSINESS_ID}: ${summary.business} customers, ${summary.vendor} vendors, ${summary.staff} staff, ${summary.personal} personal, ${summary.junk} junk, ${summary.needs_review} need review; ${summary.analysed} analysed; ${totalErrors} errors.`);
     } else {
-        warn('Summary', `⚠️ ANALYSIS FINISHED WITH TOO MANY ERRORS for ${BUSINESS_ID}: ${totalErrors} item errors (${summary.business} business, ${summary.personal} personal, ${summary.analysed} analysed). Not treated as complete by the persona pack. See enrichment_errors, then re-run to retry the failed chats.`);
+        warn('Summary', `⚠️ ANALYSIS FINISHED WITH TOO MANY ERRORS for ${BUSINESS_ID}: ${totalErrors} item errors (${summary.business} customers, ${summary.vendor} vendors, ${summary.staff} staff, ${summary.personal} personal, ${summary.analysed} analysed). Not treated as complete by the persona pack. See enrichment_errors, then re-run to retry the failed chats.`);
     }
     console.log('--------------------------------------------------');
     console.log('✅ Done! Check enrichment_errors table for any per-item failures.');

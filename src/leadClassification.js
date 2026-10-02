@@ -54,13 +54,43 @@ export function resolveLeadClassification(nlp = {}, existingLeadType = null) {
 
 // Bump when the analysis prompt/rules change. Contacts analysed under an older
 // version are re-analysed on the next run and their old scores are ignored.
-export const ANALYSIS_VERSION = 2;
+export const ANALYSIS_VERSION = 3;
 
-// Below this the classifier's answer is not trusted and the contact stays
-// 'unknown' (excluded from scoring) instead of being guessed into a bucket.
+// Bump when the classifier prompt or its rules change. Contacts classified under
+// an older version are re-classified on the next run (manual labels never are).
+export const CLASSIFIER_VERSION = 2;
+
+// Below this a personal / vendor / staff / junk verdict is not trusted and the
+// contact stays 'unknown' (excluded from scoring) instead of being guessed.
 export const CONFIDENCE_FLOOR = 0.65;
 
-const CLASS_TYPES = ['business', 'personal', 'junk'];
+// A customer verdict is cheap to be wrong about: the analysis still demands
+// verbatim evidence and caps quality without it, so a weak customer guess ends
+// up cold instead of being silently dropped. Real one-line enquiries survive.
+export const CUSTOMER_CONFIDENCE_FLOOR = 0.5;
+
+// When the other person never wrote a word (only the owner's side was captured,
+// or they never replied), a customer verdict rests on the owner's lines alone,
+// so it needs the same bar as an exclusion. This keeps "4900" or "Alright" from
+// becoming a scored customer.
+export const SILENT_CHAT_CONFIDENCE_FLOOR = 0.65;
+
+// The classifier answers with 'customer'; the pipeline stores that as 'business'.
+// vendor = the owner is the buyer / the other person serves or chases the owner.
+// staff = employees, people being hired, job applicants.
+const LABEL_TO_TYPE = {
+  customer: 'business',
+  business: 'business',
+  vendor: 'vendor',
+  staff: 'staff',
+  personal: 'personal',
+  junk: 'junk',
+};
+export const NON_PIPELINE_TYPES = ['personal', 'junk', 'vendor', 'staff'];
+const NON_CUSTOMER_ROLES = ['vendor', 'staff', 'personal'];
+const STAGES = ['Awareness', 'Consideration', 'Product interest', 'Negotiation', 'Stalled', 'Closed', 'Ghosted'];
+const STAGE_BY_KEY = Object.fromEntries(STAGES.map((st) => [st.toLowerCase(), st]));
+STAGE_BY_KEY.closing = 'Negotiation'; // a close in progress is not a close
 const INTENTS = ['buying', 'browsing', 'support', 'price_check', 'referral', 'unknown'];
 const URGENCIES = ['hot', 'warm', 'cold'];
 const COMMERCIAL_INTENTS = ['buying', 'price_check'];
@@ -106,6 +136,7 @@ export function decideClassification({
   leadState = null,
   llm = null,
   transcriptText = '',
+  otherPersonSilent = false,
 } = {}) {
   if (hasAdReferral || isAdLead) {
     return classification('business', 'ad', 1, 'Arrived through a click-to-WhatsApp ad');
@@ -115,12 +146,12 @@ export function decideClassification({
   }
   if (!llm) return classification('unknown', 'llm', 0, 'No classifier output', true);
 
-  const type = lower(llm.lead_type);
+  const type = LABEL_TO_TYPE[lower(llm.lead_type)];
   let confidence = Number(llm.confidence);
   confidence = Number.isFinite(confidence) ? clamp(confidence, 0, 1) : 0;
   const reason = llm.reason || '';
 
-  if (!CLASS_TYPES.includes(type)) {
+  if (!type) {
     return classification('unknown', 'llm', 0, `Unrecognised label "${llm.lead_type}"`, true);
   }
 
@@ -129,15 +160,63 @@ export function decideClassification({
   if (!llm.evidence) confidence = Math.max(0, confidence - 0.1);
   else if (!evidenceSupported(llm.evidence, transcriptText)) confidence = Math.max(0, confidence - 0.2);
 
-  if (confidence < CONFIDENCE_FLOOR) {
+  confidence = Math.round(confidence * 100) / 100;
+
+  const floor = type === 'business' && !otherPersonSilent ? CUSTOMER_CONFIDENCE_FLOOR : CONFIDENCE_FLOOR;
+  if (confidence < floor) {
     return classification('unknown', 'llm', confidence, `Low confidence (${type}): ${reason}`, true);
   }
   return classification(type, 'llm', confidence, reason);
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Prefilled openers. A click-to-chat button or ad pre-types the same first
+// message for every person who taps it ("I have A project I would like you to
+// work on. Can I get more info?"). It shows they clicked, not what they want, so
+// it must not be scored differently from one chat to the next.
+// ─────────────────────────────────────────────────────────────────────────────
+// Some stored messages lost their emoji to an encoding fault and contain U+FFFD
+// garbage ("Okay ?f��"). The model reads that as spam. Replace each garbled token
+// with [emoji] so a real reply is not judged as junk.
+export function cleanCorruptedText(text) {
+  return String(text || '').replace(/\S*\uFFFD+\S*/g, '[emoji]');
+}
+
+export function normalizeText(text) {
+  return tokens(text).join(' ');
+}
+
+// firstTexts: the first inbound message text of each contact.
+// Returns Map(normalized text -> original text) for texts that many different
+// contacts opened with, word for word.
+export function findOpenerTemplates(firstTexts, { minCount = 5, minTokens = 4 } = {}) {
+  const counts = new Map();
+  for (const raw of firstTexts || []) {
+    const key = normalizeText(raw);
+    if (!key || key.split(' ').length < minTokens) continue;
+    const entry = counts.get(key) || { count: 0, sample: String(raw).trim() };
+    entry.count += 1;
+    counts.set(key, entry);
+  }
+  const templates = new Map();
+  for (const [key, entry] of counts) if (entry.count >= minCount) templates.set(key, entry.sample);
+  return templates;
+}
+
+// True when everything the customer typed is a prefilled opener.
+export function isOpenerOnly(customerTexts, templates) {
+  if (!templates || !templates.size) return false;
+  const texts = (customerTexts || []).map((t) => String(t || '').trim()).filter(Boolean);
+  return texts.length > 0 && texts.every((t) => templates.has(normalizeText(t)));
+}
+
 // Cleans the model's analysis and enforces internal consistency, so a claim
 // with nothing behind it cannot inflate quality or urgency.
-export function normalizeNlp(raw, { customerText = '' } = {}) {
+//   customerText     everything the customer said (evidence must come from here)
+//   fullText         both sides of the chat (relationship evidence may come from here)
+//   customerMessages the customer's individual message texts
+//   openerTemplates  Map from findOpenerTemplates()
+export function normalizeNlp(raw, { customerText = '', fullText = '', customerMessages = [], openerTemplates = null } = {}) {
   const n = { ...(raw || {}) };
   const flags = [];
 
@@ -171,6 +250,43 @@ export function normalizeNlp(raw, { customerText = '' } = {}) {
     flags.push('quality_capped_unknown_intent');
     quality = 3;
   }
+
+  // Prefilled opener handling. If that is all the customer said, every such chat
+  // gets the same answer: browsing, quality 3. If they typed more, the model's
+  // judgement stands, but a quote that is just the opener is flagged.
+  if (isOpenerOnly(customerMessages, openerTemplates)) {
+    flags.push('opener_only');
+    n.intent = 'browsing';
+    quality = 3;
+    n.intent_evidence = String(customerMessages.find((t) => String(t || '').trim())).trim().slice(0, 240);
+  } else if (n.intent_evidence && openerTemplates && openerTemplates.has(normalizeText(n.intent_evidence))) {
+    flags.push('evidence_is_opener');
+  }
+
+  // Stage is a closed list. "Closing" (a stray value the model used to produce)
+  // means a close in progress, so it is Negotiation, not Closed.
+  const stageKey = lower(n.conv_stage);
+  if (stageKey === 'closing') flags.push('stage_closing_remapped');
+  n.conv_stage = STAGE_BY_KEY[stageKey] || null;
+  // Support means the customer already ordered or paid: that sale is done.
+  if (n.intent === 'support' && ['Awareness', 'Consideration', 'Product interest', 'Negotiation'].includes(n.conv_stage)) {
+    flags.push('support_stage_closed');
+    n.conv_stage = 'Closed';
+  }
+
+  // Relationship check: the model may only demote a chat if it quotes the chat.
+  let relationship = lower(n.relationship_check);
+  if (relationship !== 'customer' && !NON_CUSTOMER_ROLES.includes(relationship)) relationship = 'customer';
+  if (relationship !== 'customer') {
+    if (evidenceSupported(n.relationship_evidence, fullText || customerText)) {
+      flags.push('not_a_customer');
+    } else {
+      flags.push('relationship_unsupported');
+      relationship = 'customer';
+    }
+  }
+  n.relationship_check = relationship;
+  n.relationship_evidence = relationship === 'customer' ? null : String(n.relationship_evidence).trim().slice(0, 240);
 
   n.quality_score = quality;
   return { nlp: n, flags };
