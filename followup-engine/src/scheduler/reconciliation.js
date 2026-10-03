@@ -3,6 +3,7 @@ import { calculateSendTime, getZonedParts } from '../lib/timing.js'
 import { sendPlatformMessage } from '../sender-baileys/evolutionSender.js'
 import { DEFAULT_QUIET_START, DEFAULT_QUIET_END, DEFAULT_TIMEZONE } from '../config.js'
 import { log } from '../lib/log.js'
+import { contactDisplayName } from '../lib/sendTarget.js'
 
 const BATCH_SIZE = 50
 
@@ -76,7 +77,7 @@ export async function runPostSendReconciliation(supabase) {
         const lastIn = inbound.at(-1)
         const threshold = business.hot_lead_intent_threshold ?? 8
         if ((lastIn?.intent_level ?? 0) >= threshold) {
-          const alertMsg = `🔥 Hot lead alert: ${contact.name ?? contact.phone} is showing strong buying intent. Check your HeySasa dashboard.`
+          const alertMsg = `🔥 Hot lead alert: ${contactDisplayName(contact)} is showing strong buying intent. Check your HeySasa dashboard.`
           await sendPlatformMessage(business.owner_phone, alertMsg).catch(() => {})
         }
       }

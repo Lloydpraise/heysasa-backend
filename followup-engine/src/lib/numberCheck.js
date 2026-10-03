@@ -1,5 +1,5 @@
 import { EVOLUTION_URL, EVOLUTION_KEY } from '../config.js'
-import { normalizePhone } from '../sender-baileys/evolutionSender.js'
+import { resolveSendTarget } from './sendTarget.js'
 import { log } from './log.js'
 
 // Asks WhatsApp whether a number has an account, BEFORE we try to message it.
@@ -72,6 +72,10 @@ async function askWhatsApp(instanceName, number) {
 //   not_on_whatsapp  -> do NOT send; the contact has been marked
 //   wait             -> not this one's turn for a lookup yet; leave it in the queue, try next poll
 export async function ensureNumberOnWhatsApp(supabase, { instanceName, contact, businessId }) {
+  // Defensive: a @lid contact has no number to look up (and already messaged us).
+  const target = resolveSendTarget(contact, contact.country_code)
+  if (target?.kind === 'lid') return { status: 'ok' }
+
   const age = contact.wa_checked_at ? Date.now() - new Date(contact.wa_checked_at).getTime() : Infinity
   if (contact.wa_exists === false && age < RECHECK_FALSE_MS) return { status: 'not_on_whatsapp' }
   if (contact.wa_exists === true && age < RECHECK_TRUE_MS) return { status: 'ok' }
@@ -82,7 +86,7 @@ export async function ensureNumberOnWhatsApp(supabase, { instanceName, contact, 
   state.set(businessId, biz)
   if (now < biz.nextAt || biz.stamps.length >= MAX_LOOKUPS_PER_HOUR) return { status: 'wait' }
 
-  const number = normalizePhone(contact.phone, contact.country_code)
+  const number = target?.number
   if (!number) return { status: 'not_on_whatsapp' }
 
   biz.stamps.push(now)

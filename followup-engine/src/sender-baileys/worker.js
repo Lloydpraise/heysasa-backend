@@ -1,6 +1,7 @@
 import { supabase } from '../supabaseClient.js'
 import { getBusiness, getContact } from '../lib/db.js'
 import { sendContentViaEvolution } from './evolutionSender.js'
+import { resolveSendTarget } from '../lib/sendTarget.js'
 import { checkAntiban, recordSend, primeAntiban } from './antiban.js'
 import { effectiveDailyCap, sentTodayCount, noteSent, logWarmupHold } from '../lib/warmup.js'
 import { recordSuccessfulSend, recordFailedDispatch } from './postSend.js'
@@ -75,9 +76,19 @@ export async function processBaileysBatch() {
         await logSendEvent(item.business_id, { queueId: item.id, contactId: item.contact_id, eventType: 'business_not_found' })
         continue
       }
-      if (!contact?.phone) {
+      if (!contact) {
         await recordFailedDispatch(supabase, item, 'contact_or_phone_not_found')
         await logSendEvent(item.business_id, { queueId: item.id, contactId: item.contact_id, eventType: 'contact_or_phone_not_found' })
+        continue
+      }
+
+      // Where does this message go? A phone number when we have one, otherwise the
+      // contact's WhatsApp ID (@lid) - customers whose number WhatsApp hides are
+      // still fully reachable that way. See lib/sendTarget.js.
+      const target = resolveSendTarget(contact, contact.country_code)
+      if (!target) {
+        await recordFailedDispatch(supabase, item, 'no_send_target')
+        await logSendEvent(item.business_id, { queueId: item.id, contactId: item.contact_id, eventType: 'no_send_target' })
         continue
       }
 
@@ -135,9 +146,16 @@ export async function processBaileysBatch() {
       // (see lib/numberCheck.js). Auto campaigns and AI follow-ups are never looked up, because
       // those people already messaged us. A number known not to be on WhatsApp is skipped
       // (not failed, not retried) and its campaign spot is closed.
-      const numberCheck = (await needsNumberLookup(supabase, item))
-        ? await ensureNumberOnWhatsApp(supabase, { instanceName: activeSession.instance_name, contact, businessId: item.business_id })
-        : (contact.wa_exists === false ? { status: 'not_on_whatsapp' } : { status: 'ok' })
+      //
+      // A @lid target is never looked up and never gated on wa_exists: that person
+      // already messaged us, so they are on WhatsApp by definition, and "is this
+      // number on WhatsApp" is meaningless for an ID that is not a number.
+      const isLidTarget = target.kind === 'lid'
+      const numberCheck = isLidTarget
+        ? { status: 'ok' }
+        : (await needsNumberLookup(supabase, item))
+          ? await ensureNumberOnWhatsApp(supabase, { instanceName: activeSession.instance_name, contact, businessId: item.business_id })
+          : (contact.wa_exists === false ? { status: 'not_on_whatsapp' } : { status: 'ok' })
       if (numberCheck.status === 'wait') continue
       if (numberCheck.status === 'not_on_whatsapp') {
         await supabase.from('follow_up_queue').update({
@@ -168,7 +186,7 @@ export async function processBaileysBatch() {
       if (!claimedItem) continue
 
       const sendStartedAt = Date.now()
-      const result = await sendContentViaEvolution(activeSession.instance_name, contact.phone, {
+      const result = await sendContentViaEvolution(activeSession.instance_name, target.number, {
         text: item.final_message,
         media: item.media
       }, contact.country_code)
@@ -183,10 +201,10 @@ export async function processBaileysBatch() {
           eventType: 'failed',
           reason: result.error ?? 'send_failed'
         })
-        log('warn', 'sender', 'sender.send_failed', `Send failed to ${contact.phone}: ${result.error ?? 'send_failed'}`, {
+        log('warn', 'sender', 'sender.send_failed', `Send failed to ${target.label}: ${result.error ?? 'send_failed'}`, {
           business_id: item.business_id, contact_id: item.contact_id, entity_id: item.id,
           duration_ms: sendDurationMs,
-          details: { instance: activeSession.instance_name, campaignId: item.campaign_id ?? null, error: result.error ?? 'send_failed' }
+          details: { instance: activeSession.instance_name, campaignId: item.campaign_id ?? null, targetKind: target.kind, error: result.error ?? 'send_failed' }
         })
         continue
       }
@@ -200,10 +218,10 @@ export async function processBaileysBatch() {
         finalMessage: item.final_message,
         whatsappMessageId: result.messageId
       })
-      log('ok', 'sender', 'sender.sent', `Sent to ${contact.phone}`, {
+      log('ok', 'sender', 'sender.sent', `Sent to ${target.label}`, {
         business_id: item.business_id, contact_id: item.contact_id, entity_id: item.id,
         duration_ms: sendDurationMs,
-        details: { instance: activeSession.instance_name, campaignId: item.campaign_id ?? null, whatsappMessageId: result.messageId }
+        details: { instance: activeSession.instance_name, campaignId: item.campaign_id ?? null, targetKind: target.kind, whatsappMessageId: result.messageId }
       })
       dispatched++
     } catch (e) {

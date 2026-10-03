@@ -10,6 +10,7 @@ const HOUR = 60 * MIN
 const POLICY = {
   not_on_whatsapp: { permanent: true,  retryDelays: [],                        reportAs: 'warn'  },
   invalid_number:  { permanent: true,  retryDelays: [],                        reportAs: 'warn'  },
+  no_send_target:  { permanent: true,  retryDelays: [],                        reportAs: 'warn'  },
   timeout:         { permanent: false, retryDelays: [5 * MIN, 30 * MIN, 2 * HOUR], reportAs: 'error' },
   server_error:    { permanent: false, retryDelays: [5 * MIN, 30 * MIN, 2 * HOUR], reportAs: 'error' },
   rate_limited:    { permanent: false, retryDelays: [HOUR, 3 * HOUR, 6 * HOUR],    reportAs: 'error' },
@@ -24,6 +25,7 @@ export function classifyFailure(errorMessage) {
 
   if (msg.includes('"exists":false') || (msg.includes('exists') && msg.includes('false')) ||
       msg.includes('not on whatsapp') || msg.includes('not registered') || msg.includes('number_not_on_whatsapp')) return 'not_on_whatsapp'
+  if (msg.includes('no_send_target')) return 'no_send_target'
   if (msg.includes('invalid_phone') || msg.includes('invalid number')) return 'invalid_number'
 
   const status = parseInt(raw.match(/^(\d{3}):/)?.[1] ?? '', 10)

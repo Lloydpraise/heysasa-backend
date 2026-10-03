@@ -7,7 +7,9 @@
 
 function firstName(contact) {
   const name = (contact?.name ?? '').trim()
-  if (!name) return 'there'
+  // A name that is just a number (or a placeholder) is not a name: "Hi 2547123..."
+  // would read as spam. Fall back to the neutral greeting.
+  if (!name || /^\+?[\d\s\-().]+$/.test(name) || /^(unknown|você|voce)$/i.test(name)) return 'there'
   return name.split(/\s+/)[0]
 }
 

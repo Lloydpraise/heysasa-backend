@@ -12,6 +12,7 @@ import { normalizeOutboundMedia } from '../lib/media.js'
 import { resolveMediaMergeFields, resolveMergeFields } from '../lib/mergeFields.js'
 import { log } from '../lib/log.js'
 import { effectiveDailyCap } from '../lib/warmup.js'
+import { resolveSendTarget } from '../lib/sendTarget.js'
 
 const STALL_RETRY_MS = 5 * 60_000
 // When the AI call itself failed (rate limit, outage, out of credits) the
@@ -112,14 +113,18 @@ export async function runWorker(supabase, queueItemId) {
   // won't fix itself by waiting.
   if (!contact) return skipItem('contact_not_found')
   if (!business) return skipItem('business_not_found')
-  if (!contact.phone) return skipItem('no_phone')
+  // Reachable means "has a phone number OR a WhatsApp ID (@lid)". Customers whose
+  // number WhatsApp hides have only the ID, and the sender can message that.
+  const sendTarget = resolveSendTarget(contact, contact.country_code)
+  if (!sendTarget) return skipItem('no_send_target')
 
   // Opt-out is the only permanent stop here. There's no separate
   // opt-in gate anymore — leads are treated as opted in by default;
   // opting a lead out happens explicitly from the lead detail panel
   // and is what sets do_not_contact.
   if (contact.do_not_contact) return skipItem('do_not_contact')
-  if (contact.wa_exists === false) return skipItem('number_not_on_whatsapp')
+  // wa_exists describes a phone number; it says nothing about a @lid ID.
+  if (contact.wa_exists === false && sendTarget.kind !== 'lid') return skipItem('number_not_on_whatsapp')
 
   // Business-level pause: this is now an active blocker (campaigns for
   // this business get paused at the scheduler level too — see

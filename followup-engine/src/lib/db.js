@@ -20,7 +20,7 @@ export async function getBusiness(s, businessId) {
 // ── Contact ───────────────────────────────────────────────────
 export async function getContact(s, contactId) {
   const { data } = await s.from('contacts').select(`
-    id, name, phone, country_code, business_id, do_not_contact, follow_up_opted_in,
+    id, name, phone, social_id, country_code, business_id, do_not_contact, follow_up_opted_in,
     lead_state, optimal_contact_hour, follow_up_sequence_id,
     current_sequence_step, follow_up_count, consent_message_sent_at,
     created_at, last_seen, daily_followup_count, daily_followup_reset_at,

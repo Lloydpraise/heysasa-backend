@@ -8,8 +8,24 @@ export function isGroupOrBroadcast(jid) {
     );
 }
 
+// WhatsApp addresses a chat either by phone number (<digits>@s.whatsapp.net) or by
+// an anonymous "LID" (<digits>@lid) when it hides the number - always for people
+// who adopt a username. A LID is a routable address, NOT a phone number.
+export function isLidJid(jid) {
+    return typeof jid === 'string' && /^\d+@lid$/.test(jid.trim());
+}
+
+export function isPhoneJid(jid) {
+    return typeof jid === 'string' && /^\d+@s\.whatsapp\.net$/.test(jid.trim());
+}
+
 export function extractPhone(jid) {
     if (!jid) return null;
+    // Never turn a LID into a phone number: its digits are an internal ID, and
+    // saving them as `phone` made the sender try to message a number that does
+    // not exist. A LID contact keeps the ID in social_id and has phone = null
+    // until a real number is learned.
+    if (isLidJid(jid)) return null;
     const raw = jid.split('@')[0].replace(/\D/g, '');
     if (!raw || raw.length < 7) return null;
     return `+${raw}`;
@@ -19,6 +35,34 @@ export function extractMessageJid(msg) {
     const jid = msg?.key?.remoteJid;
     if (jid?.endsWith('@lid') && msg?.key?.remoteJidAlt) return msg.key.remoteJidAlt;
     return jid;
+}
+
+// Both identities of a chat when WhatsApp gave us both. `jid` is what
+// extractMessageJid has always returned; `altJid` is the other one (the LID when
+// jid is the phone JID, or vice versa), so callers can link the two.
+export function extractMessageJids(msg) {
+    const remote = msg?.key?.remoteJid || null;
+    const alt = msg?.key?.remoteJidAlt || null;
+    const jid = extractMessageJid(msg);
+    const altJid = [remote, alt].find(j => j && j !== jid) || null;
+    return { jid, altJid };
+}
+
+// A display name worth storing. Rejects what is not really a name: empty,
+// "Unknown", purely numeric strings, WhatsApp's own "You" label in Portuguese
+// ("Você"), and the business owner's own name (which Evolution reports as the
+// pushName on outgoing events).
+const PLACEHOLDER_NAMES = new Set(['unknown', 'você', 'voce']);
+export function isUsableContactName(name, ownerNames = []) {
+    const n = String(name ?? '').trim();
+    if (!n) return false;
+    const lower = n.toLowerCase();
+    if (PLACEHOLDER_NAMES.has(lower)) return false;
+    if (/^\+?[\d\s\-().]+$/.test(n)) return false;
+    for (const owner of ownerNames) {
+        if (owner && lower === String(owner).trim().toLowerCase()) return false;
+    }
+    return true;
 }
 
 function unwrapMessage(msg) {

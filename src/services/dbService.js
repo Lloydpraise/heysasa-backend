@@ -1,5 +1,5 @@
 import { supabase } from '../config/supabase.js';
-import { extractPhone } from './dataCleaner.js';
+import { extractPhone, isLidJid, isPhoneJid, isUsableContactName } from './dataCleaner.js';
 import { logEvent } from './debugConsole.js';
 
 // `area` groups related failures in the console (default 'db' for
@@ -21,36 +21,156 @@ function logDbFailure(step, context, error, area = 'db') {
     });
 }
 
-export async function getOrCreateContact(businessId, jid, pushName) {
-    const phone = extractPhone(jid);
+const CONTACT_COLS = 'id, lead_state, name, is_ad_lead, lead_type, original_ad_id, ad_attribution_id';
+
+// The business's own name(s), so we never save them as a customer's name.
+const OWNER_NAMES_TTL_MS = 10 * 60 * 1000;
+const ownerNamesCache = new Map();
+async function getOwnerNames(businessId) {
+    const hit = ownerNamesCache.get(businessId);
+    if (hit && Date.now() - hit.at < OWNER_NAMES_TTL_MS) return hit.names;
+    let names = [];
     try {
+        const { data } = await supabase.from('businesses').select('name').eq('business_id', businessId).maybeSingle();
+        if (data?.name) names = [data.name];
+    } catch { /* best effort - the name guard just gets weaker, ingestion carries on */ }
+    ownerNamesCache.set(businessId, { at: Date.now(), names });
+    return names;
+}
+
+const lidDigits = (jid) => (isLidJid(jid) ? jid.split('@')[0] : '');
+
+// Finds the contact a chat belongs to under EITHER of its identities (phone JID or
+// LID), so one person never becomes two contacts when WhatsApp alternates between
+// them. Falls back to matching a known phone number on a LID contact.
+async function findExistingContact(businessId, ids, phone) {
+    const { data: bySocial, error } = await supabase
+        .from('contacts')
+        .select(`${CONTACT_COLS}, social_id, phone`)
+        .eq('business_id', businessId)
+        .eq('social_platform', 'whatsapp')
+        .in('social_id', ids)
+        .limit(5);
+    if (error) throw error;
+    if (bySocial?.length) return bySocial.find(r => r.social_id === ids[0]) || bySocial[0];
+
+    if (phone) {
+        const { data: byPhone, error: phoneError } = await supabase
+            .from('contacts')
+            .select(`${CONTACT_COLS}, social_id, phone`)
+            .eq('business_id', businessId)
+            .eq('social_platform', 'whatsapp')
+            .like('social_id', '%@lid')
+            .eq('phone', phone)
+            .limit(2);
+        if (phoneError) throw phoneError;
+        if (byPhone?.length === 1) return byPhone[0]; // ambiguous matches are never guessed
+    }
+    return null;
+}
+
+// jid    - the chat's primary identity (what extractMessageJid returned)
+// altJid - the chat's other identity when WhatsApp supplied both (LID <-> phone JID)
+export async function getOrCreateContact(businessId, jid, pushName, altJid = null) {
+    const ids = [...new Set([jid, altJid].filter(Boolean))];
+    const lidJid = ids.find(isLidJid) || null;
+    const pnJid = ids.find(isPhoneJid) || null;
+    // phone is ONLY ever a real number: from a phone JID, never from a LID.
+    const phone = pnJid ? extractPhone(pnJid) : (lidJid ? null : extractPhone(jid));
+    try {
+        const ownerNames = await getOwnerNames(businessId);
+        const name = isUsableContactName(pushName, ownerNames) ? String(pushName).trim() : null;
+        const now = new Date().toISOString();
+
+        const existing = await findExistingContact(businessId, ids, phone);
+        if (existing) {
+            const patch = { last_seen: now };
+            if (name) patch.name = name;
+            // Fill the phone in when we learn it - and replace the old bug where a
+            // LID's digits were stored as the phone. Never overwrite a real number.
+            const phoneIsLidDigits = existing.phone
+                && lidDigits(existing.social_id)
+                && String(existing.phone).replace(/\D/g, '') === lidDigits(existing.social_id);
+            if (phone && (!existing.phone || phoneIsLidDigits)) patch.phone = phone;
+
+            const { data: updated, error } = await supabase
+                .from('contacts')
+                .update(patch)
+                .eq('id', existing.id)
+                .select(CONTACT_COLS)
+                .single();
+            if (error) throw error;
+            return updated;
+        }
+
+        // New contact. Prefer the LID as the stable identity when we know it, with the
+        // real phone alongside - a later LID-only message then still finds this row.
         const payload = {
             business_id: businessId,
             social_platform: 'whatsapp',
-            social_id: jid,
-            phone,
-            last_seen: new Date().toISOString()
+            social_id: lidJid || jid,
+            last_seen: now
         };
-
-        if (pushName && pushName !== 'Unknown') {
-            payload.name = pushName;
-        }
+        if (phone) payload.phone = phone;
+        if (name) payload.name = name;
 
         const { data: created, error } = await supabase
             .from('contacts')
-            .upsert(payload, { 
+            .upsert(payload, {
                 onConflict: 'business_id, social_platform, social_id',
-                ignoreDuplicates: false 
+                ignoreDuplicates: false
             })
-            .select('id, lead_state, name, is_ad_lead, lead_type, original_ad_id, ad_attribution_id')
+            .select(CONTACT_COLS)
             .single();
 
         if (error) throw error;
         return created;
     } catch (error) {
-        logDbFailure('getOrCreateContact', { businessId, jid, pushName, phone }, error);
+        logDbFailure('getOrCreateContact', { businessId, jid, altJid, pushName, phone }, error);
         throw new Error(`Contact lookup/create failed: ${error.message}`);
     }
+}
+
+// Bulk contact writer for contacts.set / contacts.upsert / history sync.
+// Differences from the three inline upserts it replaces:
+//   - a LID never becomes `phone`
+//   - 'Unknown' / numeric / owner names are never written (the old code wrote
+//     'Unknown' over a real name whenever a sync carried no name)
+//   - columns we have no value for are OMITTED, so an existing name/phone is never
+//     blanked; rows are grouped by shape so PostgREST doesn't null the gaps
+//   - duplicate ids in one batch are collapsed (they made Postgres reject the batch)
+// `extraFields` are applied to every row (history sync passes the new-lead defaults).
+export async function upsertContactBatch(businessId, rawContacts, { extraFields = {}, returning = false } = {}) {
+    const ownerNames = await getOwnerNames(businessId);
+    const now = new Date().toISOString();
+    const bySocialId = new Map();
+
+    for (const c of rawContacts) {
+        if (!c?.id) continue;
+        const row = { business_id: businessId, social_platform: 'whatsapp', social_id: c.id, last_seen: now, ...extraFields };
+        const phone = isLidJid(c.id) ? null : extractPhone(c.id);
+        if (phone) row.phone = phone;
+        const candidate = c.name || c.notify || c.verifiedName;
+        if (isUsableContactName(candidate, ownerNames)) row.name = String(candidate).trim();
+        bySocialId.set(c.id, row);
+    }
+
+    const groups = new Map();
+    for (const row of bySocialId.values()) {
+        const shape = Object.keys(row).sort().join(',');
+        if (!groups.has(shape)) groups.set(shape, []);
+        groups.get(shape).push(row);
+    }
+
+    const data = [];
+    let firstError = null;
+    for (const rows of groups.values()) {
+        const query = supabase.from('contacts').upsert(rows, { onConflict: 'business_id, social_platform, social_id' });
+        const { data: out, error } = returning ? await query.select('id, social_id') : await query;
+        if (error) { firstError = firstError || error; continue; }
+        if (out) data.push(...out);
+    }
+    return { data, error: firstError, count: bySocialId.size };
 }
 
 export async function getOrCreateConversation(businessId, contactId, jid) {
