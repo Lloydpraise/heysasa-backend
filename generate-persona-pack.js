@@ -15,6 +15,10 @@ import {
 } from './src/services/openAiGate.js';
 import { AI_PROMPT_CATALOG } from './src/aiPromptCatalog.js';
 import { getAiPromptConfig } from './src/services/aiPromptConfig.js';
+import {
+    squash, redact, isLowValueVoiceMessage, capPerConversation, phraseSupport,
+    validateObjectionEntries, cleanTriggers,
+} from './src/personaHelpers.js';
 
 dotenv.config();
 
@@ -45,7 +49,7 @@ const FORCE = requestedConfig.force === true || process.env.PERSONA_FORCE === 't
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4.1-mini';
 
 // ─── Thresholds — tune these as real data volume grows ─────────────────────────
-const MIN_VOICE_MESSAGES     = 150;   // below this, tone signals aren't stable
+const MIN_VOICE_MESSAGES     = 100;   // counted AFTER cleaning (no amounts, acks, other-people chats, per-chat cap), so fewer but better messages than before
 const MIN_VOICE_CONVERSATIONS = 25;
 const VOICE_SAMPLE_CAP       = 500;   // don't dump the whole history into prompts
 const VOICE_BATCH_SIZE       = 130;   // per-batch map step, similar scale to MAX_TRANSCRIPT_MSGS in run-local.js
@@ -65,6 +69,10 @@ const ANALYSIS_MAX_AGE_HOURS = Number(process.env.PERSONA_ANALYSIS_MAX_AGE_HOURS
 const ANALYSIS_WAIT_MAX_MS   = 3 * 60 * 60 * 1000;
 const ANALYSIS_POLL_MS       = 15 * 1000;
 const LIVE_WINDOW_MS         = 3 * 60 * 1000;
+const MAX_VOICE_PER_CONVERSATION = 20;          // no single chat may dominate the owner's "voice"
+const MIN_VOICE_WORDS = 3;                      // "135k", "Ok", "Done" carry no style
+const MIN_PHRASE_SUPPORT = 3;                   // a signature phrase must appear in at least this many separate messages
+const OBJECTION_TAGS = ['price', 'not_ready', 'found_elsewhere', 'trust_concerns', 'size_availability'];  // 'needs_more_info' is a question, not an objection
 const MAX_DUPLICATE_MESSAGES = 3;   // one broadcast sent to 300 people must not become "your voice"
 
 const TEXT_INPUT_COST_PER_TOKEN  = 0.000000150;
@@ -307,14 +315,16 @@ async function callOpenAI(systemPrompt, userPrompt, { json = true, maxTokens = 9
 
 // ─── Shared text helper — same extraction logic as run-local.js's buildTranscript ──
 function messageText(m) {
-    return m.content?.text || (typeof m.content === 'string' ? m.content : '') || '';
+    // Everything that reaches a prompt, a grounding check or the saved pack goes through redact().
+    return redact(m.content?.text || (typeof m.content === 'string' ? m.content : '') || '');
 }
 
 function buildTranscript(messages) {
     return messages
         .map(m => {
             const isCustomer = m.direction === 'in' || m.direction === 'inbound';
-            const role = isCustomer ? 'CUSTOMER' : 'BUSINESS';
+            // OWNER = a human on the business side. Automated replies are labelled so they are never learned as the owner's voice.
+            const role = isCustomer ? 'CUSTOMER' : (m.agent_role && m.agent_role !== 'human' ? 'AUTO' : 'OWNER');
             const text = messageText(m) || (m.type && m.type !== 'text' ? `[${m.type}]` : '');
             return `${role}: ${text}`;
         })
@@ -336,8 +346,6 @@ function chunk(arr, size) {
     return out;
 }
 
-// Lowercase letters+digits only, so "M-Pesa", "m pesa" and "MPESA" all compare equal.
-const squash = (text) => String(text || '').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '');
 
 // A phrase is grounded when it really occurs in the source text. Anything the
 // model produced that fails this is dropped, never shipped as "your voice".
@@ -510,7 +518,7 @@ async function getBusinessScope() {
         supabase.from('contacts')
             .select('id, analysis_version')
             .eq('business_id', BUSINESS_ID)
-            .eq('lead_type', 'business')
+            .eq('lead_type', 'business')   // analyser v3: 'business' = a real customer or prospect; vendor/staff/personal/junk are separate types
             .order('id')
             .range(from, to));
     const businessContactIds = contacts.map(c => c.id);
@@ -541,20 +549,37 @@ async function getBusinessScope() {
 async function fetchVoiceMessages() {
     const scope = await getBusinessScope();
     const funnel = {
-        business_contacts: scope.businessContactIds.length,
+        business_contacts: scope.businessContactIds.length,   // customers and prospects only
         business_conversations: scope.businessConvs.length,
         human_messages: 0,
         with_text: 0,
+        after_quality_filter: 0,
         after_duplicate_cap: 0,
+        after_conversation_cap: 0,
         conversations_covered: 0,
     };
     if (!scope.businessContactIds.length || !scope.businessConvs.length) return { messages: [], funnel };
 
     const flaggedContacts = new Set(scope.businessConvs.map(c => c.contact_id));
     const convByContact = new Map(scope.businessConvs.map(c => [c.contact_id, c.id]));
+    const contactIds = scope.businessContactIds.filter(id => flaggedContacts.has(id));
+
+    // Outbound-only chats (broadcasts, one-sided notes) are not conversations with a customer.
+    const repliedContacts = new Set();
+    for (const batch of chunk(contactIds, 300)) {
+        const rows = await fetchAllPages((from, to) =>
+            supabase.from('messages')
+                .select('id, contact_id')
+                .eq('business_id', BUSINESS_ID)
+                .eq('direction', 'in')
+                .in('contact_id', batch)
+                .order('id')
+                .range(from, to));
+        for (const r of rows) repliedContacts.add(r.contact_id);
+    }
 
     let all = [];
-    for (const batch of chunk(scope.businessContactIds.filter(id => flaggedContacts.has(id)), 300)) {
+    for (const batch of chunk(contactIds.filter(id => repliedContacts.has(id)), 300)) {
         const rows = await fetchAllPages((from, to) =>
             supabase.from('messages')
                 .select('id, content, type, created_at, conversation_id, contact_id')
@@ -575,43 +600,38 @@ async function fetchVoiceMessages() {
         .sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
     funnel.with_text = withText.length;
 
-    const messages = capDuplicates(withText, MAX_DUPLICATE_MESSAGES);
-    funnel.after_duplicate_cap = messages.length;
+    // Bare amounts, one-word acknowledgements and identifiers say nothing about how the owner talks.
+    const substantive = withText.filter(m => !isLowValueVoiceMessage(messageText(m), MIN_VOICE_WORDS));
+    funnel.after_quality_filter = substantive.length;
+
+    const deduped = capDuplicates(substantive, MAX_DUPLICATE_MESSAGES);
+    funnel.after_duplicate_cap = deduped.length;
+
+    const messages = capPerConversation(deduped, MAX_VOICE_PER_CONVERSATION, evenSample);
+    funnel.after_conversation_cap = messages.length;
     funnel.conversations_covered = new Set(messages.map(m => m.conversation_id)).size;
     return { messages, funnel };
 }
 
 // Names the actual bottleneck instead of a bare "below threshold".
 function explainShortfall(funnel) {
-    if (!funnel.business_contacts) return 'no_business_contacts: no contacts are classified as business chats yet, so the analyser has not separated them.';
+    if (!funnel.business_contacts) return 'no_customer_contacts: no contacts are classified as customer chats yet, so the analyser has not separated them.';
     if (!funnel.business_conversations) return 'no_business_conversations: business contacts exist but none of their conversations are flagged as business chats.';
-    if (!funnel.human_messages) return 'no_human_messages: the business chats contain no messages sent by a human (only inbound or automated).';
-    return `not_enough_history: ${funnel.after_duplicate_cap} usable messages across ${funnel.conversations_covered} business conversations (need ${MIN_VOICE_MESSAGES} and ${MIN_VOICE_CONVERSATIONS}).`;
+    if (!funnel.human_messages) return 'no_human_messages: the customer chats contain no messages sent by a human (only inbound or automated), or no customer ever replied.';
+    return `not_enough_history: ${funnel.after_conversation_cap} usable messages across ${funnel.conversations_covered} customer conversations (need ${MIN_VOICE_MESSAGES} and ${MIN_VOICE_CONVERSATIONS}).`;
 }
 
 // ─── Step 2: voice/tone — map-reduce over the sampled messages ─────────────────
 async function extractVoiceBatch(batch, businessName) {
     const transcript = batch.map(m => messageText(m)).filter(Boolean).join('\n---\n');
-    const systemPrompt = `You are analyzing real WhatsApp messages written by a business owner/staff member to customers in Kenya. Extract observable STYLE signals only — do not summarize content or invent anything not visibly present.
-
-Return ONLY valid JSON:
-{
-  "language_counts": {"english": integer, "swahili": integer, "sheng": integer},
-  "greetings_seen": ["verbatim opening lines actually used, max 5"],
-  "closings_seen": ["verbatim closing lines actually used, max 5"],
-  "signature_phrases": ["short recurring phrases/expressions this person actually uses, max 8"],
-  "emoji_observations": "one short note on emoji usage in this batch, or 'none observed'",
-  "sentence_length_observations": "one short note: short/punchy, long/detailed, or mixed",
-  "message_count": integer
-}
-"language_counts" should count messages by dominant language, roughly — a rough tally is fine, this gets aggregated across many batches.`;
+    const systemPrompt = ''; // wording lives in src/aiPromptCatalog.js, keyed by `purpose` below
 
     return callOpenAI(systemPrompt, `MESSAGES (one per line, separated by ---):\n${transcript}`, {
         maxTokens: 700, temperature: 0.1, purpose: 'voice_batch_extract', businessName
     });
 }
 
-async function reduceVoiceSignals(batchResults, businessName, corpus) {
+async function reduceVoiceSignals(batchResults, businessName, corpus, pool = []) {
     const totals = { english: 0, swahili: 0, sheng: 0 };
     const greetings = [], closings = [], phrases = [], emojiNotes = [], lengthNotes = [];
     for (const b of batchResults) {
@@ -631,22 +651,7 @@ async function reduceVoiceSignals(batchResults, businessName, corpus) {
         sheng:   Math.round((totals.sheng   / totalLangCount) * 100) / 100,
     };
 
-    const systemPrompt = `You are writing the final voice/tone profile for ${businessName}'s WhatsApp persona pack, based on real observations pulled from their own sent messages. Ground everything in the observations given — do not invent phrases that weren't listed.
-
-Return ONLY valid JSON matching this exact shape:
-{
-  "display_name": "string — a natural name for this voice, e.g. the business name or owner's style",
-  "voice_tone": "one short sentence describing the tone",
-  "formality_score": integer 1-10 (1=very casual, 10=very formal),
-  "typical_greeting": "pick ONE representative greeting VERBATIM from the examples given — do not rewrite it",
-  "typical_closing": "pick ONE representative closing VERBATIM from the examples given — do not rewrite it",
-  "emoji_style": "short description, e.g. 'one relevant emoji per message' or 'none'",
-  "sentence_length": "short description",
-  "signature_phrases": ["the 5-8 most authentic recurring phrases from the input list — do not invent new ones"],
-  "phrases_to_avoid": ["2-4 sensible things to avoid, e.g. overly generic filler seen in the batches, or standard WhatsApp-business no-nos — mark these as suggestions for the owner to confirm"],
-  "tone_descriptors": ["3-5 single words or short phrases, e.g. warm, direct, playful"]
-}
-language_mix is NOT part of your output — it's computed separately and will be merged in afterward.`;
+    const systemPrompt = ''; // wording lives in src/aiPromptCatalog.js, keyed by `purpose` below
 
     const userPrompt = [
         `GREETINGS SEEN ACROSS ALL BATCHES:\n${JSON.stringify([...new Set(greetings)].slice(0, 40))}`,
@@ -662,17 +667,23 @@ language_mix is NOT part of your output — it's computed separately and will be
     // Grounding: every phrase, greeting and closing must really occur in the
     // owner's own messages. Anything the model invented or reworded is dropped
     // and replaced with the most frequent REAL one.
+    const poolTexts = pool.map(messageText);
+    const wordsOf = (x) => String(x).trim().split(/\s+/).filter(Boolean).length;
+    // A signature phrase must really occur, be short, and be a habit (several separate messages), not a one-off or a canned paragraph.
+    const isHabit = (x) => isGrounded(x, corpus) && wordsOf(x) <= 8 && phraseSupport(x, poolTexts) >= MIN_PHRASE_SUPPORT;
     const realOnly = (list) => rankedByFrequency(list).filter(x => isGrounded(x, corpus));
     const modelPhrases = Array.isArray(persona.signature_phrases) ? persona.signature_phrases : [];
-    const signature = modelPhrases.filter(x => isGrounded(x, corpus));
-    for (const real of realOnly(phrases)) {
+    const signature = modelPhrases.filter(isHabit);
+    for (const real of realOnly(phrases).filter(isHabit)) {
         if (signature.length >= 8) break;
         if (!signature.some(x => squash(x) === squash(real))) signature.push(real);
     }
+    // Most habitual first, so the strongest voice markers lead.
+    signature.sort((a, b) => phraseSupport(b, poolTexts) - phraseSupport(a, poolTexts));
     const realGreetings = realOnly(greetings);
     const realClosings = realOnly(closings);
     const keepOrReplace = (chosen, real) => (chosen && isGrounded(chosen, corpus)) ? chosen : (real[0] || '');
-    log('Voice', `Grounding check: kept ${signature.length} signature phrases (${modelPhrases.length - modelPhrases.filter(x => isGrounded(x, corpus)).length} invented/reworded dropped).`);
+    log('Voice', `Grounding check: kept ${signature.length} signature phrases that appear in ${MIN_PHRASE_SUPPORT}+ separate messages (${modelPhrases.length - modelPhrases.filter(isHabit).length} invented, reworded, one-off or too long dropped).`);
 
     return {
         ...persona,
@@ -683,7 +694,7 @@ language_mix is NOT part of your output — it's computed separately and will be
     };
 }
 
-async function buildPersonaSection(sampledMessages, businessName, corpus) {
+async function buildPersonaSection(sampledMessages, businessName, corpus, pool = sampledMessages) {
     const batches = chunk(sampledMessages, VOICE_BATCH_SIZE);
     log('Voice', `Mining tone across ${sampledMessages.length} sampled messages in ${batches.length} batches...`);
     const batchResults = [];
@@ -701,7 +712,7 @@ async function buildPersonaSection(sampledMessages, businessName, corpus) {
     if (failedBatches / batches.length > 0.3) {
         throw new Error(`${failedBatches} of ${batches.length} voice batches failed. Refusing to build a persona from a partial sample.`);
     }
-    return reduceVoiceSignals(batchResults, businessName, corpus);
+    return reduceVoiceSignals(batchResults, businessName, corpus, pool);
 }
 
 // ─── Step 3: business_context — mostly hard facts, not chat-mined ─────────────
@@ -725,16 +736,7 @@ async function buildBusinessContextSection(business, sampledMessages, corpus) {
     // this section leans on hard facts, not volume.
     const phraseSample = evenSample(sampledMessages, 150).map(messageText).filter(Boolean).join('\n');
 
-    const systemPrompt = `You are documenting the factual business context of "${business.name}" for a WhatsApp AI persona pack. Use the structured facts and the product catalog as ground truth. Use the sample messages only to find recurring value-prop language already used by the business — never invent a claim, price, policy, or USP that isn't supported by the catalog or the messages.
-
-Return ONLY valid JSON:
-{
-  "core_offer": "1-2 sentences, grounded in the product catalog",
-  "target_customer": "1-2 sentences, inferred conservatively from products/messages",
-  "delivery_info": "1-2 sentences — leave generic/null-ish if no delivery info is evidenced",
-  "unique_selling_points": ["max 5, only ones evidenced in the catalog or repeated in messages"],
-  "payment_methods": ["only ones explicitly evidenced in the messages — e.g. M-Pesa if mentioned; leave empty array if none seen"]
-}`;
+    const systemPrompt = ''; // wording lives in src/aiPromptCatalog.js, keyed by `purpose` below
 
     const userPrompt = [
         `BUSINESS: ${business.name} | industry: ${business.industry || 'unknown'} | type: ${business.business_type || 'unknown'} | currency: ${business.currency || 'unknown'}`,
@@ -758,81 +760,82 @@ Return ONLY valid JSON:
 
 // ─── Step 4: objection_playbook — precision over volume, from conversation_enrichment ──
 async function fetchObjectionConversations() {
-    // Business chats analysed under the current analyser rules only. This is what
-    // keeps stale analysis of personal chats out of the pack.
+    // Customer/prospect chats analysed under the current analyser rules only. This is what
+    // keeps stale analysis, supplier chats and the owner's own purchases out of the pack.
     const convIds = (await getBusinessScope()).analysedConvIds;
     if (!convIds.length) return [];
 
-    // Filtering "array not empty" through PostgREST's .or() string syntax is
-    // fragile to get exactly right from outside a live DB — this table is
-    // small (a few hundred rows across all businesses today), so pull
-    // plainly and filter in JS instead. Cheap and can't silently misfire.
+    // Small table; pulled plainly and filtered in JS so a PostgREST filter can't silently misfire.
     const CONV_BATCH = 300;
     let rows = [];
     for (const batch of chunk(convIds, CONV_BATCH)) {
         const { data, error } = await supabase
             .from('conversation_enrichment')
-            .select('conversation_id, objection_tags, price_objection, pre_purchase_questions')
+            .select('conversation_id, objection_tags, price_objection')
             .in('conversation_id', batch);
         if (error) throw new Error(`conversation_enrichment lookup failed: ${error.message}`);
         rows = rows.concat(data || []);
     }
-    const relevant = rows.filter(r =>
-        (r.objection_tags && r.objection_tags.length > 0) ||
-        r.price_objection === true ||
-        (r.pre_purchase_questions && r.pre_purchase_questions.length > 0)
-    );
-    // Prioritize richer conversations (more distinct tags) and cap the count —
-    // we want a handful of strong real examples per tag, not every match.
-    relevant.sort((a, b) => (b.objection_tags?.length || 0) - (a.objection_tags?.length || 0));
+    // Real objections only. 'needs_more_info' is a question and pre_purchase_questions are questions, so
+    // neither selects a chat; they used to crowd out the price and not_ready chats.
+    const relevant = rows
+        .map(r => ({ ...r, real_tags: (r.objection_tags || []).filter(t => OBJECTION_TAGS.includes(t)) }))
+        .filter(r => r.real_tags.length > 0 || r.price_objection === true);
+    relevant.sort((a, b) =>
+        (b.price_objection === true) - (a.price_objection === true) ||
+        b.real_tags.length - a.real_tags.length);
     return relevant.slice(0, MAX_OBJECTION_CONVOS);
 }
 
-async function fetchTailTranscript(conversationId) {
+async function fetchTailTranscript(conversationId, limit = TRANSCRIPT_TAIL) {
     const { data, error } = await supabase
         .from('messages')
-        .select('direction, type, content, created_at')
+        .select('direction, type, content, created_at, agent_role')
         .eq('conversation_id', conversationId)
         .order('created_at', { ascending: false })
-        .limit(TRANSCRIPT_TAIL);
+        .limit(limit);
     if (error) throw new Error(`Message fetch failed for conversation ${conversationId}: ${error.message}`);
     return buildTranscript((data || []).reverse());
+}
+
+// Text of the lines on one side of a transcript, squashed for grounding checks.
+function sideCorpus(transcripts, label) {
+    const prefix = `${label}: `;
+    return squash(transcripts.flatMap(t => t.split('\n')).filter(l => l.startsWith(prefix)).map(l => l.slice(prefix.length)).join(' '));
 }
 
 async function buildObjectionPlaybook(business) {
     const tagged = await fetchObjectionConversations();
     if (!tagged.length) {
-        warn('Objections', 'No conversation_enrichment rows with objection_tags/price_objection/pre_purchase_questions found — returning empty playbook.');
+        warn('Objections', 'No customer conversations with a real objection tag (price, not_ready, found_elsewhere, trust_concerns, size_availability) found — returning empty playbook.');
         return [];
     }
 
     const examples = [];
+    const transcripts = [];
     for (const row of tagged) {
         try {
             const transcript = await fetchTailTranscript(row.conversation_id);
-            examples.push({
-                tags: row.objection_tags || [],
-                price_objection: row.price_objection,
-                pre_purchase_questions: row.pre_purchase_questions || [],
-                transcript
-            });
+            transcripts.push(transcript);
+            // Per-example cap so one long chat can't push the others out of the prompt.
+            examples.push(`--- EXAMPLE (flagged: ${row.real_tags.join(', ') || 'price'}${row.price_objection ? ', price objection' : ''}) ---\n${transcript.slice(-1400)}`);
         } catch (e) {
             warn('Objections', `Skipping conversation ${row.conversation_id}: ${e.message}`);
         }
     }
     if (!examples.length) return [];
 
-    const systemPrompt = `You are building an objection-handling playbook for ${business.name}, a real business, from real tagged WhatsApp conversations. Each example below is a real conversation transcript plus the objection tags the conversation was already flagged with. Find the actual customer objection and the business's actual reply in each transcript, and use that reply as the grounding for your suggested_language — do not invent a resolution the business didn't actually use.
+    const userPrompt = `TAGGED CONVERSATION EXAMPLES:\n${examples.join('\n\n').slice(0, 14000)}`;
+    // The wording of this prompt lives in src/aiPromptCatalog.js (objection_playbook). AUTO lines are automated replies and must be ignored.
+    const result = await callOpenAI('', userPrompt + '\n\nLines starting "AUTO:" are automated replies. Ignore them.', { maxTokens: 1800, temperature: 0.2, purpose: 'objection_playbook', businessName: business.name });
 
-Group by distinct objection type across the examples (e.g. price, not_ready, found_elsewhere, needs_more_info, trust_concerns, size_availability — use whatever tags/categories actually appear). Skip a category if you don't have real material for it.
-
-Return ONLY valid JSON: {"objection_playbook": [
-  {"objection": "what the customer says, in their own words or close to it", "response_strategy": "one sentence strategy", "suggested_language": "grounded in the business's own real reply", "escalation_if_repeated": "one sentence"}
-]}`;
-
-    const userPrompt = `TAGGED CONVERSATION EXAMPLES:\n${JSON.stringify(examples, null, 2).slice(0, 12000)}`;
-    const result = await callOpenAI(systemPrompt, userPrompt, { maxTokens: 1400, temperature: 0.3, purpose: 'objection_playbook', businessName: business.name });
-    return result.objection_playbook || [];
+    // Every entry has to be backed by real words on the right side of a real conversation.
+    const { kept, dropped } = validateObjectionEntries(result.objection_playbook, {
+        customerCorpus: sideCorpus(transcripts, 'CUSTOMER'),
+        ownerCorpus: sideCorpus(transcripts, 'OWNER'),
+    });
+    if (dropped.length) warn('Objections', `Dropped ${dropped.length} playbook entr${dropped.length === 1 ? 'y' : 'ies'} that were not grounded in the right side of a real chat.`, { dropped });
+    return kept;
 }
 
 // ─── Step 5: customer_profiles — cluster on signals the analyser already wrote ──
@@ -862,11 +865,7 @@ async function buildCustomerProfiles(business) {
         return [];
     }
 
-    const systemPrompt = `You are identifying recurring customer archetypes for ${business.name} from real per-conversation signals already extracted by an upstream analyser (customer_intent, psychology, vibe_check, context_summary). Cluster these into 3-5 real recurring profiles — do not invent a profile that isn't represented in the data given.
-
-Return ONLY valid JSON: {"customer_profiles": [
-  {"profile_name": "short label", "detection_signals": ["phrases or behaviors that identify this profile, max 5"], "approach_strategy": "one sentence", "message_style_adjustment": "one short instruction", "cta_style": "short description", "what_to_avoid": "one short instruction"}
-]}`;
+    const systemPrompt = ''; // wording lives in src/aiPromptCatalog.js, keyed by `purpose` below
 
     const userPrompt = `PER-CONVERSATION SIGNALS:\n${JSON.stringify(signals, null, 2).slice(0, 10000)}`;
     const result = await callOpenAI(systemPrompt, userPrompt, { maxTokens: 1200, temperature: 0.3, purpose: 'customer_profiles', businessName: business.name });
@@ -877,10 +876,7 @@ Return ONLY valid JSON: {"customer_profiles": [
 const SENTIMENT_KEYS = ['positive', 'neutral', 'hesitant', 'price_resistant', 'time_poor', 'trust_deficit', 'negative', 'aggressive'];
 
 async function buildSentimentMap(business, persona, businessContext, objectionPlaybook) {
-    const systemPrompt = `You are writing response instructions for a WhatsApp AI, one instruction per customer sentiment/state, for ${business.name}. Stay consistent with the voice and objection-handling approach already established below — don't contradict them.
-
-Return ONLY valid JSON with exactly these 8 keys, each a short instruction (1-2 sentences) on how the bot should respond when it detects that sentiment:
-{"positive": "", "neutral": "", "hesitant": "", "price_resistant": "", "time_poor": "", "trust_deficit": "", "negative": "", "aggressive": ""}`;
+    const systemPrompt = ''; // wording lives in src/aiPromptCatalog.js, keyed by `purpose` below
 
     const userPrompt = [
         `PERSONA (voice/tone):\n${JSON.stringify(persona)}`,
@@ -918,10 +914,10 @@ async function buildClosingAndHandoff(business) {
     const { closed, negative } = await fetchClosedConversationIds();
 
     if (closed.length < 3) {
-        warn('Closing', `Only ${closed.length} 'Closed'/'Closing' conversations found — closing_triggers will be generated but should be treated as low-confidence until more closes accumulate.`);
+        warn('Closing', `Only ${closed.length} 'Closed'/'Closing' conversations found — closing_triggers will be thin and should be treated as low-confidence until more closes accumulate.`);
     }
     if (!negative.length) {
-        warn('Handoff', 'No conversations with strongly negative sentiment_score found, and handover_flag/handover_reason are not populated anywhere yet — human_handoff_triggers will be generated from general best practice, not real examples. Revisit once handover data exists.');
+        warn('Handoff', 'No customer conversations with strongly negative sentiment_score found — human_handoff_triggers will be left empty rather than filled with generic phrases.');
     }
 
     const closedTranscripts = [];
@@ -932,21 +928,22 @@ async function buildClosingAndHandoff(business) {
     for (const id of negative) {
         try { negativeTranscripts.push(await fetchTailTranscript(id)); } catch { /* skip */ }
     }
+    if (!closedTranscripts.length && !negativeTranscripts.length) return { closing_triggers: [], human_handoff_triggers: [] };
 
-    const systemPrompt = `You are identifying (a) signals that a customer is ready to buy, and (b) signals that a conversation should be handed to a human, for ${business.name}.
-
-The CLOSED conversation examples were tagged "Closed" by an upstream analyser, and that tag also covers customers who declined or ended the chat. Use ONLY examples where the customer actually bought, paid or committed; ignore refusals when writing closing_triggers. If no example shows a real purchase, return an empty closing_triggers array rather than guessing.
-
-Ground human_handoff_triggers in the NEGATIVE-SENTIMENT examples if given; otherwise use general WhatsApp-sales best practice for Kenya/East Africa, without overclaiming specificity.
-
-Return ONLY valid JSON: {"closing_triggers": ["short signal phrases, max 8"], "human_handoff_triggers": ["short signal phrases, max 8"]}`;
-
+    // The wording of this prompt lives in src/aiPromptCatalog.js (closing_handoff).
     const userPrompt = [
-        closedTranscripts.length ? `CLOSED CONVERSATION EXAMPLES:\n${closedTranscripts.join('\n===\n').slice(0, 6000)}` : 'No closed conversation examples available.',
-        negativeTranscripts.length ? `NEGATIVE-SENTIMENT CONVERSATION EXAMPLES:\n${negativeTranscripts.join('\n===\n').slice(0, 6000)}` : 'No negative-sentiment examples available — use general best practice.'
+        closedTranscripts.length ? `CLOSED CONVERSATION EXAMPLES:\n${closedTranscripts.join('\n===\n').slice(0, 6000)}` : 'No closed conversation examples available. Return an empty closing_triggers array.',
+        negativeTranscripts.length ? `NEGATIVE-SENTIMENT CONVERSATION EXAMPLES:\n${negativeTranscripts.join('\n===\n').slice(0, 6000)}` : 'No negative-sentiment examples available. Return an empty human_handoff_triggers array.'
     ].join('\n\n');
 
-    return callOpenAI(systemPrompt, userPrompt, { maxTokens: 700, temperature: 0.3, purpose: 'closing_handoff', businessName: business.name });
+    const result = await callOpenAI('', userPrompt, { maxTokens: 700, temperature: 0.2, purpose: 'closing_handoff', businessName: business.name });
+
+    // Short generalised phrases only: no identifiers, no amounts-as-numbers, nothing that is really a sentence.
+    // And never invent a signal where there was no example for it.
+    return {
+        closing_triggers: closedTranscripts.length ? cleanTriggers(result.closing_triggers) : [],
+        human_handoff_triggers: negativeTranscripts.length ? cleanTriggers(result.human_handoff_triggers) : []
+    };
 }
 
 // ─── Normalize — guarantee the exact shape PersonaPackEditor.jsx expects ───────
@@ -1065,7 +1062,7 @@ async function main() {
     await setPhase('voice');
     log('Voice', 'Fetching human-authored messages from confirmed business chats...');
     const { messages: voiceMessages, funnel } = await fetchVoiceMessages();
-    log('Voice', `Funnel: ${funnel.business_contacts} business contacts -> ${funnel.business_conversations} business conversations -> ${funnel.human_messages} human messages -> ${funnel.with_text} with text -> ${funnel.after_duplicate_cap} after duplicate cap, across ${funnel.conversations_covered} conversations.`);
+    log('Voice', `Funnel: ${funnel.business_contacts} customer/prospect contacts -> ${funnel.business_conversations} conversations -> ${funnel.human_messages} human messages -> ${funnel.with_text} with text -> ${funnel.after_quality_filter} substantive -> ${funnel.after_duplicate_cap} after duplicate cap -> ${funnel.after_conversation_cap} after per-chat cap, across ${funnel.conversations_covered} conversations.`);
 
     if (voiceMessages.length < MIN_VOICE_MESSAGES || funnel.conversations_covered < MIN_VOICE_CONVERSATIONS) {
         const reason = explainShortfall(funnel);
@@ -1080,7 +1077,7 @@ async function main() {
     const sample = evenSample(voiceMessages, VOICE_SAMPLE_CAP);
     log('Voice', `Sampling ${sample.length} of ${voiceMessages.length} messages, evenly spread across the full history.`);
 
-    const persona = await buildPersonaSection(sample, business.name || BUSINESS_ID, corpus);
+    const persona = await buildPersonaSection(sample, business.name || BUSINESS_ID, corpus, voiceMessages);
     log('Persona', 'Voice/tone section built.');
 
     await setPhase('business_context');

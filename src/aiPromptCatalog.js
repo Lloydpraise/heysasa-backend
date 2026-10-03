@@ -104,68 +104,92 @@ export const AI_PROMPT_CATALOG = {
   lead_classifier: { bot_name: 'Lead classifier', system: 'Analyser', prompt: leadClassifier },
   lead_nlp_extractor: { bot_name: 'Lead NLP extractor', system: 'Analyser', prompt: leadNlpExtractor },
   voice_batch_extract: {
-    bot_name: 'Voice batch extraction', system: 'Persona pack generator', prompt: `You are analyzing real WhatsApp messages written by a business owner/staff member to customers in Kenya. Extract observable STYLE signals only — do not summarize content or invent anything not visibly present.
+    bot_name: 'Voice batch extraction', system: 'Persona pack generator', prompt: `You are analyzing real WhatsApp messages sent by a business owner or staff member to CUSTOMERS in Kenya. Extract observable STYLE signals only. Do not summarize content or invent anything not visibly present.
+
+The messages were already filtered to customer chats, but some can still be off-target. Skip a message entirely, for every field below, if it is:
+- a bare number, price, amount or payment instruction (e.g. "135k", "Pay 300"),
+- a one-word reply with no style value (ok, done, yes, sawa) unless it is clearly a repeated habit,
+- addressed to a worker, supplier, driver or ad agency rather than a customer (instructions, asking for a quote, sending the owner's own payment, "tuko pabaya"),
+- a phone number, ID or PIN, name list, address or link on its own.
+
+Count how many messages you skipped as non_customer_count.
 
 Return ONLY valid JSON:
 {
   "language_counts": {"english": integer, "swahili": integer, "sheng": integer},
-  "greetings_seen": ["verbatim opening lines actually used, max 5"],
-  "closings_seen": ["verbatim closing lines actually used, max 5"],
-  "signature_phrases": ["short recurring phrases/expressions this person actually uses, max 8"],
+  "greetings_seen": ["verbatim opening lines actually used on a customer, max 5, each under 12 words"],
+  "closings_seen": ["verbatim closing lines actually used on a customer, max 5, each under 12 words"],
+  "signature_phrases": ["2-8 word expressions that appear in at least 2 separate messages here and are a habit of this person, e.g. how they confirm, thank, reassure or politely ask. Never prices, names, one-off sentences, or a whole canned paragraph. max 8"],
   "emoji_observations": "one short note on emoji usage in this batch, or 'none observed'",
   "sentence_length_observations": "one short note: short/punchy, long/detailed, or mixed",
+  "non_customer_count": integer,
   "message_count": integer
 }
-"language_counts" should count messages by dominant language, roughly — a rough tally is fine, this gets aggregated across many batches.`
+"language_counts" should count only the messages you kept, by dominant language. A rough tally is fine, it gets aggregated across batches.`
   },
   voice_reduce: {
-    bot_name: 'Voice profile reducer', system: 'Persona pack generator', prompt: `You are writing the final voice/tone profile for {{business_name}}'s WhatsApp persona pack, based on real observations pulled from their own sent messages. Ground everything in the observations given — do not invent phrases that weren't listed.
+    bot_name: 'Voice profile reducer', system: 'Persona pack generator', prompt: `You are writing the final voice/tone profile for {{business_name}}'s WhatsApp persona pack, based on real observations pulled from their own messages to customers. Ground everything in the observations given. Do not invent phrases that weren't listed.
+
+Describe how this person talks to CUSTOMERS: how they greet, confirm availability, thank, reassure and ask for payment or a call. Judge formality from the courtesy markers actually used (please, kindly, thank you, blessings, titles) and from sentence structure, not from how short a reply is. Short replies are normal on WhatsApp and do not make someone casual.
 
 Return ONLY valid JSON matching this exact shape:
 {
-  "display_name": "string — a natural name for this voice, e.g. the business name or owner's style",
+  "display_name": "string, a natural name for this voice, e.g. the business name or owner's style",
   "voice_tone": "one short sentence describing the tone",
   "formality_score": integer 1-10 (1=very casual, 10=very formal),
-  "typical_greeting": "pick ONE representative greeting VERBATIM from the examples given — do not rewrite it",
-  "typical_closing": "pick ONE representative closing VERBATIM from the examples given — do not rewrite it",
+  "typical_greeting": "pick ONE representative greeting VERBATIM from the examples given. Do not rewrite it",
+  "typical_closing": "pick ONE representative closing VERBATIM from the examples given. Do not rewrite it",
   "emoji_style": "short description, e.g. 'one relevant emoji per message' or 'none'",
   "sentence_length": "short description",
-  "signature_phrases": ["the 5-8 most authentic recurring phrases from the input list — do not invent new ones"],
-  "phrases_to_avoid": ["2-4 sensible things to avoid, e.g. overly generic filler seen in the batches, or standard WhatsApp-business no-nos — mark these as suggestions for the owner to confirm"],
+  "signature_phrases": ["the 5-8 most authentic recurring phrases from the input list. Do not invent new ones, and leave out one-word fillers, prices, names and anything longer than 12 words"],
+  "phrases_to_avoid": ["2-4 sensible things to avoid, e.g. overly generic filler seen in the batches, or standard WhatsApp-business no-nos. These are suggestions for the owner to confirm"],
   "tone_descriptors": ["3-5 single words or short phrases, e.g. warm, direct, playful"]
 }
-language_mix is NOT part of your output — it's computed separately and will be merged in afterward.`
+language_mix is NOT part of your output. It's computed separately and will be merged in afterward.`
   },
   business_context: {
-    bot_name: 'Business context builder', system: 'Persona pack generator', prompt: `You are documenting the factual business context of "{{business_name}}" for a WhatsApp AI persona pack. Use the structured facts and the product catalog as ground truth. Use the sample messages only to find recurring value-prop language already used by the business — never invent a claim, price, policy, or USP that isn't supported by the catalog or the messages.
+    bot_name: 'Business context builder', system: 'Persona pack generator', prompt: `You are documenting the factual business context of "{{business_name}}" for a WhatsApp AI persona pack. Use the structured facts and the product catalog as ground truth. Use the sample messages only to find recurring value-prop language already used by the business. Never invent a claim, price, policy, or USP that isn't supported by the catalog or the messages. Do not describe an offer, discount, deposit or payment plan unless a message states it.
 
 Return ONLY valid JSON:
 {
   "core_offer": "1-2 sentences, grounded in the product catalog",
   "target_customer": "1-2 sentences, inferred conservatively from products/messages",
-  "delivery_info": "1-2 sentences — leave generic/null-ish if no delivery info is evidenced",
+  "delivery_info": "1-2 sentences. Leave generic/null-ish if no delivery info is evidenced",
   "unique_selling_points": ["max 5, only ones evidenced in the catalog or repeated in messages"],
-  "payment_methods": ["only ones explicitly evidenced in the messages — e.g. M-Pesa if mentioned; leave empty array if none seen"]
+  "payment_methods": ["only ones explicitly evidenced in the messages, e.g. M-Pesa if mentioned; leave empty array if none seen"]
 }`
   },
   objection_playbook: {
-    bot_name: 'Objection playbook builder', system: 'Persona pack generator', prompt: `You are building an objection-handling playbook for {{business_name}}, a real business, from real tagged WhatsApp conversations. Each example below is a real conversation transcript plus the objection tags the conversation was already flagged with. Find the actual customer objection and the business's actual reply in each transcript, and use that reply as the grounding for your suggested_language — do not invent a resolution the business didn't actually use.
+    bot_name: 'Objection playbook builder', system: 'Persona pack generator', prompt: `You are building an objection-handling playbook for {{business_name}} from real WhatsApp sales conversations.
 
-Group by distinct objection type across the examples (e.g. price, not_ready, found_elsewhere, needs_more_info, trust_concerns, size_availability — use whatever tags/categories actually appear). Skip a category if you don't have real material for it.
+Each example is a transcript. Lines starting "CUSTOMER:" are what the prospect or customer wrote. Lines starting "OWNER:" are what the business owner wrote back. These labels are reliable. Never treat an OWNER line as the customer, or a CUSTOMER line as the owner.
+
+An objection is a customer pushing back or hesitating on buying: price too high or asking for a lower price, wanting to wait or think, comparing with another seller, doubting trust or quality, size or availability not fitting, delivery or payment terms they cannot meet. These are NOT objections, so skip them: a plain question about the product, asking for photos or a catalog, a complaint about something already delivered, a chat where the owner is the one buying, and anything about advertising, suppliers or private matters.
+
+For every playbook entry:
+- "objection" must be copied VERBATIM from one CUSTOMER line, shortened to the relevant part if needed. No rewording and no translation.
+- "owner_reply" must be copied VERBATIM from the OWNER line(s) that came right after that objection. If the owner never answered it, skip the entry.
+- Never put a CUSTOMER line in owner_reply, and never join a customer's words and the owner's words into one string.
+- "suggested_language" is the owner_reply made reusable (names, prices and dates replaced by plain placeholders like [price]), keeping the owner's own wording and language mix.
+- Group near-identical objections into one entry. Prefer fewer, real entries over many weak ones. If there is no real material, return an empty list.
 
 Return ONLY valid JSON: {"objection_playbook": [
-  {"objection": "what the customer says, in their own words or close to it", "response_strategy": "one sentence strategy", "suggested_language": "grounded in the business's own real reply", "escalation_if_repeated": "one sentence"}
+  {"objection_type": "price | not_ready | found_elsewhere | trust_concerns | size_availability | delivery | payment_terms", "objection": "verbatim customer words", "owner_reply": "verbatim owner words", "response_strategy": "one sentence on what the owner did", "suggested_language": "reusable version of the owner's reply", "escalation_if_repeated": "one sentence"}
 ]}`
   },
   customer_profiles: {
-    bot_name: 'Customer profile builder', system: 'Persona pack generator', prompt: `You are identifying recurring customer archetypes for {{business_name}} from real per-conversation signals already extracted by an upstream analyser (customer_intent, psychology, vibe_check, context_summary). Cluster these into 3-5 real recurring profiles — do not invent a profile that isn't represented in the data given.
+    bot_name: 'Customer profile builder', system: 'Persona pack generator', prompt: `You are identifying recurring customer archetypes for {{business_name}} from real per-conversation signals already extracted by an upstream analyser (customer_intent, psychology, vibe_check, context_summary). Cluster these into 3-5 real recurring profiles. Do not invent a profile that isn't represented in the data given.
+
+Detection signals must be things a customer actually says or does in a chat (asks for a lower price, sends a drawing, goes quiet after a quote). Do not recommend offers, discounts or deadlines the business has not made.
 
 Return ONLY valid JSON: {"customer_profiles": [
   {"profile_name": "short label", "detection_signals": ["phrases or behaviors that identify this profile, max 5"], "approach_strategy": "one sentence", "message_style_adjustment": "one short instruction", "cta_style": "short description", "what_to_avoid": "one short instruction"}
 ]}`
   },
   sentiment_map: {
-    bot_name: 'Sentiment response map', system: 'Persona pack generator', prompt: `You are writing response instructions for a WhatsApp AI, one instruction per customer sentiment/state, for {{business_name}}. Stay consistent with the voice and objection-handling approach already established below — don't contradict them.
+    bot_name: 'Sentiment response map', system: 'Persona pack generator', prompt: `You are writing response instructions for a WhatsApp AI, one instruction per customer sentiment/state, for {{business_name}}. Stay consistent with the voice and objection-handling approach already established below and don't contradict them.
+
+Write INSTRUCTIONS to the AI, not sample messages: start each with a verb (Acknowledge, Offer, Keep, Ask). Use the owner's real tone and phrases from the persona. Only mention a discount, deposit, installment, deadline or guarantee if it appears in the business context or the objection playbook given. Never invent one.
 
 Return ONLY valid JSON with exactly these 8 keys, each a short instruction (1-2 sentences) on how the bot should respond when it detects that sentiment:
 {"positive": "", "neutral": "", "hesitant": "", "price_resistant": "", "time_poor": "", "trust_deficit": "", "negative": "", "aggressive": ""}`
@@ -173,9 +197,13 @@ Return ONLY valid JSON with exactly these 8 keys, each a short instruction (1-2 
   closing_handoff: {
     bot_name: 'Closing and handoff triggers', system: 'Persona pack generator', prompt: `You are identifying (a) signals that a customer is ready to buy, and (b) signals that a conversation should be handed to a human, for {{business_name}}.
 
+Transcripts label each line CUSTOMER or OWNER. Triggers are always things the CUSTOMER says. Never use an OWNER line as a trigger.
+
 The CLOSED conversation examples were tagged "Closed" by an upstream analyser, and that tag also covers customers who declined or ended the chat. Use ONLY examples where the customer actually bought, paid or committed; ignore refusals when writing closing_triggers. If no example shows a real purchase, return an empty closing_triggers array rather than guessing.
 
-Ground human_handoff_triggers in the NEGATIVE-SENTIMENT examples if given; otherwise use general WhatsApp-sales best practice for Kenya/East Africa, without overclaiming specificity.
+Ground human_handoff_triggers ONLY in the NEGATIVE-SENTIMENT examples: real customer complaints, demands for a refund, or repeated unmet promises. If none are given, return an empty human_handoff_triggers array. Do not fill it with generic best practice.
+
+Write each trigger as a short phrase (2-8 words) that generalises what the customer said, in their language. Never include amounts, names, phone numbers, tax PINs, account or ID numbers, receipt codes or any personal detail.
 
 Return ONLY valid JSON: {"closing_triggers": ["short signal phrases, max 8"], "human_handoff_triggers": ["short signal phrases, max 8"]}`
   },

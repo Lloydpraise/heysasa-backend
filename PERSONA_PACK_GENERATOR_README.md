@@ -65,17 +65,23 @@ Watch stdout — it logs `@@LOG {...}` lines just like `run-local.js` does, same
 
 ## 5. What it actually does, in order
 1. Loads the business, flips `persona_pack_status` to `running`.
-2. Pulls messages already cleaned by the analyser: `contacts.lead_type = 'business'`, `conversations.is_business_chat = true`, `messages.direction = 'out'`, `agent_role = 'human'`. **This is why it must run after `run-local.js`** — those three fields are what separate signal from noise.
-3. If fewer than 150 qualifying messages or 25 conversations exist, it stops there, sets `persona_pack_status` back to `pending` (not `failed` — the DB constraint on that column only allows `pending/running/ready/failed`, and "not enough data yet" isn't a failure, it's a retry-later state), and exits. Nothing gets written to `persona_packs`.
+2. Checks the analyser has run recently (and runs it first if not). Then it pulls messages from **customer chats only**: `contacts.lead_type = 'business'` (analyser v3: vendors, staff, personal and junk are separate types), `conversations.is_business_chat = true`, the customer replied at least once, and the message is `direction = 'out'`, `agent_role = 'human'`. Vendors (ad agency, suppliers, the owner's own purchases) and staff never feed the pack.
+   Messages are then cleaned: bare amounts and one-or-two-word replies ("135k", "Ok", "Done") are dropped, duplicates are capped at 3, and no single conversation may contribute more than 20 messages.
+3. If fewer than 100 cleaned messages or 25 conversations exist, it stops there, sets `persona_pack_status` back to `pending` (not `failed` — the DB constraint on that column only allows `pending/running/ready/failed`, and "not enough data yet" isn't a failure, it's a retry-later state), and exits. Nothing gets written to `persona_packs`.
 4. Otherwise, evenly samples up to 500 messages across the full time range and mines voice/tone in batches (map), then merges into one `persona` object (reduce).
 5. Builds `business_context` from `businesses` + `products` tables directly (facts, not chat-mined), with a light grounding pass over messages just for recurring value-prop phrasing.
-6. Builds `objection_playbook` and `customer_profiles` from `conversation_enrichment` (`objection_tags`, `price_objection`, `pre_purchase_questions`, `customer_intent`, `psychology`, `vibe_check`) — reusing what the analyser already wrote instead of re-reading raw transcripts.
-7. Builds `sentiment_response_map`, `closing_triggers`, `human_handoff_triggers`.
+6. Builds `objection_playbook` from customer chats tagged with a real objection (`price`, `not_ready`, `found_elsewhere`, `trust_concerns`, `size_availability`, or `price_objection = true`). `needs_more_info` and pre-purchase questions are questions, not objections, and no longer select a chat. Transcripts label each line `CUSTOMER` / `OWNER` / `AUTO`, and every entry must quote a real customer line and a real owner reply; anything else is dropped in code. `customer_profiles` still comes from the analyser's `customer_intent`, `psychology`, `vibe_check` fields.
+7. Builds `sentiment_response_map`, `closing_triggers`, `human_handoff_triggers`. Closing and handoff triggers are short generalised phrases; both stay empty when there is no real example behind them instead of being filled with generic advice.
 8. Normalizes the whole thing to the exact shape `PersonaPackEditor.jsx` expects (fills any key an LLM call might have skipped, so the editor never crashes on `undefined`), deactivates the old `persona_packs` row for this business, inserts the new one as `version = old + 1, is_active = true`, and sets `persona_pack_status = 'ready'`.
 
-## 6. Known thin spots — worth knowing before you look at the output
-- **`closing_triggers`**: only ~5 conversations across the whole DB are currently tagged `Closed`/`Closing` in `conversation_enrichment`. It'll still generate something, but treat it as low-confidence until more closes accumulate.
-- **`human_handoff_triggers`**: `handover_flag`/`handover_reason` on `conversations` are 0% populated anywhere right now, so this section is generated from negative-sentiment conversations if any exist, or general best practice if not — not real handoff examples. Revisit once handover data actually exists.
-- **Internal-vs-customer-facing filtering isn't applied yet** — the analyser doesn't write a message-level "is this actually a customer reply" flag yet. Once it does, add `.eq('is_internal', false)` to the messages query in `fetchVoiceMessages()` (it's marked with a comment at that exact spot in the file).
-- **`business_dna` is deliberately untouched** — confirmed nothing in either repo reads or writes it; it's dead code from an earlier design, superseded by `persona_packs.pack`. Nothing in this generator references it.
-- Thresholds (`MIN_VOICE_MESSAGES`, `VOICE_SAMPLE_CAP`, `MAX_OBJECTION_CONVOS`, etc.) are all named constants at the top of `generate-persona-pack.js` — tune them there as real volume grows across more businesses.
+## 6. Where the prompts live
+All persona-pack prompts (`voice_batch_extract`, `voice_reduce`, `business_context`, `objection_playbook`, `customer_profiles`, `sentiment_map`, `closing_handoff`) and the analyser's `lead_classifier` live in `src/aiPromptCatalog.js`. The generator calls them by id; the copies that used to be inlined in `generate-persona-pack.js` were dead text and have been removed. An active row in `ai_bots_config` with the same `bot_id` (edited from the admin page) overrides the catalog text, so if a prompt seems not to change, check there first.
+
+## 7. Privacy
+Every message goes through `redact()` before it reaches a prompt, a grounding check or the saved pack: KRA PINs, Kenyan phone numbers, emails, M-Pesa style receipt codes and 9+ digit numbers become `[pin]`, `[phone]`, `[email]`, `[code]`, `[number]`.
+
+## 8. Known thin spots — worth knowing before you look at the output
+- **`closing_triggers`**: only a handful of conversations per business are tagged `Closed`. Treat as low-confidence until more closes accumulate.
+- **`human_handoff_triggers`**: built only from real negative-sentiment customer chats. If a business has none, the list is empty.
+- **`business_dna` is deliberately untouched** — nothing reads or writes it; superseded by `persona_packs.pack`.
+- Thresholds (`MIN_VOICE_MESSAGES`, `VOICE_SAMPLE_CAP`, `MAX_VOICE_PER_CONVERSATION`, `MIN_PHRASE_SUPPORT`, `MAX_OBJECTION_CONVOS`, etc.) are named constants at the top of `generate-persona-pack.js`.
