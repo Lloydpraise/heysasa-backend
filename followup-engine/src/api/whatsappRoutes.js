@@ -70,9 +70,13 @@ whatsappRouter.post('/whatsapp/connection', async (req, res) => {
     const saved = await saveConnectionState(req.businessId, {
       evolution_instance_id: instanceName,
       status: 'connecting',
-      qr_code: connection?.base64 || connection?.qrcode?.base64 || connection?.qrCode || null,
-      pairing_code: connection?.pairingCode || connection?.pairing_code || connection?.code || null,
-      phone_number: phoneNumber,
+      qr_code: mode === 'phone' ? null : (connection?.base64 || connection?.qrcode?.base64 || connection?.qrCode || null),
+      // `code` is the raw QR payload in Evolution responses, not a pairing code,
+      // so it must never be stored here. Only keep a pairing code in phone mode.
+      pairing_code: mode === 'phone'
+        ? (connection?.pairingCode || connection?.pairing_code || connection?.qrcode?.pairingCode || null)
+        : null,
+      phone_number: phoneNumber ? phoneNumber.replace(/^0+/, '') : null,
       last_error: null,
       raw_payload: connection,
     })

@@ -5,13 +5,12 @@ import {
     extractAdAttribution, 
     classifyLeadType, 
     extractProductInterests, 
+    extractPhone,
     extractMessageJid,
-    extractMessageJids,
     preScanPayload 
 } from './dataCleaner.js';
 import { 
     getOrCreateContact, 
-    upsertContactBatch,
     getOrCreateConversation, 
     recordAdAttribution, 
     updateLeadStateOnReply, 
@@ -85,13 +84,15 @@ export async function processConnectionUpdate(payload, businessId) {
         return;
     }
     const sessionStatus = isConnected ? 'connected' : 'pending';
+    const incomingQr = data.qrcode?.base64 || data.qrCode || data.base64 || null;
+    const incomingPairingCode = data.pairingCode || data.pairing_code || null;
     const values = {
         business_id: businessId,
         instance_name: instanceName,
         status: sessionStatus,
         session_data: {
-            qr_code: data.qrcode?.base64 || data.qrCode || data.base64 || null,
-            pairing_code: data.pairingCode || data.pairing_code || null,
+            qr_code: incomingQr,
+            pairing_code: incomingPairingCode,
             raw_payload: payload,
         },
         updated_at: new Date().toISOString(),
@@ -104,12 +105,20 @@ export async function processConnectionUpdate(payload, businessId) {
     // in evolutionConnections.js already uses.
     const { data: existing, error: findError } = await supabase
         .from('whatsapp_sessions')
-        .select('id')
+        .select('id, session_data')
         .eq('instance_name', instanceName)
         .order('updated_at', { ascending: false })
         .limit(1)
         .maybeSingle();
     if (findError) throw findError;
+
+    // A bare "connecting" update carries no pairing code or QR. Keep the ones
+    // already stored instead of overwriting them with null while the user is
+    // still typing the code into WhatsApp.
+    if (!isConnected && existing?.session_data) {
+        values.session_data.pairing_code = incomingPairingCode || existing.session_data.pairing_code || null;
+        values.session_data.qr_code = incomingQr || existing.session_data.qr_code || null;
+    }
 
     const query = existing?.id
         ? supabase.from('whatsapp_sessions').update(values).eq('id', existing.id)
@@ -125,7 +134,7 @@ export async function processConnectionUpdate(payload, businessId) {
 // (extractMessageContent/extractAdAttribution/isGroupOrBroadcast) so both
 // paths parse a raw Baileys message identically.
 function parseMessagePayload(rawMessage) {
-    const { jid, altJid } = extractMessageJids(rawMessage);
+    const jid = extractMessageJid(rawMessage);
     if (!jid || isGroupOrBroadcast(jid) || rawMessage?.messageStubType) return null;
 
     const content = extractMessageContent(rawMessage);
@@ -133,9 +142,6 @@ function parseMessagePayload(rawMessage) {
 
     return {
         jid,
-        // The chat's other identity (LID <-> phone JID) when WhatsApp sent both, so
-        // getOrCreateContact can link them instead of creating a second contact.
-        altJid,
         // pushName on an outgoing message is the OWNER's own display name, not the
         // contact's. Using it renamed customers to the business's own name
         // ("Kitchen And All", "Lloyd Praise"). Only incoming messages carry the contact's name.
@@ -161,10 +167,10 @@ export async function processLiveMessage(messages, businessId) {
             const parsed = parseMessagePayload(rawMessage);
             if (!parsed) continue;
 
-            const { jid, altJid, pushName, isFromMe, keyId, timestamp, text, type, adAttribution, reactedMessageId } = parsed;
+            const { jid, pushName, isFromMe, keyId, timestamp, text, type, adAttribution, reactedMessageId } = parsed;
 
             // 1. Resolve Contact safely
-            const contact = await getOrCreateContact(businessId, jid, pushName, altJid);
+            const contact = await getOrCreateContact(businessId, jid, pushName);
             if (!contact?.id) {
                 debugLog('error', 'Contact ready', 'Failed to retrieve or build contact ID', { businessId, jid });
                 continue;
@@ -256,18 +262,27 @@ export async function processHistorySync(payload, businessIdOverride) {
     debugLog('info', 'History sync', 'Preparing history records', { businessId, contacts: contacts.length, chats: chats.length, messages: messages.length });
 
     const validContacts = contacts.filter(c => c.id && !isGroupOrBroadcast(c.id));
+    const contactPayloads = validContacts.map(c => ({
+        business_id:     businessId,
+        social_platform: 'whatsapp',
+        social_id:       c.id,
+        name:            c.name || c.notify || c.verifiedName || 'Unknown',
+        phone:           extractPhone(c.id),
+        lead_state:      'new',
+        lead_type:       'pending_analysis',
+        is_ad_lead:      false
+    }));
 
     let contactMap = {};
-    if (validContacts.length > 0) {
-        const { data: inserted, error } = await upsertContactBatch(businessId, validContacts, {
-            returning: true,
-            extraFields: { lead_state: 'new', lead_type: 'pending_analysis', is_ad_lead: false }
-        });
-        if (inserted?.length) {
+    if (contactPayloads.length > 0) {
+        const { data: inserted, error } = await supabase
+            .from('contacts')
+            .upsert(contactPayloads, { onConflict: 'business_id, social_platform, social_id' })
+            .select('id, social_id');
+        if (!error && inserted) {
             contactMap = inserted.reduce((acc, c) => { acc[c.social_id] = c.id; return acc; }, {});
             debugLog('ok', 'DB history contacts', `Upserted ${inserted.length} contacts`, { businessId });
-        }
-        if (error) {
+        } else if (error) {
             debugLog('error', 'DB history contacts', 'Contact history upsert failed', { businessId, error });
         }
     }
@@ -310,7 +325,7 @@ export async function processHistorySync(payload, businessIdOverride) {
     // contactMap/convoMap so repeat senders in one sync batch only hit the
     // DB once each.
     for (const msg of messages) {
-        const { jid, altJid } = extractMessageJids(msg);
+        const jid = extractMessageJid(msg);
         if (!jid || isGroupOrBroadcast(jid) || msg.messageStubType) continue;
 
         const content = extractMessageContent(msg);
@@ -319,7 +334,7 @@ export async function processHistorySync(payload, businessIdOverride) {
         let contactId = contactMap[jid];
         if (!contactId) {
             try {
-                const contact = await getOrCreateContact(businessId, jid, msg?.key?.fromMe === true ? null : msg.pushName, altJid);
+                const contact = await getOrCreateContact(businessId, jid, msg?.key?.fromMe === true ? null : msg.pushName);
                 contactId = contact?.id || null;
                 if (contactId) contactMap[jid] = contactId;
             } catch (error) {
@@ -481,12 +496,23 @@ export async function processContactsSync(payload, businessIdOverride) {
     const contacts = (payload.data || []).filter(c => c?.id && !isGroupOrBroadcast(c.id));
     if (contacts.length === 0) return;
 
-    const { error, count } = await upsertContactBatch(businessId, contacts);
+    const payloads = contacts.map(c => ({
+        business_id:     businessId,
+        social_platform: 'whatsapp',
+        social_id:       c.id,
+        name:            c.name || c.notify || c.verifiedName || 'Unknown',
+        phone:           extractPhone(c.id),
+        last_seen:       new Date().toISOString(),
+    }));
+
+    const { error } = await supabase
+        .from('contacts')
+        .upsert(payloads, { onConflict: 'business_id, social_platform, social_id' });
 
     if (error) {
         debugLog('error', 'DB contacts sync', 'Bulk contacts upsert failed', { businessId, error });
     } else {
-        debugLog('ok', 'DB contacts sync', `Upserted ${count} contacts`, { businessId });
+        debugLog('ok', 'DB contacts sync', `Upserted ${payloads.length} contacts`, { businessId });
     }
 }
 
@@ -496,12 +522,23 @@ export async function processContactsUpsert(payload, businessIdOverride) {
     const contacts = raw.filter(c => c?.id && !isGroupOrBroadcast(c.id));
     if (contacts.length === 0) return;
 
-    const { error, count } = await upsertContactBatch(businessId, contacts);
+    const payloads = contacts.map(c => ({
+        business_id:     businessId,
+        social_platform: 'whatsapp',
+        social_id:       c.id,
+        name:            c.name || c.notify || c.verifiedName || 'Unknown',
+        phone:           extractPhone(c.id),
+        last_seen:       new Date().toISOString(),
+    }));
+
+    const { error } = await supabase
+        .from('contacts')
+        .upsert(payloads, { onConflict: 'business_id, social_platform, social_id' });
 
     if (error) {
         debugLog('error', 'DB contact upsert', 'Contact upsert failed', { businessId, error });
     } else {
-        debugLog('ok', 'DB contact upsert', `Upserted ${count} contact(s)`, { businessId });
+        debugLog('ok', 'DB contact upsert', `Upserted ${payloads.length} contact(s)`, { businessId });
     }
 }
 
