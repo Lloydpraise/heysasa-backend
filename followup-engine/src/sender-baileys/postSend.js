@@ -1,6 +1,4 @@
-import { deductBalance } from '../lib/billing.js'
-import { getBillingConfig } from '../lib/db.js'
-import { DEFAULT_MSG_COST, DEFAULT_CONSENT_COST } from '../config.js'
+import { billSend } from '../lib/billing.js'
 import { decideRetry } from '../lib/sendFailures.js'
 import { log } from '../lib/log.js'
 
@@ -17,7 +15,6 @@ export async function recordSuccessfulSend(supabase, { item, contact, business, 
   // don't touch follow_up_count/current_sequence_step, and they bill
   // at the consent rate instead of the per-message follow-up rate.
   if (item.touchpoint_type === 'consent') {
-    const consentCost = await getBillingConfig(supabase, 'consent_message_cost_usd', DEFAULT_CONSENT_COST)
     await Promise.all([
       supabase.from('messages').insert({
         business_id: item.business_id,
@@ -29,14 +26,13 @@ export async function recordSuccessfulSend(supabase, { item, contact, business, 
       }),
       supabase.from('follow_up_queue').update({ status: 'sent', processed_at: now, next_step_processed: true }).eq('id', item.id),
       supabase.from('contacts').update({ consent_message_sent_at: now }).eq('id', item.contact_id),
-      deductBalance(supabase, item.business_id, consentCost, 'consent_message')
+      billSend(supabase, item.business_id, { reason: 'consent_message', runner: 'consent_send' })
     ])
     return
   }
 
   const currentCount = contact.follow_up_count ?? 0
   const sendDate = now.slice(0, 10)
-  const messageCost = await getBillingConfig(supabase, 'followup_message_cost_usd', DEFAULT_MSG_COST)
 
   const [messageInsertResult] = await Promise.all([
     // Log the message — .select('id') so we can link it onto the
@@ -84,7 +80,7 @@ export async function recordSuccessfulSend(supabase, { item, contact, business, 
       followup_total_sent: (business.followup_total_sent ?? 0) + 1
     }).eq('business_id', item.business_id),
     // Deduct message cost
-    deductBalance(supabase, item.business_id, messageCost, `followup_step_${item.sequence_step}`),
+    billSend(supabase, item.business_id, { reason: `followup_step_${item.sequence_step}`, runner: item.campaign_id ? 'campaign_send' : 'followup_send' }),
     // Daily capacity counter — v_campaign_summary and the dashboard's
     // subscribeToCapacity both read this; nothing wrote to it before.
     // Read-modify-write is fine at this volume; it's a display counter,

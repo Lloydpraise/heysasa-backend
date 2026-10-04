@@ -1,10 +1,10 @@
 import {
-  DEFAULT_DAILY_CAP, DEFAULT_MSG_COST, DEFAULT_ZONE_RECENT, DEFAULT_ZONE_MEDIUM, DEFAULT_MAX_PER_LEAD
+  DEFAULT_DAILY_CAP, DEFAULT_ZONE_RECENT, DEFAULT_ZONE_MEDIUM, DEFAULT_MAX_PER_LEAD
 } from '../config.js'
 import {
-  getBusiness, getContact, getPersonaPack, getConversation, getMessages, getBillingConfig, getDailyCount
+  getBusiness, getContact, getPersonaPack, getConversation, getMessages, getDailyCount
 } from '../lib/db.js'
-import { checkBalance, flagInsufficientFunds } from '../lib/billing.js'
+import { checkSendBalance, checkAiBalance, flagInsufficientFunds } from '../lib/billing.js'
 import { leadAgeDays, hoursSince } from '../lib/timing.js'
 import { rewriteSuggestedMessage } from './generateDraft.js'
 import { getCustomerProfile, getAutoCampaignContext } from '../lib/campaignContext.js'
@@ -150,8 +150,8 @@ export async function runWorker(supabase, queueItemId) {
   if ((contact.follow_up_count ?? 0) >= maxPerLead) return stallItem('max_followups_reached')
 
   // ── 4. Billing check ─────────────────────────────────────────
-  const msgCost = await getBillingConfig(supabase, 'followup_message_cost_usd', DEFAULT_MSG_COST)
-  const hasBalance = await checkBalance(supabase, item.business_id, msgCost)
+  // Sends are billed in KES; AI (rewrite / QC) in USD. Both wallets must be able to pay for this item.
+  const hasBalance = (await checkSendBalance(supabase, item.business_id)) && (await checkAiBalance(supabase, item.business_id))
   if (!hasBalance) {
     await flagInsufficientFunds(supabase, item.business_id)
     return stallItem('insufficient_balance')

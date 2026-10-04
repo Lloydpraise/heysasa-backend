@@ -24,13 +24,13 @@ function formatThread(messages) {
 const SUMMARY_CACHE_MAX = 500
 const summaryCache = new Map() // `${conversationId}:${lastMessageAt}` -> summary
 
-async function summariseThread(supabase, conv, messages, businessId) {
+async function summariseThread(supabase, conv, messages, businessId, skipBilling = false) {
   const thread = formatThread(messages)
   const key = conv?.id ? `${conv.id}:${messages.at(-1)?.created_at ?? ''}` : null
   if (key && summaryCache.has(key)) return summaryCache.get(key)
 
   const summary = await callBot(supabase, 'conversation_summariser', thread, SUMMARISER_FALLBACK, {
-    temperature: 0.2, maxTokens: 300, cacheKey: `summary:${businessId}`
+    temperature: 0.2, maxTokens: 300, cacheKey: `summary:${businessId}`, businessId, skipBilling
   })
   if (!summary) return thread // AI unavailable: fall back to the raw thread, and do not cache it
 
@@ -100,7 +100,7 @@ export async function generateFollowupDraft(supabase, item, contact, business, p
     materialsBlock
   ].filter(Boolean).join('\n\n')
 
-  const draft = await callBot(supabase, 'follow_up_generator', userContent, FOLLOWUP_FALLBACK, { cacheKey: `draft:${item.business_id}` })
+  const draft = await callBot(supabase, 'follow_up_generator', userContent, FOLLOWUP_FALLBACK, { cacheKey: `draft:${item.business_id}`, businessId: item.business_id })
   if (!draft) return { ok: false, reason: 'generation_failed' }
 
   const qc = await runQC(supabase, draft, pack, previousFollowups, { businessId: item.business_id })
@@ -128,7 +128,7 @@ export async function rewriteSuggestedMessage(supabase, suggestion, contact, bus
   if (messages.length) {
     convSummary = messages.length <= 8
       ? formatThread(messages)
-      : await summariseThread(supabase, conv, messages, contact.business_id)
+      : await summariseThread(supabase, conv, messages, contact.business_id, extra.skipBilling === true)
   }
 
   const parts = [
@@ -145,11 +145,11 @@ export async function rewriteSuggestedMessage(supabase, suggestion, contact, bus
   }
   const userContent = parts.join('\n\n')
 
-  const draft = await callBot(supabase, 'suggestion_rewriter', userContent, SUGGESTION_REWRITE_FALLBACK, { cacheKey: `rewrite:${contact.business_id}` })
+  const draft = await callBot(supabase, 'suggestion_rewriter', userContent, SUGGESTION_REWRITE_FALLBACK, { cacheKey: `rewrite:${contact.business_id}`, businessId: contact.business_id, skipBilling: extra.skipBilling === true })
   if (!draft) return { ok: false, reason: 'generation_failed' }
 
   const previousFollowups = await getLastSentFollowups(supabase, contact.id, 3)
-  const qc = await runQC(supabase, draft, pack, previousFollowups, { businessId: contact.business_id })
+  const qc = await runQC(supabase, draft, pack, previousFollowups, { businessId: contact.business_id, skipBilling: extra.skipBilling === true })
   if (!qc.passed && qc.attempts >= 2) {
     return { ok: false, reason: 'qc_failed', issues: qc.issues, draft }
   }

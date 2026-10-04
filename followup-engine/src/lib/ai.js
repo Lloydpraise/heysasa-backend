@@ -1,5 +1,7 @@
 import { OPENAI_KEY, OPENAI_MODEL } from '../config.js'
 import { getBotConfig } from './db.js'
+import { billAiUsage } from './billing.js'
+import { supabase as billingClient } from '../supabaseClient.js'
 import { log } from './log.js'
 import {
   classifyOpenAIFailure,
@@ -69,6 +71,20 @@ export async function callOpenAI(options) {
     if (res.ok) {
       const data = await res.json()
       const usage = data.usage ?? {}
+      // Every OpenAI response is billed here, in the one function all follow-up AI goes through.
+      // options.skipBilling is ONLY for admin previews; anything else without a businessId is
+      // logged loudly (ai.unbilled) so it cannot go unnoticed.
+      if (!options.skipBilling) {
+        if (!options.businessId) {
+          log('error', 'ai', 'ai.unbilled', `OpenAI call without a business id was NOT billed (${options.purpose ?? 'unspecified'})`, { details: { purpose: options.purpose ?? null, promptTokens: usage.prompt_tokens ?? null, completionTokens: usage.completion_tokens ?? null } })
+        } else {
+          await billAiUsage(billingClient, {
+            businessId: options.businessId, runner: options.purpose ?? 'unspecified', model: body.model,
+            promptTokens: usage.prompt_tokens ?? 0, cachedTokens: usage.prompt_tokens_details?.cached_tokens ?? 0,
+            completionTokens: usage.completion_tokens ?? 0
+          })
+        }
+      }
       log('info', 'ai', 'ai.call', `OpenAI call (${options.purpose ?? 'unspecified'})`, {
         business_id: options.businessId ?? null,
         duration_ms: durationMs,
@@ -133,6 +149,7 @@ export async function callBot(supabase, botId, userContent, fallbackPrompt, opti
     json: options.json,
     purpose: options.purpose ?? botId,
     businessId: options.businessId ?? null,
+    skipBilling: options.skipBilling === true,
     cacheKey: options.cacheKey ?? null
   })
 }

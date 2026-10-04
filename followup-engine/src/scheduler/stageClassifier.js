@@ -90,6 +90,7 @@ export async function runStageClassifier(supabase, deps, onlyConversationId = nu
         temperature: 0,        // a classifier should give the same answer twice
         maxTokens: 80,
         cacheKey: `stage:${conv.business_id}`,
+        businessId: conv.business_id,
       })
 
       if (!raw) {

@@ -3,7 +3,7 @@ import { AI_PROMPT_CATALOG } from '../../../src/aiPromptCatalog.js'
 
 export const QC_FALLBACK = AI_PROMPT_CATALOG.followup_qc.prompt
 
-export async function runQC(supabase, message, personaPack, previousMessages, { businessId = null } = {}) {
+export async function runQC(supabase, message, personaPack, previousMessages, { businessId = null, skipBilling = false } = {}) {
   const prevText = previousMessages
     .map(m => m.content?.text ?? '')
     .filter(Boolean)
@@ -16,7 +16,7 @@ export async function runQC(supabase, message, personaPack, previousMessages, { 
     `PREVIOUS 3 MESSAGES TO THIS LEAD:\n${prevText || 'None yet'}`,
     `MESSAGE TO CHECK:\n${message}`
   ].join('\n\n')
-  const aiOptions = { json: true, temperature: 0, maxTokens: 300, cacheKey: businessId ? `qc:${businessId}` : null }
+  const aiOptions = { json: true, temperature: 0, maxTokens: 300, cacheKey: businessId ? `qc:${businessId}` : null, businessId, skipBilling }
 
   // First attempt
   const raw = await callBot(supabase, 'followup_qc', userContent, QC_FALLBACK, aiOptions)

@@ -327,6 +327,114 @@ export function createAdminRouter({ getFollowupPort, isFollowupRunning }) {
         return out;
     }));
 
+    // ── Billing: usage per business, prices, runners, wallet credits ─────
+    // Everything we charge for lives in billing_prices / ai_model_prices / billing_runners,
+    // so prices change here (or in those tables) and never need a deploy.
+    const sinceFor = (days) => {
+        const d = Number(days);
+        return Number.isFinite(d) && d > 0 ? new Date(Date.now() - d * 86_400_000).toISOString() : null;
+    };
+    const num = (v, name) => {
+        const n = Number(v);
+        if (!Number.isFinite(n) || n < 0) throw httpError(400, `${name} must be a number >= 0`);
+        return n;
+    };
+
+    router.get('/admin/api/billing/overview', wrap(async (req) => {
+        const data = must(await supabase.rpc('admin_billing_overview', { p_since: sinceFor(req.query.days) }));
+        return { overview: data };
+    }));
+
+    router.get('/admin/api/billing/business/:businessId', wrap(async (req) => {
+        const id = req.params.businessId;
+        const since = sinceFor(req.query.days);
+        let q = supabase.from('ai_usage_log')
+            .select('created_at, bot_id, model, prompt_tokens, cached_tokens, completion_tokens, base_cost_usd, multiplier, billed_usd, charged_usd, shortfall_usd')
+            .eq('business_id', id).order('created_at', { ascending: false }).limit(200);
+        if (since) q = q.gte('created_at', since);
+        const usage = must(await q);
+        const tx = must(await supabase.from('balance_transactions')
+            .select('created_at, type, category, currency, amount, description, balance_after')
+            .eq('business_id', id).order('created_at', { ascending: false }).limit(100));
+        return { usage, transactions: tx };
+    }));
+
+    router.get('/admin/api/billing/prices', wrap(async () => {
+        const [prices, models, runners, outcome] = await Promise.all([
+            supabase.from('billing_prices').select('*').order('sort'),
+            supabase.from('ai_model_prices').select('*').order('model'),
+            supabase.from('billing_runners').select('*').order('auto_registered', { ascending: false }).order('runner_id'),
+            supabase.from('followup_billing_config').select('key, value, description').in('key', ['min_charge_usd', 'max_charge_usd']),
+        ]);
+        return { prices: must(prices), models: must(models), runners: must(runners), outcome: must(outcome) };
+    }));
+
+    router.put('/admin/api/billing/prices/:key', wrap(async (req) => {
+        const value = num(req.body?.value, 'value');
+        const row = must(await supabase.from('billing_prices')
+            .update({ value, updated_at: new Date().toISOString(), updated_by: 'admin' })
+            .eq('key', req.params.key).select().maybeSingle());
+        if (!row) throw httpError(404, 'unknown price key');
+        logEvent({ level: 'info', area: 'admin', event: 'admin.billing_price', message: `price ${row.key} -> ${row.value}` });
+        return { price: row };
+    }));
+
+    // Outcome (stage-change) charges still live in followup_billing_config; editable here too.
+    router.put('/admin/api/billing/outcome/:key', wrap(async (req) => {
+        if (!['min_charge_usd', 'max_charge_usd'].includes(req.params.key)) throw httpError(404, 'unknown key');
+        const value = num(req.body?.value, 'value');
+        const row = must(await supabase.from('followup_billing_config')
+            .update({ value: String(value), updated_at: new Date().toISOString() }).eq('key', req.params.key).select().maybeSingle());
+        return { row };
+    }));
+
+    router.put('/admin/api/billing/models/:model', wrap(async (req) => {
+        const b = req.body ?? {};
+        const row = must(await supabase.from('ai_model_prices').upsert({
+            model: req.params.model,
+            input_per_1m_usd: num(b.input_per_1m_usd, 'input'),
+            cached_input_per_1m_usd: num(b.cached_input_per_1m_usd, 'cached input'),
+            output_per_1m_usd: num(b.output_per_1m_usd, 'output'),
+            updated_at: new Date().toISOString(),
+        }).select().maybeSingle());
+        return { model: row };
+    }));
+
+    // Create or edit a runner. A new runner may use a named multiplier (multiplier_key) or a fixed one.
+    router.put('/admin/api/billing/runners/:id', wrap(async (req) => {
+        const b = req.body ?? {};
+        const id = String(req.params.id).trim();
+        if (!/^[a-z0-9_]{2,64}$/.test(id)) throw httpError(400, 'runner id: lowercase letters, numbers, underscore');
+        const patch = {};
+        if (b.label !== undefined) patch.label = String(b.label).slice(0, 80) || id;
+        if (b.user_label !== undefined) patch.user_label = String(b.user_label).slice(0, 60) || 'AI usage';
+        if (b.is_active !== undefined) patch.is_active = !!b.is_active;
+        if (b.multiplier_key !== undefined) patch.multiplier_key = b.multiplier_key || null;
+        if (b.multiplier !== undefined) patch.multiplier = b.multiplier === null || b.multiplier === '' ? null : num(b.multiplier, 'multiplier');
+        const existing = must(await supabase.from('billing_runners').select('runner_id').eq('runner_id', id).maybeSingle());
+        let row;
+        if (existing) {
+            // Editing a runner confirms it: it is no longer flagged "new".
+            row = must(await supabase.from('billing_runners').update({ ...patch, auto_registered: false }).eq('runner_id', id).select().maybeSingle());
+        } else {
+            row = must(await supabase.from('billing_runners').insert({
+                runner_id: id, label: id, user_label: 'AI usage', multiplier_key: 'ai_multiplier_default', ...patch, auto_registered: false,
+            }).select().maybeSingle());
+        }
+        return { runner: row };
+    }));
+
+    router.post('/admin/api/billing/credit', wrap(async (req) => {
+        const b = req.body ?? {};
+        const amount = Number(b.amount);
+        if (!b.business_id || !Number.isFinite(amount) || amount === 0) throw httpError(400, 'business_id and a non-zero amount are required');
+        const out = must(await supabase.rpc('admin_credit_wallet', {
+            p_business_id: String(b.business_id), p_currency: String(b.currency || '').toUpperCase(), p_amount: amount, p_note: String(b.note || 'admin credit').slice(0, 200),
+        }));
+        logEvent({ level: 'info', area: 'admin', event: 'admin.billing_credit', message: `${b.business_id} ${amount} ${b.currency}` });
+        return out;
+    }));
+
     // ── Overview + manual runs ───────────────────────────────────────────
     router.get('/admin/api/auto-campaigns', wrap(async () => {
         const campaigns = must(await supabase.from('campaigns')

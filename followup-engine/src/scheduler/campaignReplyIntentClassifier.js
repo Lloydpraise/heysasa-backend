@@ -99,7 +99,8 @@ export async function runCampaignReplyIntentClassifier(supabase, onlyEventId = n
         model: 'gpt-4o-mini',
         temperature: 0,
         maxTokens: 40,
-        cacheKey: `reply_intent:${businessId}`
+        cacheKey: `reply_intent:${businessId}`,
+        businessId
       })
       if (!raw) continue
 

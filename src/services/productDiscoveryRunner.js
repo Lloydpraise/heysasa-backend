@@ -894,6 +894,20 @@ async function callOpenAiJson(ctx, state, { promptId, model, user, maxTokens, in
         throw new Error(`OpenAI API returned ${res.status}: ${body.slice(0, 300)}`);
       }
       const body = await res.json();
+      // Bill the moment OpenAI answers. Truncated or unparseable responses (and retries) are still
+      // charged by OpenAI, so they are billed too. Image tokens are inside usage.prompt_tokens.
+      if (ctx.recordUsage) {
+        const u = body.usage || {};
+        try {
+          await ctx.recordUsage({
+            businessId, botId: promptId, model: resolvedModel, inputType,
+            promptTokens: u.prompt_tokens || 0, cachedTokens: u.prompt_tokens_details?.cached_tokens || 0,
+            completionTokens: u.completion_tokens || 0,
+          });
+        } catch (error) {
+          warn('Products', `Could not record AI usage for ${promptId}: ${error.message}`);
+        }
+      }
       const choice = body.choices?.[0];
       if (choice?.finish_reason === 'length') throw new Error('response truncated (finish_reason=length)');
       const raw = choice?.message?.content?.trim() || '';
@@ -902,16 +916,6 @@ async function callOpenAiJson(ctx, state, { promptId, model, user, maxTokens, in
       state.cacheStats.calls += 1;
       state.cacheStats.prompt += usage.prompt_tokens || 0;
       state.cacheStats.cached += usage.prompt_tokens_details?.cached_tokens || 0;
-      if (ctx.recordUsage) {
-        try {
-          await ctx.recordUsage({
-            businessId, botId: promptId, model: resolvedModel, inputType,
-            promptTokens: usage.prompt_tokens || 0, completionTokens: usage.completion_tokens || 0,
-          });
-        } catch (error) {
-          warn('Products', `Could not record AI usage for ${promptId}: ${error.message}`);
-        }
-      }
       log('Products', `OpenAI ${promptId} completed: ${usage.prompt_tokens || 0} input and ${usage.completion_tokens || 0} output tokens.`);
       return { json: JSON.parse(clean), promptTokens: usage.prompt_tokens || 0, completionTokens: usage.completion_tokens || 0 };
     } catch (e) {

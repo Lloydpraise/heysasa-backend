@@ -63,6 +63,7 @@
     <button data-t="preview">Preview on a lead</button>
     <button data-t="ops">Overview &amp; ops</button>
     <button data-t="waitlist">Waitlist</button>
+    <button data-t="billing">Billing</button>
   </nav>
   <span style="flex:1"></span>
   <a class="hint" href="/debug.html">Debug console</a>
@@ -192,6 +193,54 @@
       <p class="hint">Moving someone to conversation, demo done, trial, paid, lost or opted out stops their follow-up messages.</p>
     </div>
   </section>
+  <!-- BILLING -->
+  <section id="tab-billing" class="hidden">
+    <div class="card">
+      <div class="row" style="align-items:center">
+        <strong>AI &amp; send usage by business</strong>
+        <select id="b-days" style="flex:0 0 150px"><option value="1">Last 24 hours</option><option value="7">Last 7 days</option><option value="30" selected>Last 30 days</option><option value="0">All time</option></select>
+        <button class="btn" id="b-refresh" style="flex:0">Refresh</button>
+      </div>
+      <div id="b-totals" style="display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));margin:12px 0"></div>
+      <div style="overflow-x:auto"><div id="b-table">Loading…</div></div>
+      <p class="hint">Billed = OpenAI cost x runner multiplier (what the business pays). One wallet pays for AI and sends; customers see it in KES at the USD to KES rate set under Pricing. Short = billed but not collected because the balance was empty. Internal (HeySasa) businesses are recorded but never charged.</p>
+    </div>
+
+    <div class="card">
+      <strong>Pricing — change anything we charge for (no code)</strong>
+      <div id="b-prices" style="margin-top:8px">Loading…</div>
+    </div>
+
+    <div class="card">
+      <strong>AI runners</strong>
+      <p class="hint">Every AI run is billed under a runner id. A new runner (e.g. the product runner) is added automatically at the default multiplier the first time it bills — it shows up here flagged <em>new</em>. Set its multiplier below.</p>
+      <div style="overflow-x:auto"><div id="b-runners">Loading…</div></div>
+      <div class="row" style="margin-top:10px;align-items:flex-end">
+        <div><label>New runner id</label><input id="nr-id" placeholder="product_runner"></div>
+        <div><label>Name (admin)</label><input id="nr-label" placeholder="Product runner"></div>
+        <div><label>Shown to business</label><input id="nr-user" placeholder="Product matching"></div>
+        <div><label>Multiplier</label><select id="nr-key"></select></div>
+        <button class="btn primary" id="nr-add" style="flex:0 0 90px">Add</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <strong>OpenAI token prices per 1M tokens (USD)</strong>
+      <p class="hint">Used to work out the real cost of each call before the multiplier. Unknown models fall back to the <code>default</code> row. Check these against OpenAI's current pricing.</p>
+      <div style="overflow-x:auto"><div id="b-models">Loading…</div></div>
+    </div>
+
+    <div class="card">
+      <strong>Add / remove credit</strong>
+      <div class="row" style="align-items:flex-end">
+        <div style="flex:2"><label>Business</label><select id="cr-biz"></select></div>
+        <div><label>Wallet</label><select id="cr-cur"><option value="KES">KES (what the customer paid)</option><option value="USD">USD</option></select></div>
+        <div><label>Amount (negative removes)</label><input id="cr-amt" type="number" step="any" placeholder="500"></div>
+        <div style="flex:2"><label>Note</label><input id="cr-note" placeholder="M-Pesa top-up"></div>
+        <button class="btn primary" id="cr-go" style="flex:0 0 90px">Apply</button>
+      </div>
+    </div>
+  </section>
 </main>
 </div>
 
@@ -233,8 +282,8 @@ $('signout').onclick = signOut;
 $('nav').onclick = (e) => {
   const t = e.target.dataset.t; if (!t) return;
   document.querySelectorAll('#nav button').forEach((b) => b.classList.toggle('on', b === e.target));
-  ['defaults', 'prompts', 'preview', 'ops', 'waitlist'].forEach((n) => $('tab-' + n).classList.toggle('hidden', n !== t));
-  if (t === 'prompts') guard(loadBots)(); if (t === 'ops') guard(loadOps)(); if (t === 'waitlist') guard(loadWaitlist)();
+  ['defaults', 'prompts', 'preview', 'ops', 'waitlist', 'billing'].forEach((n) => $('tab-' + n).classList.toggle('hidden', n !== t));
+  if (t === 'prompts') guard(loadBots)(); if (t === 'ops') guard(loadOps)(); if (t === 'waitlist') guard(loadWaitlist)(); if (t === 'billing') guard(loadBilling)();
 };
 
 let meta = { businesses: [], industries: [], businessTypes: [], ruleIds: [] };
@@ -487,6 +536,92 @@ async function loadWaitlist() {
   });
 }
 $('w-refresh').onclick = guard(loadWaitlist);
+
+
+// ── billing ──────────────────────────────────────────────────
+const usd = (n, d = 4) => '$' + Number(n || 0).toFixed(d);
+const kes = (n) => 'KES ' + Number(n || 0).toLocaleString(undefined, { maximumFractionDigits: 2 });
+const tile = (label, value, sub = '') => `<div class="card" style="margin:0;padding:12px"><div class="hint" style="margin:0">${label}</div><div style="font-size:20px;font-weight:700">${value}</div><div class="hint" style="margin:0">${sub}</div></div>`;
+let bizDetail = null;
+
+async function loadBilling() {
+  const days = $('b-days').value;
+  const [{ overview: o }, p] = await Promise.all([api('/billing/overview?days=' + days), api('/billing/prices')]);
+  const t = o.totals;
+  $('b-totals').innerHTML =
+    tile('AI billed to businesses', usd(t.ai_billed_usd, 2), `${t.ai_calls} AI runs`) +
+    tile('OpenAI cost (real)', usd(t.ai_base_usd, 2), `margin ${usd(t.ai_billed_usd - t.ai_base_usd, 2)}`) +
+    tile('Short (billed, not collected)', usd(t.ai_shortfall_usd, 2), 'empty balances') +
+    tile('Follow-up sends', `${t.sends}`, kes(t.send_billed_kes)) +
+    tile('Balances held', usd(t.balance_usd, 2), kes(t.balance_kes));
+
+  $('b-table').innerHTML = `<table style="width:100%;border-collapse:collapse"><thead><tr style="text-align:left;color:var(--mute)">
+    <th>Business</th><th>AI runs</th><th>OpenAI cost</th><th>AI billed</th><th>Short</th><th>Sends</th><th>Send KES</th><th>Balance (USD)</th><th>Balance (KES)</th></tr></thead><tbody>` +
+    o.businesses.map((b) => {
+      const internal = b.business_type === 'heysasa' ? '<span class="pill">internal</span>' : '';
+      const runners = Object.entries(b.runners || {}).sort((a, c) => c[1].billed_usd - a[1].billed_usd)
+        .map(([r, v]) => `<span class="pill" title="${v.calls} runs, OpenAI ${usd(v.base_usd)}">${esc(r)} ${usd(v.billed_usd, 3)}</span>`).join(' ');
+      return `<tr data-b="${esc(b.business_id)}" style="border-top:1px solid var(--line);cursor:pointer"><td>${esc(b.name || b.business_id)}${internal}<small class="hint" style="display:block;margin:0">${runners || 'no AI usage in this period'}</small></td>
+        <td>${b.ai_calls}</td><td>${usd(b.ai_base_usd)}</td><td><strong>${usd(b.ai_billed_usd)}</strong></td><td style="color:${b.ai_shortfall_usd > 0 ? 'var(--red)' : 'inherit'}">${usd(b.ai_shortfall_usd)}</td>
+        <td>${b.sends}</td><td>${kes(b.send_billed_kes)}</td><td style="color:${b.balance_usd <= 0 ? 'var(--red)' : 'inherit'}">${usd(b.balance_usd, 2)}</td><td style="color:${b.balance_kes <= 0 ? 'var(--red)' : 'inherit'}">${kes(b.balance_kes)}</td></tr>
+        <tr class="b-detail hidden" data-d="${esc(b.business_id)}"><td colspan="9"></td></tr>`;
+    }).join('') + '</tbody></table>';
+  $('b-table').querySelectorAll('tr[data-b]').forEach((tr) => (tr.onclick = guard(async () => {
+    const d = $('b-table').querySelector(`tr[data-d="${CSS.escape(tr.dataset.b)}"]`);
+    if (!d.classList.contains('hidden')) return d.classList.add('hidden');
+    const { usage, transactions } = await api(`/billing/business/${encodeURIComponent(tr.dataset.b)}?days=${$('b-days').value}`);
+    d.firstElementChild.innerHTML = `<div class="hint" style="margin:6px 0">Latest AI runs</div>` + (usage.length ? `<table style="width:100%;font-size:12px"><tr style="color:var(--mute)"><th align=left>When</th><th align=left>Runner</th><th align=left>Model</th><th>In (cached)</th><th>Out</th><th>OpenAI</th><th>x</th><th>Billed</th><th>Short</th></tr>` +
+      usage.slice(0, 40).map((u) => `<tr><td>${new Date(u.created_at).toLocaleString()}</td><td>${esc(u.bot_id)}</td><td>${esc(u.model)}</td><td align=center>${u.prompt_tokens} (${u.cached_tokens ?? 0})</td><td align=center>${u.completion_tokens}</td><td align=center>${u.base_cost_usd == null ? '—' : usd(u.base_cost_usd, 5)}</td><td align=center>${u.multiplier ?? '—'}</td><td align=center>${usd(u.billed_usd, 5)}</td><td align=center>${usd(u.shortfall_usd, 5)}</td></tr>`).join('') + '</table>' : '<div class="hint">none</div>') +
+      `<div class="hint" style="margin:10px 0 6px">Latest wallet movements</div><table style="width:100%;font-size:12px">` + transactions.slice(0, 25).map((x) => `<tr><td>${new Date(x.created_at).toLocaleString()}</td><td>${esc(x.category)}</td><td>${esc(x.description || '')}</td><td align=right>${x.currency === 'KES' ? kes(x.amount) : usd(x.amount, 5)}</td><td align=right>bal ${x.balance_after == null ? '—' : (x.currency === 'KES' ? kes(x.balance_after) : usd(x.balance_after, 4))}</td></tr>`).join('') + '</table>';
+    d.classList.remove('hidden');
+  })));
+
+  // prices
+  const unitOf = (u) => (u === 'x' ? 'x' : u);
+  $('b-prices').innerHTML = p.prices.map((r) => `<div class="row" style="align-items:flex-end;margin-bottom:8px"><div style="flex:3"><label style="margin-top:0">${esc(r.label)}</label><div class="hint">${esc(r.description || '')}</div></div>
+      <div style="flex:1"><input data-price="${esc(r.key)}" type="number" step="any" value="${r.value}"></div><div style="flex:0 0 40px;padding-bottom:9px">${unitOf(r.unit)}</div><button class="btn" data-save-price="${esc(r.key)}" style="flex:0 0 70px">Save</button></div>`).join('') +
+    p.outcome.map((r) => `<div class="row" style="align-items:flex-end;margin-bottom:8px"><div style="flex:3"><label style="margin-top:0">${r.key === 'min_charge_usd' ? 'Lead outcome charge — minimum' : 'Lead outcome charge — maximum'}</label><div class="hint">${esc(r.description || 'Charged when a lead advances / is won (USD).')}</div></div>
+      <div style="flex:1"><input data-outcome="${esc(r.key)}" type="number" step="any" value="${r.value}"></div><div style="flex:0 0 40px;padding-bottom:9px">USD</div><button class="btn" data-save-outcome="${esc(r.key)}" style="flex:0 0 70px">Save</button></div>`).join('');
+  $('b-prices').querySelectorAll('[data-save-price]').forEach((b) => (b.onclick = guard(async () => { const k = b.dataset.savePrice; await api('/billing/prices/' + k, { method: 'PUT', body: { value: $('b-prices').querySelector(`[data-price="${k}"]`).value } }); flash('Saved. Takes effect on the next run.'); await loadBilling(); })));
+  $('b-prices').querySelectorAll('[data-save-outcome]').forEach((b) => (b.onclick = guard(async () => { const k = b.dataset.saveOutcome; await api('/billing/outcome/' + k, { method: 'PUT', body: { value: $('b-prices').querySelector(`[data-outcome="${k}"]`).value } }); flash('Saved.'); })));
+
+  // runners
+  const keyOpts = (sel) => p.prices.filter((r) => r.unit === 'x').map((r) => `<option value="${esc(r.key)}" ${r.key === sel ? 'selected' : ''}>${esc(r.label)} (${r.value}x)</option>`).join('');
+  $('nr-key').innerHTML = keyOpts('ai_multiplier_default');
+  $('b-runners').innerHTML = `<table style="width:100%;border-collapse:collapse"><thead><tr style="text-align:left;color:var(--mute)"><th>Runner</th><th>Multiplier</th><th>Fixed override</th><th>Shown to business</th><th></th></tr></thead><tbody>` +
+    p.runners.map((r) => `<tr data-r="${esc(r.runner_id)}" style="border-top:1px solid var(--line)"><td><code>${esc(r.runner_id)}</code>${r.auto_registered ? '<span class="pill warn">new</span>' : ''}<small class="hint" style="display:block;margin:0">${esc(r.label)}</small></td>
+      <td><select class="r-key">${keyOpts(r.multiplier_key)}</select></td><td><input class="r-mult" type="number" step="any" placeholder="none" value="${r.multiplier ?? ''}" style="width:90px"></td>
+      <td><input class="r-user" value="${esc(r.user_label)}"></td><td><button class="btn r-save">Save</button></td></tr>`).join('') + '</tbody></table>';
+  $('b-runners').querySelectorAll('tr[data-r]').forEach((tr) => (tr.querySelector('.r-save').onclick = guard(async () => {
+    await api('/billing/runners/' + tr.dataset.r, { method: 'PUT', body: { multiplier_key: tr.querySelector('.r-key').value, multiplier: tr.querySelector('.r-mult').value, user_label: tr.querySelector('.r-user').value } });
+    flash('Runner saved.'); await loadBilling();
+  })));
+
+  // models
+  $('b-models').innerHTML = `<table style="width:100%;border-collapse:collapse"><thead><tr style="text-align:left;color:var(--mute)"><th>Model</th><th>Input</th><th>Cached input</th><th>Output</th><th></th></tr></thead><tbody>` +
+    p.models.map((m) => `<tr data-m="${esc(m.model)}" style="border-top:1px solid var(--line)"><td><code>${esc(m.model)}</code></td><td><input class="m-in" type="number" step="any" value="${m.input_per_1m_usd}"></td><td><input class="m-c" type="number" step="any" value="${m.cached_input_per_1m_usd}"></td><td><input class="m-out" type="number" step="any" value="${m.output_per_1m_usd}"></td><td><button class="btn m-save">Save</button></td></tr>`).join('') +
+    `<tr data-m="" style="border-top:1px solid var(--line)"><td><input class="m-name" placeholder="new model id"></td><td><input class="m-in" type="number" step="any"></td><td><input class="m-c" type="number" step="any"></td><td><input class="m-out" type="number" step="any"></td><td><button class="btn m-save">Add</button></td></tr></tbody></table>`;
+  $('b-models').querySelectorAll('tr[data-m]').forEach((tr) => (tr.querySelector('.m-save').onclick = guard(async () => {
+    const id = tr.dataset.m || tr.querySelector('.m-name').value.trim();
+    if (!id) throw new Error('Model id required');
+    await api('/billing/models/' + encodeURIComponent(id), { method: 'PUT', body: { input_per_1m_usd: tr.querySelector('.m-in').value, cached_input_per_1m_usd: tr.querySelector('.m-c').value, output_per_1m_usd: tr.querySelector('.m-out').value } });
+    flash('Model prices saved.'); await loadBilling();
+  })));
+
+  $('cr-biz').innerHTML = o.businesses.map((b) => `<option value="${esc(b.business_id)}">${esc(b.name || b.business_id)}</option>`).join('');
+}
+$('b-refresh').onclick = guard(loadBilling);
+$('b-days').onchange = guard(loadBilling);
+$('nr-add').onclick = guard(async () => {
+  const id = $('nr-id').value.trim();
+  await api('/billing/runners/' + id, { method: 'PUT', body: { label: $('nr-label').value || id, user_label: $('nr-user').value || 'AI usage', multiplier_key: $('nr-key').value } });
+  ['nr-id', 'nr-label', 'nr-user'].forEach((i) => ($(i).value = ''));
+  flash('Runner added. Have it call bill_ai_usage with this id.'); await loadBilling();
+});
+$('cr-go').onclick = guard(async () => {
+  const r = await api('/billing/credit', { method: 'POST', body: { business_id: $('cr-biz').value, currency: $('cr-cur').value, amount: $('cr-amt').value, note: $('cr-note').value } });
+  flash(`Done. New balance: ${usd(r.new_balance, 2)} (${kes(r.new_balance_kes)})`); $('cr-amt').value = ''; await loadBilling();
+});
 
 // ── boot ─────────────────────────────────────────────────────
 async function boot() {

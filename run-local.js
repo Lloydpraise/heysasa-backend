@@ -27,6 +27,7 @@ import { AI_PROMPT_CATALOG } from './src/aiPromptCatalog.js';
 import { getAiPromptConfig } from './src/services/aiPromptConfig.js';
 import { runProductDiscovery, AlreadyRunningError } from './src/services/productDiscoveryRunner.js';
 import { formatCatalogForPrompt, groundNlpProducts, imageKeyFor } from './src/productDiscovery.js';
+import { billAiUsage } from './src/services/aiBilling.js';
 
 dotenv.config();
 
@@ -61,10 +62,6 @@ const MAX_TRANSCRIPT_MSGS = 100;
 const PAGE_SIZE = 1000;
 const CONTACT_DELAY_MIN_MS = 200;
 const CONTACT_DELAY_MAX_MS = 500;
-
-const TEXT_INPUT_COST_PER_TOKEN  = 0.000000150;
-const TEXT_OUTPUT_COST_PER_TOKEN = 0.000000600;
-const BILLING_MULTIPLIER         = 5.0;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const sleepBetweenContacts = () => sleep(
@@ -359,34 +356,6 @@ async function fetchAllPages(buildQuery) {
     return allRows;
 }
 
-// ─── Billing / Usage ──────────────────────────────────────────────────────────
-async function logAiUsage(businessId, callRunId, promptTokens, completionTokens, botId = 'enrichment_worker_local') {
-    try {
-        const baselineCost = parseFloat((
-            promptTokens     * TEXT_INPUT_COST_PER_TOKEN +
-            completionTokens * TEXT_OUTPUT_COST_PER_TOKEN
-        ).toFixed(6));
-        const operationalCost = parseFloat((baselineCost * BILLING_MULTIPLIER).toFixed(6));
-
-        await supabase.from('ai_usage_log').insert({
-            business_id:        businessId,
-            run_id:             callRunId,
-            bot_id:             botId,
-            model:              OPENAI_MODEL,
-            input_type:         'text',
-            prompt_tokens:      promptTokens,
-            completion_tokens:  completionTokens,
-            total_tokens:       promptTokens + completionTokens,
-            estimated_cost_usd: operationalCost,
-            created_at:         new Date().toISOString()
-        });
-        return operationalCost;
-    } catch (e) {
-        warn('Usage', `Log failed: ${e.message}`);
-        return 0;
-    }
-}
-
 // ─── Structural Signal Helper Functions ────────────────────────────────────────
 async function computeReadReceipt(contactId, messages = null) {
     try {
@@ -658,7 +627,7 @@ function logCacheStats(tag) {
 // Rate limits (429 rate_limit_exceeded) are waited out and retried. Only quota
 // exhaustion or a rejected key is fatal for the run: the old code treated every
 // 429 as "out of credits" and killed the whole run on a per-minute limit.
-async function callOpenAiJson({ model, system, user, maxTokens, promptId = null, attempts = 4, cacheKey = null }) {
+async function callOpenAiJson({ model, system, user, maxTokens, promptId = null, attempts = 4, cacheKey = null, billing = null }) {
     let lastError;
     const promptConfig = promptId ? await getAiPromptConfig(supabase, promptId) : null;
     const resolvedSystem = promptConfig?.prompt ?? system;
@@ -711,6 +680,15 @@ async function callOpenAiJson({ model, system, user, maxTokens, promptId = null,
                 throw new Error(`OpenAI API returned ${res.status}: ${errorBody.slice(0, 500)}`);
             }
             const body   = await res.json();
+            // Bill the moment OpenAI answers: truncated / unparseable responses and every
+            // retry are still charged by OpenAI, so they are billed too.
+            if (billing) {
+                const u = body.usage || {};
+                await billAiUsage(supabase, {
+                    businessId: billing.businessId, runner: billing.runner, model: resolvedModel, runId: billing.runId || null,
+                    promptTokens: u.prompt_tokens || 0, cachedTokens: u.prompt_tokens_details?.cached_tokens || 0, completionTokens: u.completion_tokens || 0
+                });
+            }
             const choice = body.choices?.[0];
             if (choice?.finish_reason === 'length') throw new Error('response truncated (finish_reason=length)');
             const raw   = choice?.message?.content?.trim() || '';
@@ -838,10 +816,10 @@ async function runClassificationPass() {
                     user: `BUSINESS\n${businessContext}\n\nCHAT (BUSINESS = lines sent from the owner's number; CUSTOMER = the other person, whoever they turn out to be)\n${buildTranscript(excerpt, { maxChars: 300 })}`,
                     maxTokens: 300,
                     promptId: 'lead_classifier',
-                    cacheKey: `classify:${BUSINESS_ID || contact.business_id}`
+                    cacheKey: `classify:${BUSINESS_ID || contact.business_id}`,
+                    billing: { businessId: BUSINESS_ID || contact.business_id, runner: 'classifier_local', runId: crypto.randomUUID() }
                 });
                 llm = result.json;
-                await logAiUsage(BUSINESS_ID, crypto.randomUUID(), result.promptTokens, result.completionTokens, 'classifier_local');
             }
 
             const decision = decideClassification({
@@ -1034,13 +1012,13 @@ async function loadOpenerTemplates() {
 }
 
 // ─── Step 3: NLP AI Extraction ────────────────────────────────────────────────
-async function runNLPExtraction(transcript, businessContext, productsCatalog, structuralSignals, cacheKey = null, conversationImageProducts = []) {
+async function runNLPExtraction(transcript, businessContext, productsCatalog, structuralSignals, cacheKey = null, conversationImageProducts = [], billing = null) {
     const imageProductsText = conversationImageProducts.length
         ? `\n\nPRODUCTS IDENTIFIED BY DISCOVERY IN OWNER-SENT IMAGES IN THIS CONVERSATION:\n${conversationImageProducts.map(p => `- ID: ${p.id} | Name: ${p.title}${p.aliases.length ? ` | Also called: ${p.aliases.join(', ')}` : ''}`).join('\n')}`
         : '';
     const user = `BUSINESS CONTEXT:\n${businessContext}\n\nAVAILABLE BUSINESS PRODUCTS CATALOG (includes discovered, unreviewed products):\n${productsCatalog || 'No products registered.'}${imageProductsText}\n\nPRODUCT INTEREST MATCHING RULES:\n- Record each catalog item the customer showed interest in, even if they did not choose, order, or buy it.\n- When a customer asks about a category and the owner responds with several matching catalog options, match all relevant options, not just a final selection.\n- Treat discovered products identified in the owner-sent image section as available matching targets when they were sent in response to this customer's product interest.\n- Do not infer interest from an unrelated promotion or an owner's offer that does not answer a customer product enquiry.\n\nSTRUCTURAL SIGNALS (ground truth):\n${JSON.stringify(structuralSignals, null, 2)}\n\nCONVERSATION:\n${transcript}`;
     try {
-        const result = await callOpenAiJson({ model: OPENAI_MODEL, system: AI_PROMPT_CATALOG.lead_nlp_extractor.prompt, user, maxTokens: 1300, promptId: 'lead_nlp_extractor', cacheKey });
+        const result = await callOpenAiJson({ model: OPENAI_MODEL, system: AI_PROMPT_CATALOG.lead_nlp_extractor.prompt, user, maxTokens: 1300, promptId: 'lead_nlp_extractor', cacheKey, billing });
         return { nlp: result.json, promptTokens: result.promptTokens, completionTokens: result.completionTokens };
     } catch (e) {
         throw new Error(`NLP extraction failed: ${e.message}`);
@@ -1074,8 +1052,6 @@ async function loadConversationImageProducts(businessId, messages, catalog) {
 
 async function applyNLPResults(businessId, contactId, conversationId, rawNlp, callRunId, promptTokens, completionTokens, signals, text, catalog = new Map(), conversationImageProductIds = new Set()) {
     if (!rawNlp) return { flags: [] };
-
-    await logAiUsage(businessId, callRunId, promptTokens, completionTokens);
 
     const { data: existingContact, error: existingError } = await supabase
         .from('contacts')
@@ -1217,8 +1193,8 @@ async function runProductDiscoveryPhase() {
             // Re-analysing everyone must not re-read every image: discovery has its own force switch.
             force: requestedAnalysisConfig.forceProducts === true || process.env.FORCE_PRODUCT_DISCOVERY === '1',
             log, warn, err, progress,
-            recordUsage: ({ businessId, botId, promptTokens, completionTokens }) =>
-                logAiUsage(businessId, crypto.randomUUID(), promptTokens, completionTokens, botId),
+            recordUsage: ({ businessId, model, promptTokens, cachedTokens, completionTokens }) =>
+                billAiUsage(supabase, { businessId, runner: 'product_discovery', model, promptTokens, cachedTokens, completionTokens, runId: crypto.randomUUID() }),
         });
         return {
             skipped: false,
@@ -1394,7 +1370,8 @@ async function runNLPPass() {
                 productCatalog.text,
                 structuralSignals,
                 `nlp:${businessId}`,
-                conversationImageProducts
+                conversationImageProducts,
+                { businessId, runner: 'enrichment_worker_local', runId: callRunId }
             );
 
             const applied = await applyNLPResults(

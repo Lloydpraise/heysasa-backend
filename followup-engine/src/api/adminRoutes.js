@@ -129,7 +129,7 @@ adminRouter.post('/admin/engine/preview-rewrite', async (req, res) => {
     const stored = ruleId ? await getAutoCampaignContext(supabase, contact.business_id, ruleId) : {}
     const objective = String(req.body.objective ?? '').trim() || stored.objective || null
     const playbook = String(req.body.playbook ?? '').trim() || stored.playbook || null
-    const extra = { objective, playbook, profile }
+    const extra = { objective, playbook, profile, skipBilling: true } // admin preview: not billed to the business
 
     const result = await rewriteSuggestedMessage(supabase, String(message), contact, business, pack, conv, extra)
     res.json({

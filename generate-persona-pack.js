@@ -15,6 +15,7 @@ import {
 } from './src/services/openAiGate.js';
 import { AI_PROMPT_CATALOG } from './src/aiPromptCatalog.js';
 import { getAiPromptConfig } from './src/services/aiPromptConfig.js';
+import { billAiUsage } from './src/services/aiBilling.js';
 import {
     squash, redact, isLowValueVoiceMessage, capPerConversation, phraseSupport,
     validateObjectionEntries, cleanTriggers,
@@ -75,9 +76,6 @@ const MIN_PHRASE_SUPPORT = 3;                   // a signature phrase must appea
 const OBJECTION_TAGS = ['price', 'not_ready', 'found_elsewhere', 'trust_concerns', 'size_availability'];  // 'needs_more_info' is a question, not an objection
 const MAX_DUPLICATE_MESSAGES = 3;   // one broadcast sent to 300 people must not become "your voice"
 
-const TEXT_INPUT_COST_PER_TOKEN  = 0.000000150;
-const TEXT_OUTPUT_COST_PER_TOKEN = 0.000000600;
-const BILLING_MULTIPLIER         = 5.0;
 
 if (!SUPABASE_URL || !SUPABASE_KEY || !OPENAI_KEY) {
     const missing = [
@@ -197,34 +195,6 @@ async function fetchAllPages(buildQuery) {
     return allRows;
 }
 
-// ─── Billing / usage — same table and multiplier as run-local.js, distinct bot_id ──
-async function logAiUsage(promptTokens, completionTokens, purpose) {
-    try {
-        const baselineCost = parseFloat((
-            promptTokens     * TEXT_INPUT_COST_PER_TOKEN +
-            completionTokens * TEXT_OUTPUT_COST_PER_TOKEN
-        ).toFixed(6));
-        const operationalCost = parseFloat((baselineCost * BILLING_MULTIPLIER).toFixed(6));
-
-        await supabase.from('ai_usage_log').insert({
-            business_id:        BUSINESS_ID,
-            run_id:             RUN_ID,
-            bot_id:             'persona_pack_generator',
-            model:              OPENAI_MODEL,
-            input_type:         'text',
-            prompt_tokens:      promptTokens,
-            completion_tokens:  completionTokens,
-            total_tokens:       promptTokens + completionTokens,
-            estimated_cost_usd: operationalCost,
-            created_at:         new Date().toISOString()
-        });
-        return operationalCost;
-    } catch (e) {
-        warn('Usage', `Log failed (${purpose}): ${e.message}`);
-        return 0;
-    }
-}
-
 // ─── OpenAI call wrapper — same shape as run-local.js's runNLPExtraction, ──────
 // generalized so every section-builder below can reuse it.
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -293,7 +263,14 @@ async function callOpenAI(systemPrompt, userPrompt, { json = true, maxTokens = 9
 
             const body  = await res.json();
             const usage = body.usage || {};
-            await logAiUsage(usage.prompt_tokens || 0, usage.completion_tokens || 0, purpose);
+            // Billed the moment OpenAI answers (a response that later fails to parse is still charged).
+            await billAiUsage(supabase, {
+                businessId: BUSINESS_ID, runner: 'persona_pack_generator', runId: RUN_ID,
+                model: promptConfig?.model ?? OPENAI_MODEL,
+                promptTokens: usage.prompt_tokens || 0,
+                cachedTokens: usage.prompt_tokens_details?.cached_tokens || 0,
+                completionTokens: usage.completion_tokens || 0,
+            });
 
             const raw = body.choices?.[0]?.message?.content?.trim() || '';
             if (!json) return raw;

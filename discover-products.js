@@ -9,6 +9,7 @@
 import crypto from 'node:crypto';
 import { createClient } from '@supabase/supabase-js';
 import dotenv from 'dotenv';
+import { billAiUsage } from './src/services/aiBilling.js';
 import { runProductDiscovery, AlreadyRunningError } from './src/services/productDiscoveryRunner.js';
 import { FatalRunError } from './src/leadClassification.js';
 
@@ -29,11 +30,6 @@ const BUSINESS_ID = requested.businessId || process.env.BUSINESS_ID || null;
 const FORCE = requested.force === true || process.env.FORCE === '1';
 const DRY_RUN = requested.dryRun === true || process.argv.includes('--dry-run');
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4.1-mini';
-
-// Same cost constants as run-local.js so usage is billed the same way.
-const TEXT_INPUT_COST_PER_TOKEN = 0.000000150;
-const TEXT_OUTPUT_COST_PER_TOKEN = 0.000000600;
-const BILLING_MULTIPLIER = Number(process.env.AI_BILLING_MULTIPLIER) || 5.0;
 
 const missing = [
   !SUPABASE_URL && 'SUPABASE_URL',
@@ -56,20 +52,9 @@ const log = (tag, msg, details) => emit('info', tag, msg, details);
 const warn = (tag, msg, details) => emit('warn', tag, msg, details);
 const err = (tag, msg, details) => emit('error', tag, msg, details);
 
-async function recordUsage({ businessId, botId, model, inputType, promptTokens, completionTokens }) {
-  const baseline = promptTokens * TEXT_INPUT_COST_PER_TOKEN + completionTokens * TEXT_OUTPUT_COST_PER_TOKEN;
-  await supabase.from('ai_usage_log').insert({
-    business_id: businessId,
-    run_id: crypto.randomUUID(),
-    bot_id: botId,
-    model,
-    input_type: inputType,
-    prompt_tokens: promptTokens,
-    completion_tokens: completionTokens,
-    total_tokens: promptTokens + completionTokens,
-    estimated_cost_usd: parseFloat((baseline * BILLING_MULTIPLIER).toFixed(6)),
-    created_at: new Date().toISOString(),
-  });
+// Billed through the shared bill_ai_usage function (prices and multiplier are editable in /admin).
+async function recordUsage({ businessId, model, promptTokens, cachedTokens, completionTokens }) {
+  await billAiUsage(supabase, { businessId, runner: 'product_discovery', model, promptTokens, cachedTokens, completionTokens, runId: crypto.randomUUID() });
 }
 
 async function main() {

@@ -1,7 +1,6 @@
-import { getBusiness, getPersonaPack, getConversation, getMessages, getBillingConfig } from '../lib/db.js'
+import { getBusiness, getPersonaPack, getConversation, getMessages } from '../lib/db.js'
 import { callBot } from '../lib/ai.js'
-import { checkBalance, flagInsufficientFunds } from '../lib/billing.js'
-import { DEFAULT_CONSENT_COST } from '../config.js'
+import { checkSendBalance, checkAiBalance, flagInsufficientFunds } from '../lib/billing.js'
 import { CONSENT_FALLBACK } from './prompts.js'
 import { log } from '../lib/log.js'
 
@@ -40,8 +39,8 @@ export async function runConsent(supabase) {
       const business = await getBusiness(supabase, contact.business_id)
       if (!business?.followup_ai_enabled || !business?.subscription_active) continue
 
-      const consentCost = await getBillingConfig(supabase, 'consent_message_cost_usd', DEFAULT_CONSENT_COST)
-      if (!(await checkBalance(supabase, contact.business_id, consentCost))) {
+      // A consent message is AI-written (USD) and then sent (KES): both wallets must be able to pay.
+      if (!(await checkSendBalance(supabase, contact.business_id)) || !(await checkAiBalance(supabase, contact.business_id))) {
         await flagInsufficientFunds(supabase, contact.business_id)
         continue
       }
@@ -64,7 +63,7 @@ export async function runConsent(supabase) {
         `Recent conversation:\n${snippet}`
       ].join('\n\n')
 
-      const message = await callBot(supabase, 'consent_generator', userContent, CONSENT_FALLBACK)
+      const message = await callBot(supabase, 'consent_generator', userContent, CONSENT_FALLBACK, { businessId: contact.business_id })
       if (!message) continue
 
       await supabase.from('follow_up_queue').insert({
