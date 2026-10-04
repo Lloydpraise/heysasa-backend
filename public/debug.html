@@ -16,6 +16,19 @@
     padding-top: env(safe-area-inset-top, 0px);
     padding-bottom: env(safe-area-inset-bottom, 0px);
   }
+  function matchesProductFilter(ev) {
+    if (ev.area !== 'products') return false;
+    if (state.productsLevelFilter && ev.level !== state.productsLevelFilter) return false;
+    if (state.productsBusinessFilter && ev.business_id !== state.productsBusinessFilter) return false;
+    if (state.productsSearch && !JSON.stringify(ev).toLowerCase().includes(state.productsSearch.toLowerCase())) return false;
+    return true;
+  }
+  function renderProducts() {
+    productsEventsEl.innerHTML = '';
+    const filtered = state.events.filter(matchesProductFilter);
+    productsEmptyEl.style.display = filtered.length ? 'none' : 'block';
+    filtered.slice(0, 500).forEach(ev => productsEventsEl.appendChild(renderEvent(ev)));
+  }
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--text); font-family: var(--sans); font-size: 13px; -webkit-tap-highlight-color: transparent; }
   button, input, select { font: inherit; color: inherit; }
@@ -97,10 +110,11 @@
 
   h2 { font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; margin: 20px 0 8px; }
   h2:first-child { margin-top: 0; }
-  .business-row { width: 100%; text-align: left; display: flex; flex-direction: column; gap: 8px; padding: 10px 12px; background: var(--surface); border: 1px solid var(--border); border-radius: 6px; margin-bottom: 6px; cursor: pointer; color: var(--text); }
+  .business-row { width: 100%; text-align: left; display: flex; flex-direction: column; gap: 8px; padding: 10px 12px; background: var(--surface); border: 1px solid var(--border); border-radius: 6px; margin-bottom: 6px; color: var(--text); }
   .business-row:hover { border-color: var(--faint); }
   .business-row .business-head { display: flex; justify-content: space-between; gap: 10px; align-items: center; }
   .business-row .id { color: var(--muted); font-family: var(--mono); font-size: 11px; }
+  .business-actions { display: flex; gap: 6px; flex-wrap: wrap; }
   .business-row .status-text { color: var(--muted); font-size: 11px; }
   .business-row .status-text.running { color: var(--ok); }
   .business-row .status-text.waiting { color: var(--warn); }
@@ -145,6 +159,7 @@
 
 <nav class="tabs">
   <button data-tab="live" class="active">Live</button>
+  <button data-tab="products">Products</button>
   <button data-tab="queue">Queue</button>
   <button data-tab="businesses">Businesses</button>
   <button data-tab="history">History</button>
@@ -177,6 +192,16 @@
   <div id="events"></div>
   <div class="empty" id="events-empty" style="display:none">No events match this filter yet.</div>
 </div>
+<div class="tab" id="tab-products">
+  <h2>Product discovery log</h2>
+  <div class="filters">
+    <select id="products-level"><option value="">all levels</option><option>error</option><option>warn</option><option>ok</option><option>info</option></select>
+    <select id="products-business"><option value="">all businesses</option></select>
+    <input class="search" id="products-search" placeholder="search product discovery log…">
+  </div>
+  <div id="products-events"></div>
+  <div class="empty" id="products-events-empty" style="display:none">No product discovery events match this filter yet.</div>
+</div>
 <div class="newpill" id="newpill">New events ↓</div>
 
 <div class="tab" id="tab-queue">
@@ -190,7 +215,7 @@
 </div>
 
 <div class="tab" id="tab-businesses">
-  <h2>Run analysis</h2>
+  <h2>Business actions</h2>
   <div id="business-list"></div>
 </div>
 
@@ -425,12 +450,15 @@ document.querySelectorAll('nav.tabs button').forEach(btn => {
       loadBusinesses();
       scheduleBusinessRefresh();
     }
+    if (btn.dataset.tab === 'products') renderProducts();
   };
 });
 
-const state = { events: [], levelFilter: '', areaFilter: '', bizFilter: '', search: '', paused: false, errorCount: 0, knownAreas: new Set(), knownBiz: new Set(), businesses: [] };
+const state = { events: [], levelFilter: '', areaFilter: '', bizFilter: '', search: '', productsLevelFilter: '', productsBusinessFilter: '', productsSearch: '', paused: false, errorCount: 0, knownAreas: new Set(), knownBiz: new Set(), businesses: [] };
 const eventsEl = document.getElementById('events');
 const emptyEl = document.getElementById('events-empty');
+const productsEventsEl = document.getElementById('products-events');
+const productsEmptyEl = document.getElementById('products-events-empty');
 const newpill = document.getElementById('newpill');
 const MAX_KEPT = 2000;
 
@@ -469,6 +497,10 @@ function addEvent(ev) {
       } else {
         newpill.classList.add('show');
       }
+    }
+    if (document.getElementById('tab-products').classList.contains('active') && ev.area === 'products' && matchesProductFilter(ev)) {
+      productsEventsEl.prepend(renderEvent(ev));
+      productsEmptyEl.style.display = 'none';
     }
   }
 }
@@ -536,6 +568,10 @@ function refreshBizOptions() {
   const current = sel.value;
   sel.innerHTML = '<option value="">all businesses</option>' + [...state.knownBiz].sort().map(b => `<option value="${escapeHtml(b)}">${escapeHtml(b)}</option>`).join('');
   sel.value = current;
+  const productsSel = document.getElementById('products-business');
+  const productsCurrent = productsSel.value;
+  productsSel.innerHTML = '<option value="">all businesses</option>' + [...state.knownBiz].sort().map(b => `<option value="${escapeHtml(b)}">${escapeHtml(b)}</option>`).join('');
+  productsSel.value = productsCurrent;
 }
 
 function connect() {
@@ -567,6 +603,9 @@ document.querySelectorAll('.chip').forEach(chip => {
 document.getElementById('area-filter').onchange = e => { state.areaFilter = e.target.value; render(); };
 document.getElementById('biz-filter').onchange = e => { state.bizFilter = e.target.value; render(); };
 document.getElementById('search').oninput = e => { state.search = e.target.value; render(); };
+document.getElementById('products-level').onchange = e => { state.productsLevelFilter = e.target.value; renderProducts(); };
+document.getElementById('products-business').onchange = e => { state.productsBusinessFilter = e.target.value; renderProducts(); };
+document.getElementById('products-search').oninput = e => { state.productsSearch = e.target.value; renderProducts(); };
 document.getElementById('pause-btn').onclick = e => {
   state.paused = !state.paused;
   e.target.textContent = state.paused ? 'Resume' : 'Pause';
@@ -673,7 +712,7 @@ document.getElementById('retry-all-btn').onclick = async () => {
   loadQueue();
 };
 
-async function resolveBusinessProgressState(business) {
+function resolveBusinessProgressState(business) {
   const analysisRun = business?.analysis_run || null;
   const personaRun = business?.persona_run || null;
   const productRun = business?.product_run || null;
@@ -707,8 +746,7 @@ function loadBusinesses() {
         if (!result.businesses.length) { list.innerHTML = '<div class="empty">No businesses found.</div>'; return; }
         list.replaceChildren(...result.businesses.map((b) => {
           const progress = resolveBusinessProgressState(b);
-          const row = document.createElement('button');
-          row.type = 'button';
+          const row = document.createElement('div');
           row.className = 'business-row';
           row.innerHTML = `
             <div class="business-head">
@@ -722,8 +760,22 @@ function loadBusinesses() {
                 <div class="progress-track"><div class="progress-fill" style="width:${Math.max(2, Math.min(100, Number(progress.percent) || 0))}%"></div></div>
               </div>
             ` : ''}
+            <div class="business-actions">
+              <button type="button" class="btn" data-business-action="analysis">Run analyser</button>
+              <button type="button" class="btn primary" data-business-action="products">Run product discovery</button>
+              <button type="button" class="btn" data-business-action="more">More actions</button>
+            </div>
           `;
-          row.onclick = () => openBusinessActionModal(b);
+          row.querySelectorAll('[data-business-action]').forEach((button) => {
+            button.onclick = (event) => {
+              event.stopPropagation();
+              if (button.dataset.businessAction === 'more') {
+                openBusinessActionModal(b);
+                return;
+              }
+              startBusinessAction(b, button.dataset.businessAction, button);
+            };
+          });
           return row;
         }));
       })
@@ -765,12 +817,16 @@ function closeBusinessActionModal() {
   activeBusinessAction = null;
 }
 
-async function startBusinessAction(business, action) {
+async function startBusinessAction(business, action, button = null) {
   const isProducts = action === 'products' || action === 'products_dry';
   const endpoint = isProducts ? '/debug/products/discover' : action === 'persona' ? '/debug/persona/generate' : '/debug/analysis/start';
   const label = action === 'products_dry' ? 'product discovery (dry run)' : isProducts ? 'product discovery' : action === 'persona' ? 'persona pack' : 'lead analysis';
   const payload = { businessId: business.business_id };
   if (action === 'products_dry') payload.dryRun = true;
+  if (button) {
+    button.disabled = true;
+    button.textContent = 'Starting…';
+  }
   try {
     const res = await fetch(debugUrl(endpoint), {
       method: 'POST',
@@ -778,10 +834,18 @@ async function startBusinessAction(business, action) {
       body: JSON.stringify(payload),
     });
     const result = await readJsonResponse(res);
-    if (!res.ok) throw new Error((result && (result.message || result.error)) || `Could not start ${label}`);
+    if (!res.ok || result?.ok === false) throw new Error((result && (result.message || result.error)) || `Could not start ${label}`);
     const done = isProducts ? 'Product discovery' : label === 'persona pack' ? 'Persona pack generation' : 'Lead analysis';
     alert(`${done}${action === 'products_dry' ? ' (dry run)' : ''} started for ${business.name || business.business_id}.${isProducts ? ' Watch the "products" area in the live log.' : ''}`);
-  } catch (err) { alert(err.message); }
+    loadBusinesses();
+  } catch (err) {
+    alert(err.message);
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = action === 'products' ? 'Run product discovery' : 'Run analyser';
+    }
+  }
 }
 
 document.getElementById('business-run-cancel').onclick = closeBusinessActionModal;

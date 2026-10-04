@@ -191,7 +191,7 @@ test('healthy: tiny error counts are fine, large ones are not', () => {
 const VENDOR_CHAT = 'Google review of the whole website is clear. Ads are now on. 40 of above products added.';
 
 test('versions were bumped so every existing contact is re-checked', () => {
-  assert.equal(ANALYSIS_VERSION, 3);
+  assert.equal(ANALYSIS_VERSION, 4);
   assert.equal(CLASSIFIER_VERSION, 2);
 });
 

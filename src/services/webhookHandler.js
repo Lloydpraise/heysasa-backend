@@ -23,6 +23,7 @@ import { debugLog, logEvent } from './debugConsole.js';
 import { describeConnectionUpdate, summariseClose } from './connectionDiagnostics.js';
 import { deleteSessionRecord } from './evolutionConnections.js';
 import { scheduleDisconnectNotice } from './disconnectNotice.js';
+import { triggerChatAi } from '../chatAi/index.js';
 
 async function notifyFollowupEngineActivity(contactId, conversationId, campaignStepEventId, inbound) {
     const token = process.env.DEBUG_TOKEN;
@@ -254,14 +255,23 @@ export async function processLiveMessage(messages, businessId) {
             // even once bugs #1/#2 above were fixed. Upserting on
             // whatsapp_message_id (which has a real unique constraint) also
             // makes this safe against Evolution redelivering the same event.
+            // Evolution echoes every message we send back as fromMe. If the follow-up engine or the chat AI
+            // already saved that message under its own agent_role, keep it: relabelling it 'human' would make
+            // the chat AI think the owner had taken over the chat.
+            let echoOf = null;
+            if (isFromMe && keyId) {
+                const { data: known } = await supabase.from('messages').select('role, agent_role').eq('whatsapp_message_id', keyId).maybeSingle();
+                if (known?.agent_role && known.agent_role !== 'human') echoOf = known;
+            }
+
             const { error: msgError } = await supabase.from('messages').upsert({
                 business_id: businessId,
                 conversation_id: conversationId,
                 contact_id: contactId,
                 whatsapp_message_id: keyId,
                 direction: isFromMe ? 'out' : 'in',
-                role: isFromMe ? 'admin' : 'user',
-                agent_role: isFromMe ? 'human' : 'legacy_ai',
+                role: echoOf ? echoOf.role : (isFromMe ? 'admin' : 'user'),
+                agent_role: echoOf ? echoOf.agent_role : (isFromMe ? 'human' : 'legacy_ai'),
                 type,
                 content: { text, type },
                 status: 'sent',
@@ -274,6 +284,15 @@ export async function processLiveMessage(messages, businessId) {
                 debugLog('error', 'Message Insert', 'Failed to store incoming message', { businessId, keyId, error: msgError });
             } else if (type !== 'reaction') {
                 void notifyFollowupEngineActivity(contactId, conversationId, campaignStepEventId, !isFromMe);
+                if (!isFromMe) {
+                    triggerChatAi({
+                        businessId, conversationId, contactId,
+                        message: {
+                            keyId, text, type, isFromMe, isGroupOrBroadcast: isGroupOrBroadcast(jid),
+                            sentAt: Number(timestamp) ? new Date(Number(timestamp) * 1000) : null,
+                        },
+                    });
+                }
             }
 
         } catch (error) {

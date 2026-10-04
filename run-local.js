@@ -26,7 +26,7 @@ import {
 import { AI_PROMPT_CATALOG } from './src/aiPromptCatalog.js';
 import { getAiPromptConfig } from './src/services/aiPromptConfig.js';
 import { runProductDiscovery, AlreadyRunningError } from './src/services/productDiscoveryRunner.js';
-import { formatCatalogForPrompt, groundNlpProducts } from './src/productDiscovery.js';
+import { formatCatalogForPrompt, groundNlpProducts, imageKeyFor } from './src/productDiscovery.js';
 
 dotenv.config();
 
@@ -1034,8 +1034,11 @@ async function loadOpenerTemplates() {
 }
 
 // ─── Step 3: NLP AI Extraction ────────────────────────────────────────────────
-async function runNLPExtraction(transcript, businessContext, productsCatalog, structuralSignals, cacheKey = null) {
-    const user = `BUSINESS CONTEXT:\n${businessContext}\n\nAVAILABLE BUSINESS PRODUCTS CATALOG:\n${productsCatalog || 'No products registered.'}\n\nSTRUCTURAL SIGNALS (ground truth):\n${JSON.stringify(structuralSignals, null, 2)}\n\nCONVERSATION:\n${transcript}`;
+async function runNLPExtraction(transcript, businessContext, productsCatalog, structuralSignals, cacheKey = null, conversationImageProducts = []) {
+    const imageProductsText = conversationImageProducts.length
+        ? `\n\nPRODUCTS IDENTIFIED BY DISCOVERY IN OWNER-SENT IMAGES IN THIS CONVERSATION:\n${conversationImageProducts.map(p => `- ID: ${p.id} | Name: ${p.title}${p.aliases.length ? ` | Also called: ${p.aliases.join(', ')}` : ''}`).join('\n')}`
+        : '';
+    const user = `BUSINESS CONTEXT:\n${businessContext}\n\nAVAILABLE BUSINESS PRODUCTS CATALOG (includes discovered, unreviewed products):\n${productsCatalog || 'No products registered.'}${imageProductsText}\n\nPRODUCT INTEREST MATCHING RULES:\n- Record each catalog item the customer showed interest in, even if they did not choose, order, or buy it.\n- When a customer asks about a category and the owner responds with several matching catalog options, match all relevant options, not just a final selection.\n- Treat discovered products identified in the owner-sent image section as available matching targets when they were sent in response to this customer's product interest.\n- Do not infer interest from an unrelated promotion or an owner's offer that does not answer a customer product enquiry.\n\nSTRUCTURAL SIGNALS (ground truth):\n${JSON.stringify(structuralSignals, null, 2)}\n\nCONVERSATION:\n${transcript}`;
     try {
         const result = await callOpenAiJson({ model: OPENAI_MODEL, system: AI_PROMPT_CATALOG.lead_nlp_extractor.prompt, user, maxTokens: 1300, promptId: 'lead_nlp_extractor', cacheKey });
         return { nlp: result.json, promptTokens: result.promptTokens, completionTokens: result.completionTokens };
@@ -1044,7 +1047,32 @@ async function runNLPExtraction(transcript, businessContext, productsCatalog, st
     }
 }
 
-async function applyNLPResults(businessId, contactId, conversationId, rawNlp, callRunId, promptTokens, completionTokens, signals, text, catalog = new Map()) {
+async function loadConversationImageProducts(businessId, messages, catalog) {
+    const imageKeys = [...new Set(messages
+        .filter(m => !isInbound(m) && m.type === 'image')
+        .map(imageKeyFor)
+        .filter(Boolean))];
+    if (!imageKeys.length) return [];
+
+    const { data, error } = await supabase.from('product_mentions')
+        .select('product_id')
+        .eq('business_id', businessId)
+        .eq('kind', 'image')
+        .in('source_ref', imageKeys);
+    if (error) throw new Error(`Image product lookup failed: ${error.message}`);
+
+    const seen = new Set();
+    return (data || [])
+        .map(row => String(row.product_id))
+        .filter(id => {
+            if (!catalog.has(id) || seen.has(id)) return false;
+            seen.add(id);
+            return true;
+        })
+        .map(id => ({ id, ...catalog.get(id) }));
+}
+
+async function applyNLPResults(businessId, contactId, conversationId, rawNlp, callRunId, promptTokens, completionTokens, signals, text, catalog = new Map(), conversationImageProductIds = new Set()) {
     if (!rawNlp) return { flags: [] };
 
     await logAiUsage(businessId, callRunId, promptTokens, completionTokens);
@@ -1069,9 +1097,9 @@ async function applyNLPResults(businessId, contactId, conversationId, rawNlp, ca
         openerTemplates: text.openerTemplates,
     });
 
-    // Products are held to the approved catalog and to what the chat actually says:
-    // an ID that is not in the catalog, or an item nobody mentioned, is dropped.
-    const groundedProducts = groundNlpProducts(nlp, { catalog, fullText: text.fullText });
+    // Canonicalize NLP product names against the approved/discovered catalog;
+    // owner-sent image matches are valid only when discovery linked them to this conversation.
+    const groundedProducts = groundNlpProducts(nlp, { catalog, fullText: text.fullText, conversationImageProductIds });
     nlp.matched_products = groundedProducts.matched_products;
     nlp.product_tags = groundedProducts.product_tags;
     flags.push(...groundedProducts.flags);
@@ -1124,6 +1152,7 @@ async function applyNLPResults(businessId, contactId, conversationId, rawNlp, ca
         sentiment_score:        nlp.sentiment_score        ?? null,
         price_objection:        nlp.price_objection        || false,
         product_tags:           nlp.product_tags           || [],
+        matched_products:       nlp.matched_products       || [],
         last_enriched_at:       new Date().toISOString(),
     }, { onConflict: 'conversation_id' });
     if (enrichmentError) throw new Error(`conversation_enrichment write failed: ${enrichmentError.message}`);
@@ -1248,6 +1277,7 @@ async function runNLPPass() {
     const businessCache = new Map();
     const currencyCache = new Map();
     const productsCache = new Map();
+    let imageProductLookupWarningLogged = false;
 
     let nlpDone = 0;
     const guard = new FailureGuard('NLP');
@@ -1272,16 +1302,16 @@ async function runNLPPass() {
                 currencyCache.set(businessId, business?.currency || 'KES');
             }
 
-            // The analyser only ever sees products the owner approved and left visible to the AI.
-            // Discovered (unreviewed) and dismissed products are kept out on purpose.
+            // Discovered products are valid demand-matching targets; dismissed
+            // products are excluded and approved products still respect ai_visible.
             if (!productsCache.has(businessId)) {
                 let products;
                 const approved = await supabase
                     .from('products')
-                    .select('id, title, price, type, aliases, category')
+                    .select('id, title, price, type, aliases, category, status, ai_visible, mention_count')
                     .eq('business_id', businessId)
-                    .eq('status', 'approved')
-                    .eq('ai_visible', true);
+                    .in('status', ['approved', 'discovered'])
+                    .order('mention_count', { ascending: false });
                 if (approved.error) {
                     // The products migration has not been run yet: behave as before rather than fail the analysis.
                     if (!/column .* does not exist|42703/i.test(`${approved.error.code} ${approved.error.message}`)) {
@@ -1292,13 +1322,16 @@ async function runNLPPass() {
                     if (legacy.error) throw new Error(`Product lookup failed: ${legacy.error.message}`);
                     products = legacy.data || [];
                 } else {
-                    products = approved.data || [];
+                    products = (approved.data || []).filter(p => p.status === 'discovered' || p.ai_visible === true);
                 }
+                const discoveredCount = products.filter(p => p.status === 'discovered').length;
                 productsCache.set(businessId, {
                     text: formatCatalogForPrompt(products, { currency: currencyCache.get(businessId) }),
-                    map: new Map(products.map((p) => [String(p.id), { title: p.title, aliases: Array.isArray(p.aliases) ? p.aliases : [] }])),
+                    map: new Map(products.map((p) => [String(p.id), {
+                        title: p.title, aliases: Array.isArray(p.aliases) ? p.aliases : [], status: p.status,
+                    }])),
                 });
-                log('NLP', `${products.length} approved products loaded for ${businessId}.`);
+                log('NLP', `${products.length} approved/discovered products loaded for ${businessId} (${discoveredCount} discovered).`);
             }
 
             const messages = await fetchContactMessages(conv.contact_id);
@@ -1337,6 +1370,19 @@ async function runNLPPass() {
                 customerMessages,
                 openerTemplates,
             };
+            const productCatalog = productsCache.get(businessId);
+            let conversationImageProducts = [];
+            try {
+                conversationImageProducts = await loadConversationImageProducts(businessId, window, productCatalog.map);
+                if (conversationImageProducts.length) {
+                    log('NLP', `${conversationImageProducts.length} catalog product(s) identified by discovery in owner-sent images for conversation ${conv.id}.`);
+                }
+            } catch (error) {
+                if (!imageProductLookupWarningLogged) {
+                    warn('NLP', `Could not associate discovered image products with conversations: ${error.message}`);
+                    imageProductLookupWarningLogged = true;
+                }
+            }
             const openersSeen = [...new Set(customerMessages.filter(t => openerTemplates.has(normalizeText(t))))];
             if (openersSeen.length) structuralSignals.prefilled_opener_texts = openersSeen;
             const callRunId = crypto.randomUUID();
@@ -1345,15 +1391,17 @@ async function runNLPPass() {
             const result = await runNLPExtraction(
                 transcript,
                 businessCache.get(businessId),
-                productsCache.get(businessId).text,
+                productCatalog.text,
                 structuralSignals,
-                `nlp:${businessId}`
+                `nlp:${businessId}`,
+                conversationImageProducts
             );
 
             const applied = await applyNLPResults(
                 businessId, conv.contact_id, conv.id, result.nlp,
                 callRunId, result.promptTokens, result.completionTokens,
-                structuralSignals, text, productsCache.get(businessId).map
+                structuralSignals, text, productCatalog.map,
+                new Set(conversationImageProducts.map(p => p.id))
             );
             for (const f of applied.flags) flagCounts[f] = (flagCounts[f] || 0) + 1;
             enrichedCount++;

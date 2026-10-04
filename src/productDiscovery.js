@@ -376,6 +376,7 @@ export function formatCatalogForPrompt(products, { currency = 'KES', maxLines = 
     const parts = [`ID: ${p.id}`, `Name: ${String(p.title || '').replace(/\s+/g, ' ').trim()}`];
     const money = formatMoney(p.price, currency);
     if (money) parts.push(`Price: ${money}`);
+    if (p.status === 'discovered') parts.push('Status: discovered, unreviewed');
     if (p.type === 'service') parts.push('Type: service');
     if (p.category) parts.push(`Category: ${String(p.category).replace(/\s+/g, ' ').trim()}`);
     const aliases = (Array.isArray(p.aliases) ? p.aliases : []).slice(0, 4);
@@ -392,24 +393,38 @@ export function formatCatalogForPrompt(products, { currency = 'KES', maxLines = 
 
 // ─── Keeping the analyser honest about products ──────────────────────────────
 // catalog: Map(id -> { title, aliases }). fullText: both sides of the chat.
-export function groundNlpProducts(nlp, { catalog, fullText }) {
+export function groundNlpProducts(nlp, { catalog, fullText, conversationImageProductIds = new Set() }) {
   const flags = [];
   const chatTokens = new Set(nameTokens(fullText));
-  const grounded = (name) => nameTokens(name).some((t) => chatTokens.has(t));
-
-  const matched = [];
+  const grounded = (name) => {
+    const tokens = nameTokens(name);
+    return tokens.length > 0 && tokens.every((token) => chatTokens.has(token));
+  };
+  const catalogProducts = [...catalog].map(([id, product]) => ({ id, ...product }));
+  const matched = new Map();
+  const matchedKeys = new Set();
+  const addMatched = (product) => {
+    if (!matched.has(product.id)) {
+      matched.set(product.id, { product_id: product.id, product_name: product.title, match_status: 'matched' });
+    }
+  };
   for (const entry of Array.isArray(nlp?.matched_products) ? nlp.matched_products : []) {
     const name = String(entry?.product_name ?? '').trim();
     const id = entry?.product_id === null || entry?.product_id === undefined ? null : String(entry.product_id);
-    const hit = id ? catalog.get(id) : null;
+    const idHit = id ? catalog.get(id) : null;
+    const nameHit = name ? findBestProductMatch(name, catalogProducts)?.product : null;
+    const hit = idHit ? { id, ...idHit } : (grounded(name) ? nameHit : null);
+    if (id && !idHit) flags.push('product_id_not_in_catalog');
     if (hit) {
       const names = [hit.title, ...(hit.aliases || [])];
-      if (!names.some(grounded)) { flags.push('product_match_ungrounded'); continue; }
-      matched.push({ product_id: id, product_name: hit.title, match_status: 'matched' });
+      if (!names.some(grounded) && !conversationImageProductIds.has(hit.id)) { flags.push('product_match_ungrounded'); continue; }
+      addMatched(hit);
     } else {
-      if (id) flags.push('product_id_not_in_catalog');
       if (!name || !grounded(name)) { flags.push('product_name_ungrounded'); continue; }
-      matched.push({ product_id: null, product_name: name.slice(0, 120), match_status: 'no match' });
+      const key = name.toLowerCase();
+      if (matchedKeys.has(key)) continue;
+      matchedKeys.add(key);
+      matched.set(`unmatched:${key}`, { product_id: null, product_name: name.slice(0, 120), match_status: 'no match' });
     }
   }
 
@@ -418,9 +433,17 @@ export function groundNlpProducts(nlp, { catalog, fullText }) {
     const t = String(tag ?? '').trim();
     if (!t) continue;
     if (!grounded(t)) { flags.push('product_tag_ungrounded'); continue; }
-    if (!tags.some((x) => x.toLowerCase() === t.toLowerCase())) tags.push(t.slice(0, 80));
+    const hit = findBestProductMatch(t, catalogProducts)?.product;
+    const canonicalHit = hit && ([hit.title, ...(hit.aliases || [])].some(grounded) || conversationImageProductIds.has(hit.id))
+      ? hit
+      : null;
+    const tagValue = (canonicalHit?.title || t).slice(0, 80);
+    if (!tags.some((x) => x.toLowerCase() === tagValue.toLowerCase())) tags.push(tagValue);
+    if (canonicalHit) {
+      addMatched(canonicalHit);
+    }
   }
-  return { matched_products: matched, product_tags: tags.slice(0, 5), flags: [...new Set(flags)] };
+  return { matched_products: [...matched.values()], product_tags: tags.slice(0, 5), flags: [...new Set(flags)] };
 }
 
 // ─── Categories ──────────────────────────────────────────────────────────────

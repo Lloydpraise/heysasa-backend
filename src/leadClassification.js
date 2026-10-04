@@ -48,13 +48,13 @@ export function resolveLeadClassification(nlp = {}, existingLeadType = null) {
 
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Analyser v2: separation, verification and single-owner scoring rules.
+// Analyser v4: separation, verification, demand matching and single-owner scoring rules.
 // Everything below is pure (no DB / network) so it can be unit-tested.
 // ─────────────────────────────────────────────────────────────────────────────
 
 // Bump when the analysis prompt/rules change. Contacts analysed under an older
 // version are re-analysed on the next run and their old scores are ignored.
-export const ANALYSIS_VERSION = 3;
+export const ANALYSIS_VERSION = 4;
 
 // Bump when the classifier prompt or its rules change. Contacts classified under
 // an older version are re-classified on the next run (manual labels never are).

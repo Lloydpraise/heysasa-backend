@@ -49,12 +49,12 @@ if (missing.length) {
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, { auth: { persistSession: false } });
 
 // One parseable line per call, picked up by src/productRoutes.js and shown in the debug console (area: products).
-function emit(level, tag, message) {
-  console.log(`@@LOG ${JSON.stringify({ level, area: 'products', event: tag, message, business_id: BUSINESS_ID, details: {} })}`);
+function emit(level, tag, message, details = {}) {
+  console.log(`@@LOG ${JSON.stringify({ level, area: 'products', event: tag, message, business_id: BUSINESS_ID, details })}`);
 }
-const log = (tag, msg) => emit('info', tag, msg);
-const warn = (tag, msg) => emit('warn', tag, msg);
-const err = (tag, msg) => emit('error', tag, msg);
+const log = (tag, msg, details) => emit('info', tag, msg, details);
+const warn = (tag, msg, details) => emit('warn', tag, msg, details);
+const err = (tag, msg, details) => emit('error', tag, msg, details);
 
 async function recordUsage({ businessId, botId, model, inputType, promptTokens, completionTokens }) {
   const baseline = promptTokens * TEXT_INPUT_COST_PER_TOKEN + completionTokens * TEXT_OUTPUT_COST_PER_TOKEN;
@@ -78,11 +78,12 @@ async function main() {
     supabase, businessId: BUSINESS_ID, openaiKey: OPENAI_KEY,
     textModel: OPENAI_MODEL, visionModel: process.env.OPENAI_VISION_MODEL || OPENAI_MODEL,
     force: FORCE, dryRun: DRY_RUN, log, warn, err, recordUsage,
+    progress: (_runPhase, done, total, phase) => emit('info', 'products.progress', `${phase}: ${done}/${total}`, { phase, done, total }),
   });
   if (summary.reason === 'no_classified_customers') {
     warn('Summary', `⚠️ PRODUCT DISCOVERY has nothing to read for ${BUSINESS_ID}: ${summary.notes[0]}`);
   } else {
-    log('Summary', `✅ PRODUCT DISCOVERY COMPLETE for ${BUSINESS_ID}: ${summary.new_discovered} new products found, ${summary.matched_approved + summary.matched_discovered} matched to products already on file, ${summary.images_read} images read, ${summary.images_unreachable} images could not be opened.`);
+    log('Summary', `✅ PRODUCT DISCOVERY COMPLETE for ${BUSINESS_ID}: ${summary.new_discovered} new products found, ${summary.matched_approved + summary.matched_discovered} matched to products already on file, ${summary.images_read} images read, ${summary.images_unreachable} images could not be opened.`, summary);
   }
   if (DRY_RUN && summary.preview) {
     // one readable line per item so it reads well in the admin live log
@@ -99,7 +100,7 @@ main().catch((e) => {
     warn('Products', `${e.message} Exiting so two runs do not read the same chats.`);
     process.exit(3);
   }
-  err('Main', `Execution failed: ${e.message}`);
-  err('Summary', `❌ PRODUCT DISCOVERY FAILED for ${BUSINESS_ID}: ${e.message}${e instanceof FatalRunError ? ' (OpenAI problem, check key and credits)' : ''}`);
+  err('Main', `Execution failed: ${e.message}`, { name: e.name, stack: e.stack });
+  err('Summary', `❌ PRODUCT DISCOVERY FAILED for ${BUSINESS_ID}: ${e.message}${e instanceof FatalRunError ? ' (OpenAI problem, check key and credits)' : ''}`, { name: e.name });
   process.exit(1);
 });

@@ -87,11 +87,13 @@ export async function runProductDiscovery(ctx) {
 
   try {
     // ── load ────────────────────────────────────────────────────────────────
+    log('Products', 'Loading business, existing products and customer chats.');
     await setProgress(ctx, run, 'loading', 0, 1);
     const business = await loadBusiness(supabase, businessId);
     const products = await loadProducts(supabase, businessId);
     const contactIds = await loadCustomerContactIds(supabase, businessId);
     summary.customer_chats = contactIds.size;
+    log('Products', `Loaded business "${business.name}", ${products.length} products and ${contactIds.size} customer chats.`);
     if (!contactIds.size) {
       summary.reason = 'no_classified_customers';
       summary.notes.push('No chats are marked as customers yet. Run the analyser first so vendors, staff and personal chats are kept out.');
@@ -104,11 +106,13 @@ export async function runProductDiscovery(ctx) {
 
     const messages = await loadMessages(supabase, businessId, contactIds, false);
     const byContact = groupByContact(messages);
+    log('Products', `Loaded ${messages.length} customer-chat messages across ${byContact.size} chats.`);
 
     // ── text ────────────────────────────────────────────────────────────────
     const candidates = [];
     const snippets = buildSnippets(byContact, since);
     summary.snippets_read = snippets.length;
+    log('Products', `Selected ${snippets.length} product-relevant owner messages for text extraction.`, { snippets: snippets.length });
     if (snippets.length) {
       const textResult = await mineText(ctx, run, state, business, snippets, textModel);
       candidates.push(...textResult.candidates);
@@ -116,6 +120,7 @@ export async function runProductDiscovery(ctx) {
       summary.text_dropped_unverified = textResult.droppedUnverified;
       summary.text_price_dropped = textResult.priceDropped;
       summary.failed_batches += textResult.failedBatches;
+      log('Products', `Text extraction finished: ${textResult.candidates.length} candidates, ${textResult.droppedUnverified} rejected as unverified, ${textResult.priceDropped} unsupported prices removed, ${textResult.failedBatches} failed batches.`);
     } else {
       log('Products', 'No new product-like owner messages to read.');
     }
@@ -123,21 +128,28 @@ export async function runProductDiscovery(ctx) {
     // ── images ──────────────────────────────────────────────────────────────
     const imageResult = await mineImages(ctx, run, state, business, byContact, contactIds, visionModel, summary);
     candidates.push(...imageResult.candidates);
+    log('Products', `Evidence collection finished with ${candidates.length} product candidates (${summary.text_candidates} from text, ${imageResult.candidates.length} from images).`);
 
     // ── cluster, consolidate, match, save ───────────────────────────────────
     await setProgress(ctx, run, 'consolidating', 0, 1);
+    log('Products', `Clustering ${candidates.length} candidates into product groups.`);
     let clusters = clusterCandidates(candidates);
+    log('Products', `Initial clustering produced ${clusters.length} product groups.`);
     clusters = await consolidate(ctx, state, clusters, textModel, summary);
     summary.clusters = clusters.length;
+    log('Products', `Consolidation finished with ${clusters.length} product groups.`);
 
     await setProgress(ctx, run, 'saving', 0, clusters.length || 1);
+    log('Products', `Matching ${clusters.length} groups against ${products.length} existing products and planning changes.`);
     const plan = planWrites(clusters, products, summary);
+    log('Products', `Write plan: ${plan.newProducts.length} new products, ${plan.touched.size} existing products to update, ${plan.mentions.length} evidence records, ${summary.dropped_weak} weak-evidence groups dropped.`);
     await categorize(ctx, state, plan, products, textModel, summary);
     if (dryRun) {
       const catByTitle = new Map(plan.newProducts.map((r) => [r.title, r.category]));
       summary.preview = plan.preview.map((p) => (p.decision === 'new_discovered' ? { ...p, category: catByTitle.get(p.name) || null } : p));
       log('Products', `Dry run: would add ${plan.newProducts.length} discovered, update ${plan.touched.size} existing. Nothing was written.`);
     } else {
+      log('Products', 'Writing discovered products, evidence and refreshed product counts.');
       await writePlan(ctx, run, businessId, plan, imageResult.imageUploads);
     }
     summary.new_discovered = plan.newProducts.length;
@@ -180,17 +192,23 @@ async function startRun(ctx) {
 }
 
 async function setProgress(ctx, run, phase, done, total) {
-  if (ctx.progress) { try { await ctx.progress('products', done, total); } catch { /* the analyser's own progress is best effort */ } }
+  if (ctx.progress) {
+    try { await ctx.progress('products', done, total, phase); }
+    catch (error) { if (ctx.warn) ctx.warn('Products', `Could not report ${phase} progress: ${error.message}`); }
+  }
   if (!run.id) return;
   const now = Date.now();
   const finished = total > 0 && done >= total;
   if (!finished && done !== 0 && now - (run.lastWrite || 0) < 4000) return;
   run.lastWrite = now;
   try {
-    await ctx.supabase.from('enrichment_runs').update({
+    const { error } = await ctx.supabase.from('enrichment_runs').update({
       phase, progress_done: done, progress_total: total, heartbeat_at: new Date().toISOString(),
     }).eq('id', run.id);
-  } catch { /* progress is best effort */ }
+    if (error && ctx.warn) ctx.warn('Products', `Could not save ${phase} progress: ${error.message}`);
+  } catch (error) {
+    if (ctx.warn) ctx.warn('Products', `Could not save ${phase} progress: ${error.message}`);
+  }
 }
 
 async function finishRun(ctx, run, status, summary) {
@@ -205,10 +223,13 @@ async function finishRun(ctx, run, status, summary) {
 async function failRun(ctx, run, e) {
   if (!run.id) return;
   try {
-    await ctx.supabase.from('enrichment_runs').update({
+    const { error } = await ctx.supabase.from('enrichment_runs').update({
       status: 'failed', finished_at: new Date().toISOString(), fatal_error: String(e?.message || e).slice(0, 1000),
     }).eq('id', run.id);
-  } catch { /* nothing more to do */ }
+    if (error && ctx.warn) ctx.warn('Products', `Could not save failed run status: ${error.message}`);
+  } catch (error) {
+    if (ctx.warn) ctx.warn('Products', `Could not save failed run status: ${error.message}`);
+  }
 }
 
 async function lastCompletedRunStart(supabase, businessId) {
@@ -318,11 +339,15 @@ async function mineText(ctx, run, state, business, snippets, model) {
   let droppedUnverified = 0;
   let priceDropped = 0;
   let failedBatches = 0;
-  log('Products', `Reading ${snippets.length} owner messages in ${batches.length} batches.`);
+  log('Products', `Starting text extraction: ${snippets.length} selected owner messages in ${batches.length} batches using ${model}.`);
 
   for (let i = 0; i < batches.length; i++) {
     await setProgress(ctx, run, 'text', i, batches.length);
     const batch = batches[i];
+    const beforeCandidates = candidates.length;
+    const beforeUnverified = droppedUnverified;
+    const beforePriceDropped = priceDropped;
+    log('Products', `Text batch ${i + 1}/${batches.length}: extracting products from ${batch.length} owner messages.`);
     const user = [
       `BUSINESS: ${business.name || 'unknown'} | industry: ${business.industry || 'unknown'} | type: ${business.business_type || 'unknown'} | currency: ${business.currency || 'KES'}`,
       'SNIPPETS:',
@@ -351,6 +376,7 @@ async function mineText(ctx, run, state, business, snippets, model) {
           },
         });
       }
+      log('Products', `Text batch ${i + 1}/${batches.length} complete: ${candidates.length - beforeCandidates} candidates retained, ${droppedUnverified - beforeUnverified} unverified results rejected, ${priceDropped - beforePriceDropped} unsupported prices removed.`);
     } catch (e) {
       if (e instanceof FatalRunError) throw e;
       failedBatches++;
@@ -371,7 +397,10 @@ async function mineImages(ctx, run, state, business, byContact, contactIds, mode
 
   const imageMessages = await loadMessages(supabase, businessId, contactIds, true);
   summary.images_seen = imageMessages.length;
-  if (!imageMessages.length) return out;
+  if (!imageMessages.length) {
+    log('Products', 'No owner-sent images were found in customer chats.');
+    return out;
+  }
 
   const groups = new Map();
   for (const m of imageMessages) {
@@ -397,25 +426,30 @@ async function mineImages(ctx, run, state, business, byContact, contactIds, mode
     .sort((a, b) => (b.contacts.size - a.contacts.size) || String(b.messages.at(-1).created_at).localeCompare(String(a.messages.at(-1).created_at)));
   const batch = todo.slice(0, MAX_IMAGES_PER_RUN);
   summary.images_left_for_next_run = todo.length - batch.length;
-  log('Products', `${imageMessages.length} images sent, ${groups.size} distinct, ${todo.length} not read yet; reading ${batch.length} now.`);
+  log('Products', `${imageMessages.length} owner-sent images grouped into ${groups.size} distinct images; ${groups.size - todo.length} already read, ${todo.length} need reading, processing ${batch.length} this run${summary.images_left_for_next_run ? `, ${summary.images_left_for_next_run} deferred by the per-run limit` : ''}.`);
 
   for (let i = 0; i < batch.length; i++) {
     await setProgress(ctx, run, 'images', i, batch.length);
     const group = batch[i];
+    log('Products', `Image ${i + 1}/${batch.length}: resolving source (${group.messages.length} sends across ${group.contacts.size} chats).`);
     try {
       const resolved = await resolveImage(group, warn);
       if (!resolved) {
         summary.images_unreachable++;
         if (!dryRun) await saveImageRead(supabase, businessId, group, { status: 'unreachable', error: 'image could not be downloaded or decrypted' });
+        warn('Products', `Image ${i + 1}/${batch.length}: no usable original or thumbnail; marked unreachable.`);
         continue;
       }
+      log('Products', `Image ${i + 1}/${batch.length}: resolved ${resolved.source}${resolved.lowRes ? ' (thumbnail/low resolution)' : ''}; sending to image classifier.`);
       const hints = imageHints(group, byContact);
       const read = await readImage(ctx, state, resolved, hints, model);
+      log('Products', `Image ${i + 1}/${batch.length}: classified as ${read.imageType}, ${read.items.length} product candidates, confidence ${read.confidence}.`);
       if (resolved.lowRes) summary.images_low_res++;
       if (!KEEP_IMAGE_TYPES.has(read.imageType) || !read.items.length) {
         if (['payment_proof', 'document', 'personal', 'screenshot'].includes(read.imageType)) summary.images_private_skipped++;
         if (!dryRun) await saveImageRead(supabase, businessId, group, { status: 'read', imageType: read.imageType, items: [], source: resolved.source, lowRes: resolved.lowRes });
         summary.images_read++;
+        log('Products', `Image ${i + 1}/${batch.length}: no product candidates retained${KEEP_IMAGE_TYPES.has(read.imageType) ? '' : ` (classified as ${read.imageType})`}.`);
         continue;
       }
       let imageUrl = resolved.url || null;
@@ -437,6 +471,7 @@ async function mineImages(ctx, run, state, business, byContact, contactIds, mode
         status: 'read', imageType: read.imageType, items: read.items, imageUrl, source: resolved.source, lowRes: resolved.lowRes,
       });
       summary.images_read++;
+      log('Products', `Image ${i + 1}/${batch.length}: retained ${read.items.length} candidates${dryRun ? '' : ' and saved image-read result'}.`);
     } catch (e) {
       if (e instanceof FatalRunError) throw e;
       warn('Products', `Image ${group.key.slice(0, 24)} failed: ${e.message}`);
@@ -577,11 +612,15 @@ async function saveImageRead(supabase, businessId, group, { status, imageType = 
 
 // ─── Consolidation (model suggests merges, code checks them) ─────────────────
 async function consolidate(ctx, state, clusters, model, summary) {
-  if (clusters.length < 2) return clusters;
   const { log = () => {}, warn = () => {} } = ctx;
+  if (clusters.length < 2) {
+    log('Products', `Skipping AI consolidation: only ${clusters.length} product group${clusters.length === 1 ? '' : 's'}.`);
+    return clusters;
+  }
   const ranked = [...clusters].sort((a, b) => b.sources.length - a.sources.length);
   const head = ranked.slice(0, MAX_CONSOLIDATE);
   const tail = ranked.slice(MAX_CONSOLIDATE);
+  if (tail.length) log('Products', `${tail.length} groups exceed the AI consolidation limit and will be left as-is.`);
   const list = head.map((c, i) => ({ i, name: c.name, others: c.aliases.slice(0, 3), kind: c.kind, price: pickPrice(c.observedPrices).price, mentions: c.sources.length }));
   try {
     const result = await callOpenAiJson(ctx, state, {
@@ -611,11 +650,18 @@ async function categorize(ctx, state, plan, products, model, summary) {
     ...products.filter((p) => p.status !== 'dismissed' && !p.category)
       .map((p) => ({ kind: 'existing', product: p, name: p.title, description: p.description_short, price: p.price })),
   ].slice(0, MAX_CATEGORISE_PER_RUN);
-  if (!items.length) return;
+  if (!items.length) {
+    log('Products', 'No uncategorised products need category assignment.');
+    return;
+  }
   const categories = [...existing];
   let failed = 0;
+  log('Products', `Categorising ${items.length} products in batches of ${CATEGORY_BATCH}.`);
   for (let from = 0; from < items.length; from += CATEGORY_BATCH) {
     const batch = items.slice(from, from + CATEGORY_BATCH);
+    const batchNumber = Math.floor(from / CATEGORY_BATCH) + 1;
+    const batchCount = Math.ceil(items.length / CATEGORY_BATCH);
+    log('Products', `Category batch ${batchNumber}/${batchCount}: assigning categories to ${batch.length} products.`);
     const list = batch.map((it, i) => ({ i, name: it.name, ...(it.description ? { about: String(it.description).slice(0, 80) } : {}), ...(it.price != null ? { price: it.price } : {}) }));
     try {
       const result = await callOpenAiJson(ctx, state, {
@@ -630,6 +676,7 @@ async function categorize(ctx, state, plan, products, model, summary) {
         else plan.categoryUpdates.push({ id: it.product.id, category });
         summary.categorised++;
       }
+      log('Products', `Category batch ${batchNumber}/${batchCount} complete: ${picked.size} categories assigned.`);
     } catch (e) {
       if (e instanceof FatalRunError) throw e;
       failed++;
@@ -712,11 +759,15 @@ function planWrites(clusters, products, summary) {
 async function writePlan(ctx, run, businessId, plan, imageUploads) {
   const { supabase, log = () => {} } = ctx;
   const runId = run.id;
+  const productBatches = chunk(plan.newProducts.map((r) => ({ ...r, business_id: businessId, discovery_run_id: runId })), 50);
 
-  for (const rows of chunk(plan.newProducts.map((r) => ({ ...r, business_id: businessId, discovery_run_id: runId })), 50)) {
+  for (let i = 0; i < productBatches.length; i++) {
+    const rows = productBatches[i];
+    log('Products', `Saving new-product batch ${i + 1}/${productBatches.length} (${rows.length} rows).`);
     const { error } = await supabase.from('products').insert(rows);
     if (error) throw new Error(`Saving discovered products failed: ${error.message}`);
   }
+  if (!productBatches.length) log('Products', 'No new product rows to insert.');
 
   // evidence: one row per message, or per distinct image
   const seen = new Set();
@@ -734,10 +785,14 @@ async function writePlan(ctx, run, businessId, plan, imageUploads) {
       send_count: s.sendCount || 1, contact_count: s.contactCount || 1, observed_at: s.observedAt || null,
     });
   }
-  for (const rows of chunk(mentionRows, 200)) {
+  const mentionBatches = chunk(mentionRows, 200);
+  for (let i = 0; i < mentionBatches.length; i++) {
+    const rows = mentionBatches[i];
+    log('Products', `Saving evidence batch ${i + 1}/${mentionBatches.length} (${rows.length} rows).`);
     const { error } = await supabase.from('product_mentions').upsert(rows, { onConflict: 'product_id,kind,source_ref' });
     if (error) throw new Error(`Saving product evidence failed: ${error.message}`);
   }
+  if (!mentionBatches.length) log('Products', 'No evidence rows to save.');
 
   // refresh counters on everything this run touched (recounted, so re-runs never double count)
   const touchedIds = [...new Set([...plan.touched.keys(), ...plan.newProducts.map((p) => p.id)])];
@@ -774,6 +829,7 @@ async function writePlan(ctx, run, businessId, plan, imageUploads) {
     const { error } = await supabase.from('products').update(update).eq('id', productId);
     if (error) throw new Error(`Updating product ${productId} failed: ${error.message}`);
   }
+  log('Products', `Refreshed counts and evidence-derived fields for ${plan.touched.size} existing products.`);
   for (const id of newIds) {
     const c = counts.get(id);
     if (c) await supabase.from('products').update({ mention_count: c.n, last_mentioned_at: c.last }).eq('id', id);
@@ -782,23 +838,38 @@ async function writePlan(ctx, run, businessId, plan, imageUploads) {
     // only fills a blank: a category the owner (or an earlier run) set is never replaced
     await supabase.from('products').update({ category: u.category, category_source: 'ai' }).eq('id', u.id).is('category', null);
   }
+  log('Products', `Finished category backfill for ${plan.categoryUpdates.length} existing products.`);
   log('Products', `Saved ${plan.newProducts.length} discovered products and ${mentionRows.length} pieces of evidence; updated ${plan.touched.size} existing products.`);
 }
 
 // ─── OpenAI (JSON, text or vision) ───────────────────────────────────────────
 async function callOpenAiJson(ctx, state, { promptId, model, user, maxTokens, inputType = 'text', cacheKey = null, attempts = 4 }) {
   const { supabase, openaiKey, businessId } = ctx;
+  const { log = () => {}, warn = () => {}, err = () => {} } = ctx;
+  log('Products', `Loading AI prompt configuration for ${promptId}.`);
   const config = await getAiPromptConfig(supabase, promptId);
   const system = config.prompt ?? AI_PROMPT_CATALOG[promptId].prompt;
   const resolvedModel = config.model ?? model;
   let lastError;
-  if (shouldPauseOpenAIRequest()) throw new FatalRunError(getOpenAIAvailabilityState().message || 'OpenAI Unavailable');
+  if (shouldPauseOpenAIRequest()) {
+    const message = getOpenAIAvailabilityState().message || 'OpenAI Unavailable';
+    err('Products', `OpenAI request for ${promptId} stopped before sending: ${message}`);
+    throw new FatalRunError(message);
+  }
 
   for (let attempt = 1; attempt <= attempts; attempt++) {
     try {
       const cooldown = getOpenAICooldownMs();
-      if (cooldown > 0) await sleep(Math.min(cooldown, 30_000));
-      if (shouldPauseOpenAIRequest()) throw new FatalRunError(getOpenAIAvailabilityState().message || 'OpenAI Unavailable');
+      if (cooldown > 0) {
+        log('Products', `Waiting ${Math.min(cooldown, 30_000)}ms for OpenAI cooldown before ${promptId}.`);
+        await sleep(Math.min(cooldown, 30_000));
+      }
+      if (shouldPauseOpenAIRequest()) {
+        const message = getOpenAIAvailabilityState().message || 'OpenAI Unavailable';
+        err('Products', `OpenAI request for ${promptId} stopped before attempt ${attempt}: ${message}`);
+        throw new FatalRunError(message);
+      }
+      log('Products', `Calling OpenAI ${resolvedModel} for ${promptId} (attempt ${attempt}/${attempts}, ${inputType}).`);
       const res = await fetch('https://api.openai.com/v1/chat/completions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${openaiKey}` },
@@ -837,13 +908,22 @@ async function callOpenAiJson(ctx, state, { promptId, model, user, maxTokens, in
             businessId, botId: promptId, model: resolvedModel, inputType,
             promptTokens: usage.prompt_tokens || 0, completionTokens: usage.completion_tokens || 0,
           });
-        } catch { /* usage logging must never fail a run */ }
+        } catch (error) {
+          warn('Products', `Could not record AI usage for ${promptId}: ${error.message}`);
+        }
       }
+      log('Products', `OpenAI ${promptId} completed: ${usage.prompt_tokens || 0} input and ${usage.completion_tokens || 0} output tokens.`);
       return { json: JSON.parse(clean), promptTokens: usage.prompt_tokens || 0, completionTokens: usage.completion_tokens || 0 };
     } catch (e) {
       if (e instanceof FatalRunError) throw e;
       lastError = e;
-      if (attempt < attempts) await sleep(Math.max(1500 * attempt, getOpenAICooldownMs()));
+      if (attempt < attempts) {
+        const waitMs = Math.max(1500 * attempt, getOpenAICooldownMs());
+        warn('Products', `OpenAI ${promptId} attempt ${attempt}/${attempts} failed (${e.message}); retrying in ${waitMs}ms.`);
+        await sleep(waitMs);
+      } else {
+        err('Products', `OpenAI ${promptId} failed after ${attempts} attempts: ${e.message}`);
+      }
     }
   }
   throw lastError;

@@ -212,10 +212,10 @@ test('confidence rises with price, repeats, image proof and several customers', 
 test('catalog lines carry id, price, aliases and are bounded', () => {
   const text = formatCatalogForPrompt([
     { id: 'p1', title: 'Classic Lash Set', price: 2500, aliases: ['classic lashes'], type: 'product' },
-    { id: 'p2', title: 'UV Training', price: null, aliases: [], type: 'service' },
+    { id: 'p2', title: 'UV Training', price: null, aliases: [], type: 'service', status: 'discovered' },
   ], { currency: 'KES' });
   assert.match(text, /ID: p1 \| Name: Classic Lash Set \| Price: KES 2,500 \| Also called: classic lashes/);
-  assert.match(text, /ID: p2 \| Name: UV Training \| Type: service/);
+  assert.match(text, /ID: p2 \| Name: UV Training \| Status: discovered, unreviewed \| Type: service/);
   const many = Array.from({ length: 10 }, (_, i) => ({ id: `p${i}`, title: `Item ${i}`, price: 100 }));
   const capped = formatCatalogForPrompt(many, { maxLines: 3 });
   assert.match(capped, /7 more products not shown/);
@@ -230,6 +230,7 @@ test('analyser product output is held to the catalog and the chat', () => {
   const out = groundNlpProducts({
     matched_products: [
       { product_id: 'p1', product_name: 'whatever the model typed', match_status: 'matched' }, // real, mentioned
+      { product_id: 'p1', product_name: 'classic lashes', match_status: 'matched' },          // duplicate ID is collapsed
       { product_id: 'p2', product_name: 'Brow Lamination', match_status: 'matched' },          // real id, never mentioned
       { product_id: 'p99', product_name: 'Gold necklace', match_status: 'matched' },           // invented id, mentioned
       { product_id: null, product_name: 'Diamond ring', match_status: 'no match' },            // never mentioned
@@ -240,10 +241,58 @@ test('analyser product output is held to the catalog and the chat', () => {
     { product_id: 'p1', product_name: 'Classic Lash Set', match_status: 'matched' },
     { product_id: null, product_name: 'Gold necklace', match_status: 'no match' },
   ]);
-  assert.deepEqual(out.product_tags, ['classic lashes', 'gold necklace']);
+  assert.deepEqual(out.product_tags, ['Classic Lash Set', 'gold necklace']);
   for (const f of ['product_match_ungrounded', 'product_id_not_in_catalog', 'product_name_ungrounded', 'product_tag_ungrounded']) {
     assert.ok(out.flags.includes(f), `missing flag ${f}`);
   }
+});
+
+test('analyser can ground a discovered product identified in a conversation image', () => {
+  const catalog = new Map([
+    ['p1', { title: 'Gas Cooker 2 Burner', aliases: [], status: 'discovered' }],
+    ['p2', { title: 'Gas Cooker 4 Burner', aliases: [], status: 'discovered' }],
+  ]);
+  const out = groundNlpProducts({
+    matched_products: [
+      { product_id: 'p1', product_name: 'Gas Cooker 2 Burner' },
+      { product_id: 'p2', product_name: 'Gas Cooker 4 Burner' },
+    ],
+  }, {
+    catalog,
+    fullText: 'CUSTOMER: Do you have gas cookers?',
+    conversationImageProductIds: new Set(['p1', 'p2']),
+  });
+  assert.deepEqual(out.matched_products, [
+    { product_id: 'p1', product_name: 'Gas Cooker 2 Burner', match_status: 'matched' },
+    { product_id: 'p2', product_name: 'Gas Cooker 4 Burner', match_status: 'matched' },
+  ]);
+  assert.deepEqual(out.flags, []);
+});
+
+test('analyser canonicalizes grounded product aliases with discovery matching rules', () => {
+  const catalog = new Map([
+    ['p1', { title: 'Classic Lash Set', aliases: ['classic lashes'], status: 'discovered' }],
+  ]);
+  const out = groundNlpProducts({
+    matched_products: [],
+    product_tags: ['classic lashes', 'classic lash set'],
+  }, { catalog, fullText: 'CUSTOMER: Do you have classic lashes?' });
+  assert.deepEqual(out.matched_products, [
+    { product_id: 'p1', product_name: 'Classic Lash Set', match_status: 'matched' },
+  ]);
+});
+
+test('analyser does not guess which catalog variants a broad category refers to', () => {
+  const catalog = new Map([
+    ['p1', { title: 'Gas Cooker 2 Burner', aliases: [] }],
+    ['p2', { title: 'Gas Cooker 4 Burner', aliases: [] }],
+  ]);
+  const out = groundNlpProducts({
+    matched_products: [],
+    product_tags: ['gas cookers'],
+  }, { catalog, fullText: 'CUSTOMER: Do you have gas cookers?' });
+  assert.deepEqual(out.matched_products, []);
+  assert.deepEqual(out.product_tags, ['gas cookers']);
 });
 
 test('an empty catalog and empty output are safe', () => {
