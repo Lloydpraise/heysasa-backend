@@ -716,20 +716,47 @@ async function buildPersonaSection(sampledMessages, businessName, corpus, pool =
 }
 
 // ─── Step 3: business_context — mostly hard facts, not chat-mined ─────────────
+// Only products the owner approved and left visible to the AI. Discovered (unreviewed) and
+// dismissed ones are never used. If the products migration has not been run yet, fall back to the old query.
 async function fetchProducts() {
-    return fetchAllPages((from, to) =>
-        supabase.from('products')
-            .select('title, description_short, price, key_features')
-            .eq('business_id', BUSINESS_ID)
-            .eq('is_visible', true)
-            .range(from, to));
+    try {
+        return await fetchAllPages((from, to) =>
+            supabase.from('products')
+                .select('title, description_short, price, key_features, aliases, type, category')
+                .eq('business_id', BUSINESS_ID)
+                .eq('status', 'approved')
+                .eq('ai_visible', true)
+                .range(from, to));
+    } catch (e) {
+        if (!/column .* does not exist|42703/i.test(`${e?.code} ${e?.message}`)) throw e;
+        warn('Context', 'products.status / ai_visible not found. Run migration 20261003000000_products_discovery.sql. Using all visible products for now.');
+        return fetchAllPages((from, to) =>
+            supabase.from('products')
+                .select('title, description_short, price, key_features')
+                .eq('business_id', BUSINESS_ID)
+                .eq('is_visible', true)
+                .range(from, to));
+    }
 }
 
 async function buildBusinessContextSection(business, sampledMessages, corpus) {
     const products = await fetchProducts();
-    const productsCatalog = products.length
-        ? products.map(p => `- ${p.title}${p.price ? ` (${p.price})` : ''}${p.description_short ? `: ${p.description_short}` : ''}`).join('\n')
-        : 'No products registered.';
+    // Grouped by the owner's categories so the model sees which products go together.
+    const productLine = p => `- ${p.title}${p.price ? ` (${p.price})` : ''}${p.description_short ? `: ${p.description_short}` : ''}`;
+    const byCategory = new Map();
+    for (const p of products) {
+        const key = p.category || '';
+        if (!byCategory.has(key)) byCategory.set(key, []);
+        byCategory.get(key).push(p);
+    }
+    const productsCatalog = !products.length
+        ? 'No products registered.'
+        : byCategory.size === 1 && byCategory.has('')
+            ? products.map(productLine).join('\n')
+            : [...byCategory.entries()]
+                .sort(([a], [b]) => (a === '' ? 1 : b === '' ? -1 : a.localeCompare(b)))
+                .map(([cat, list]) => `${cat || 'Uncategorised'}:\n${list.map(productLine).join('\n')}`)
+                .join('\n\n');
 
     // Light grounding pass over a small slice of real messages, just to
     // surface recurring value-prop language — capped small on purpose,

@@ -238,6 +238,8 @@
     <select id="business-run-action">
       <option value="analysis">Run analyser</option>
       <option value="persona">Run persona pack</option>
+      <option value="products">Run product discovery</option>
+      <option value="products_dry">Product discovery (dry run, writes nothing)</option>
     </select>
     <div class="modal-actions">
       <button type="button" class="btn" id="business-run-cancel">Cancel</button>
@@ -674,7 +676,8 @@ document.getElementById('retry-all-btn').onclick = async () => {
 async function resolveBusinessProgressState(business) {
   const analysisRun = business?.analysis_run || null;
   const personaRun = business?.persona_run || null;
-  const activeRun = analysisRun?.status === 'running' ? analysisRun : personaRun?.status === 'running' ? personaRun : null;
+  const productRun = business?.product_run || null;
+  const activeRun = [analysisRun, personaRun, productRun].find((run) => run?.status === 'running') || null;
 
   if (!activeRun) {
     return { active: false, label: '', phase: '', percent: 0 };
@@ -686,7 +689,7 @@ async function resolveBusinessProgressState(business) {
 
   return {
     active: true,
-    label: activeRun.run_type === 'persona_pack' ? 'Persona pack' : 'Analysis',
+    label: activeRun.run_type === 'persona_pack' ? 'Persona pack' : activeRun.run_type === 'product_discovery' ? 'Product discovery' : 'Analysis',
     phase: activeRun.phase || 'working',
     percent,
   };
@@ -763,17 +766,21 @@ function closeBusinessActionModal() {
 }
 
 async function startBusinessAction(business, action) {
-  const endpoint = action === 'persona' ? '/debug/persona/generate' : '/debug/analysis/start';
-  const label = action === 'persona' ? 'persona pack' : 'lead analysis';
+  const isProducts = action === 'products' || action === 'products_dry';
+  const endpoint = isProducts ? '/debug/products/discover' : action === 'persona' ? '/debug/persona/generate' : '/debug/analysis/start';
+  const label = action === 'products_dry' ? 'product discovery (dry run)' : isProducts ? 'product discovery' : action === 'persona' ? 'persona pack' : 'lead analysis';
+  const payload = { businessId: business.business_id };
+  if (action === 'products_dry') payload.dryRun = true;
   try {
     const res = await fetch(debugUrl(endpoint), {
       method: 'POST',
       headers: { ...debugHeaders(), 'Content-Type': 'application/json' },
-      body: JSON.stringify({ businessId: business.business_id }),
+      body: JSON.stringify(payload),
     });
     const result = await readJsonResponse(res);
     if (!res.ok) throw new Error((result && (result.message || result.error)) || `Could not start ${label}`);
-    alert(`${label === 'persona pack' ? 'Persona pack generation' : 'Lead analysis'} started for ${business.name || business.business_id}.`);
+    const done = isProducts ? 'Product discovery' : label === 'persona pack' ? 'Persona pack generation' : 'Lead analysis';
+    alert(`${done}${action === 'products_dry' ? ' (dry run)' : ''} started for ${business.name || business.business_id}.${isProducts ? ' Watch the "products" area in the live log.' : ''}`);
   } catch (err) { alert(err.message); }
 }
 

@@ -25,6 +25,8 @@ import {
 } from './src/services/openAiGate.js';
 import { AI_PROMPT_CATALOG } from './src/aiPromptCatalog.js';
 import { getAiPromptConfig } from './src/services/aiPromptConfig.js';
+import { runProductDiscovery, AlreadyRunningError } from './src/services/productDiscoveryRunner.js';
+import { formatCatalogForPrompt, groundNlpProducts } from './src/productDiscovery.js';
 
 dotenv.config();
 
@@ -224,6 +226,7 @@ async function markRunFailed(reason) {
 // Also logs a line at every 25% so the debug console tells the same story.
 const PHASE_LABELS = {
     classify:   'Separating personal from business chats',
+    products:   'Finding products in chats and images',
     ads:        'Extracting ad attribution',
     structural: 'Scoring engagement',
     nlp:        'Analysing conversations',
@@ -1041,7 +1044,7 @@ async function runNLPExtraction(transcript, businessContext, productsCatalog, st
     }
 }
 
-async function applyNLPResults(businessId, contactId, conversationId, rawNlp, callRunId, promptTokens, completionTokens, signals, text) {
+async function applyNLPResults(businessId, contactId, conversationId, rawNlp, callRunId, promptTokens, completionTokens, signals, text, catalog = new Map()) {
     if (!rawNlp) return { flags: [] };
 
     await logAiUsage(businessId, callRunId, promptTokens, completionTokens);
@@ -1065,6 +1068,13 @@ async function applyNLPResults(businessId, contactId, conversationId, rawNlp, ca
         customerMessages: text.customerMessages,
         openerTemplates: text.openerTemplates,
     });
+
+    // Products are held to the approved catalog and to what the chat actually says:
+    // an ID that is not in the catalog, or an item nobody mentioned, is dropped.
+    const groundedProducts = groundNlpProducts(nlp, { catalog, fullText: text.fullText });
+    nlp.matched_products = groundedProducts.matched_products;
+    nlp.product_tags = groundedProducts.product_tags;
+    flags.push(...groundedProducts.flags);
 
     // Second gate: the analysis can see the whole chat and the product catalog.
     // If it quotes a line proving the owner is the buyer (or the other person is
@@ -1161,6 +1171,43 @@ async function applyNLPResults(businessId, contactId, conversationId, rawNlp, ca
     return { flags };
 }
 
+// ─── Products: find what the business sells, before anything is analysed ──────
+// Runs after chats are separated (so vendors, staff and personal chats never feed it) and
+// before the NLP pass (so the analyser sees real, owner-approved products instead of guessing).
+// New finds land as 'discovered' for the owner to approve; only approved products reach the analyser.
+// A failure here never stops the analysis, except an OpenAI key/credit problem, which would stop it anyway.
+async function runProductDiscoveryPhase() {
+    const skipped = (reason) => ({ skipped: true, reason });
+    if (requestedAnalysisConfig.skipProducts === true || process.env.SKIP_PRODUCT_DISCOVERY === '1') return skipped('disabled');
+    if (REQUESTED_CONTACT_IDS.length > 0) return skipped('single_contact_run');
+    if (!BUSINESS_ID) return skipped('no_business');
+    try {
+        const result = await runProductDiscovery({
+            supabase, businessId: BUSINESS_ID, openaiKey: OPENAI_KEY,
+            textModel: OPENAI_MODEL, visionModel: process.env.OPENAI_VISION_MODEL || OPENAI_MODEL,
+            // Re-analysing everyone must not re-read every image: discovery has its own force switch.
+            force: requestedAnalysisConfig.forceProducts === true || process.env.FORCE_PRODUCT_DISCOVERY === '1',
+            log, warn, err, progress,
+            recordUsage: ({ businessId, botId, promptTokens, completionTokens }) =>
+                logAiUsage(businessId, crypto.randomUUID(), promptTokens, completionTokens, botId),
+        });
+        return {
+            skipped: false,
+            new_discovered: result.new_discovered, matched_approved: result.matched_approved,
+            matched_discovered: result.matched_discovered, images_read: result.images_read,
+            images_unreachable: result.images_unreachable, reason: result.reason || null,
+        };
+    } catch (e) {
+        if (e instanceof FatalRunError) throw e;
+        if (e instanceof AlreadyRunningError) {
+            warn('Products', `${e.message} Continuing with the products already on file.`);
+            return skipped('already_running');
+        }
+        warn('Products', `Product discovery failed, continuing the analysis without new product suggestions: ${e.message}`);
+        return { skipped: true, reason: 'failed', error: String(e.message).slice(0, 300) };
+    }
+}
+
 async function runNLPPass() {
     log('NLP', 'Starting AI extraction pass...');
     let enrichedCount = 0, errored = 0, skipped = 0;
@@ -1199,6 +1246,7 @@ async function runNLPPass() {
     }
 
     const businessCache = new Map();
+    const currencyCache = new Map();
     const productsCache = new Map();
 
     let nlpDone = 0;
@@ -1221,15 +1269,36 @@ async function runNLPPass() {
                     .maybeSingle();
                 if (businessError) throw new Error(`Business lookup failed: ${businessError.message}`);
                 businessCache.set(businessId, summarizeBusiness(business || { name: 'unknown' }));
+                currencyCache.set(businessId, business?.currency || 'KES');
             }
 
+            // The analyser only ever sees products the owner approved and left visible to the AI.
+            // Discovered (unreviewed) and dismissed products are kept out on purpose.
             if (!productsCache.has(businessId)) {
-                const { data: products, error: productsError } = await supabase
+                let products;
+                const approved = await supabase
                     .from('products')
-                    .select('id, title')
-                    .eq('business_id', businessId);
-                if (productsError) throw new Error(`Product lookup failed: ${productsError.message}`);
-                productsCache.set(businessId, (products || []).map(p => `- ID: ${p.id} | Name: ${p.title}`).join('\n'));
+                    .select('id, title, price, type, aliases, category')
+                    .eq('business_id', businessId)
+                    .eq('status', 'approved')
+                    .eq('ai_visible', true);
+                if (approved.error) {
+                    // The products migration has not been run yet: behave as before rather than fail the analysis.
+                    if (!/column .* does not exist|42703/i.test(`${approved.error.code} ${approved.error.message}`)) {
+                        throw new Error(`Product lookup failed: ${approved.error.message}`);
+                    }
+                    warn('NLP', 'products.status / ai_visible not found. Run migration 20261003000000_products_discovery.sql. Using all products for now.');
+                    const legacy = await supabase.from('products').select('id, title').eq('business_id', businessId);
+                    if (legacy.error) throw new Error(`Product lookup failed: ${legacy.error.message}`);
+                    products = legacy.data || [];
+                } else {
+                    products = approved.data || [];
+                }
+                productsCache.set(businessId, {
+                    text: formatCatalogForPrompt(products, { currency: currencyCache.get(businessId) }),
+                    map: new Map(products.map((p) => [String(p.id), { title: p.title, aliases: Array.isArray(p.aliases) ? p.aliases : [] }])),
+                });
+                log('NLP', `${products.length} approved products loaded for ${businessId}.`);
             }
 
             const messages = await fetchContactMessages(conv.contact_id);
@@ -1276,7 +1345,7 @@ async function runNLPPass() {
             const result = await runNLPExtraction(
                 transcript,
                 businessCache.get(businessId),
-                productsCache.get(businessId),
+                productsCache.get(businessId).text,
                 structuralSignals,
                 `nlp:${businessId}`
             );
@@ -1284,7 +1353,7 @@ async function runNLPPass() {
             const applied = await applyNLPResults(
                 businessId, conv.contact_id, conv.id, result.nlp,
                 callRunId, result.promptTokens, result.completionTokens,
-                structuralSignals, text
+                structuralSignals, text, productsCache.get(businessId).map
             );
             for (const f of applied.flags) flagCounts[f] = (flagCounts[f] || 0) + 1;
             enrichedCount++;
@@ -1373,6 +1442,7 @@ async function main() {
     // Order matters: separate personal from business FIRST so nothing that is
     // not a business chat is ever scored or analysed.
     const classifyResult = await runClassificationPass();
+    const productsResult = await runProductDiscoveryPhase();
     await runAdAttributionExtraction();
     const structuralResult = await runStructuralEnrichment();
     const nlpResult = await runNLPPass();
@@ -1387,6 +1457,7 @@ async function main() {
         business: classifyResult.business, vendor: classifyResult.vendor, staff: classifyResult.staff,
         personal: classifyResult.personal, junk: classifyResult.junk, needs_review: classifyResult.unknown,
         analysis_flags: nlpResult.flagCounts,
+        products: productsResult,
         analysed: nlpResult.enrichedCount, analysis_errors: nlpResult.errored,
         classify_errors: classifyResult.errored, structural_errors: structuralResult.errored,
         total_errors: totalErrors,

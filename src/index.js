@@ -32,6 +32,7 @@ import { createWaitlistSignup } from './services/waitlistService.js';
 import { getPublicStats } from './services/publicStatsService.js';
 import { checkOpenAIAvailability, getOpenAIAvailabilityState } from './services/openAiGate.js';
 import personaRoutes from './personaRoutes.js';
+import productRoutes from './productRoutes.js';
 
 dotenv.config();
 
@@ -304,7 +305,7 @@ app.get('/debug/businesses', requireDebugToken, async (_req, res) => {
         supabase
             .from('enrichment_runs')
             .select('business_id, run_type, status, phase, progress_done, progress_total, started_at, finished_at, heartbeat_at')
-            .in('run_type', ['full_pass', 'contact_pass', 'persona_pack'])
+            .in('run_type', ['full_pass', 'contact_pass', 'persona_pack', 'product_discovery'])
             .order('started_at', { ascending: false }),
     ]);
 
@@ -317,8 +318,12 @@ app.get('/debug/businesses', requireDebugToken, async (_req, res) => {
     const latestByBusiness = new Map();
     for (const run of runs || []) {
         const businessId = run.business_id;
-        const bucket = latestByBusiness.get(businessId) || { analysis_run: null, persona_run: null };
-        if (run.run_type === 'persona_pack') {
+        const bucket = latestByBusiness.get(businessId) || { analysis_run: null, persona_run: null, product_run: null };
+        if (run.run_type === 'product_discovery') {
+            if (!bucket.product_run || new Date(run.started_at || 0).getTime() > new Date(bucket.product_run.started_at || 0).getTime()) {
+                bucket.product_run = run;
+            }
+        } else if (run.run_type === 'persona_pack') {
             if (!bucket.persona_run || new Date(run.started_at || 0).getTime() > new Date(bucket.persona_run.started_at || 0).getTime()) {
                 bucket.persona_run = run;
             }
@@ -331,20 +336,22 @@ app.get('/debug/businesses', requireDebugToken, async (_req, res) => {
     }
 
     const businesses = (data || []).map((business) => {
-        const latestRuns = latestByBusiness.get(business.business_id) || { analysis_run: null, persona_run: null };
+        const latestRuns = latestByBusiness.get(business.business_id) || { analysis_run: null, persona_run: null, product_run: null };
         const analysisRun = latestRuns.analysis_run || null;
         const personaRun = latestRuns.persona_run || null;
-        const activeRun = analysisRun?.status === 'running' ? analysisRun : personaRun?.status === 'running' ? personaRun : null;
+        const productRun = latestRuns.product_run || null;
+        const activeRun = [analysisRun, personaRun, productRun].find((run) => run?.status === 'running') || null;
         const percent = activeRun?.progress_total ? Math.min(100, Math.round((Number(activeRun.progress_done || 0) / Number(activeRun.progress_total)) * 100)) : 0;
 
         return {
             ...business,
             analysis_run: analysisRun,
             persona_run: personaRun,
+            product_run: productRun,
             active_run: activeRun,
             progress_percent: percent,
             progress_phase: activeRun?.phase || null,
-            progress_label: activeRun?.run_type === 'persona_pack' ? 'Persona pack' : activeRun ? 'Analysis' : null,
+            progress_label: activeRun?.run_type === 'persona_pack' ? 'Persona pack' : activeRun?.run_type === 'product_discovery' ? 'Product discovery' : activeRun ? 'Analysis' : null,
         };
     });
 
@@ -624,6 +631,7 @@ app.get('/analysis/status', async (req, res, next) => {
 });
 
 app.use(personaRoutes);
+app.use(productRoutes);
 
 app.get('/debug/events', requireDebugToken, (req, res) => {
     // CHANGED: added no-transform (some proxies still buffer without it),

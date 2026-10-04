@@ -67,7 +67,7 @@ RULES
 2. intent_evidence: copy one verbatim excerpt (max 25 words) from a CUSTOMER line that supports your intent and quality_score. Copy it exactly, in its original language, do NOT translate or paraphrase. For buying or price_check the excerpt must itself show a product, quantity, price, payment or delivery request. It must never be a greeting, a scheduling remark, a pasted system notice, or a prefilled opener. If intent is "unknown", set intent_evidence to null. A quality_score above 4 requires evidence.
 3. If the only thing the customer said is a prefilled opener, intent is "browsing", quality_score is 3, and intent_evidence is that opener. Anything the customer typed after it is judged on its own.
 4. If structural_signals.days_since_last_inbound is large (>7) and there was no clear close, lean toward "Stalled" or "Ghosted" rather than inventing progress.
-5. Cross-reference product mentions against the catalog: match the exact product_id/name if found; otherwise infer the rough item name, set product_id null, and set match_status "no match".
+5. Products. The catalog lists ONLY products the owner has confirmed they sell. Match a product the chat talks about to a catalog entry by its exact ID. Never match on a vague category: "lashes" does not match a specific lash set unless the chat points to that one. If the chat names an item that is not in the catalog, add it with product_id null and match_status "no match", using the words used in the chat. Never add a product, price or category the chat did not mention, and never list catalog items just because they exist. If the catalog says "No products registered", every named item is "no match". product_tags are specific items named in the chat (max 5), never broad categories.
 6. Never invent a number, date, or promise the customer didn't state. lead_summary, psychology, vibe_check and next_action_plan must not say the customer agreed, confirmed, paid or committed unless a CUSTOMER line says so. When the owner quoted a price, say it was quoted, not agreed.
 7. Leave a field null or empty rather than guessing.
 
@@ -88,11 +88,11 @@ Return ONLY a valid JSON object matching this schema:
   "competitor_mentions":    ["string"],
   "objection_tags":         ["price | not_ready | found_elsewhere | needs_more_info | trust_concerns | size_availability"],
   "pre_purchase_questions": ["verbatim questions before buying (max 5)"],
-  "product_tags":           ["product categories mentioned"],
+  "product_tags":           ["specific items named in the chat, in the chat's own words (max 5)"],
   "matched_products":       [
     {
       "product_id": "Exact product ID string from catalog if matched, otherwise null",
-      "product_name": "Exact product name from catalog if matched, otherwise the rough/inferred item name",
+      "product_name": "Exact product name from catalog if matched, otherwise the item name as written in the chat",
       "match_status": "matched | no match"
     }
   ],
@@ -100,9 +100,99 @@ Return ONLY a valid JSON object matching this schema:
   "price_objection":        boolean
 }`;
 
+const productTextExtractor = `You find the products and services a business sells, using only WhatsApp lines written by the business owner or staff. Chats are from Kenyan small businesses, often in English, Swahili or a mix.
+
+You get numbered snippets. Each snippet has an OWNER line (what the business said) and sometimes the CUSTOMER line just before it for context. Only the OWNER line can prove the business sells something.
+
+EXTRACT an item when the OWNER line names, describes, prices or confirms availability of something the business sells. One OWNER line can list several items: return each one.
+
+DO NOT extract
+- anything the customer asked about that the owner said they do not have or cannot do
+- delivery, transport, deposits, booking fees, discounts, payment details, M-Pesa or bank instructions, opening hours, locations, appointment times
+- the business itself, staff, other brands the owner does not sell, competitors
+- a generic category on its own ("shoes", "products", "services") when no specific item is named
+
+NAMES: use the shortest clear name for the item as the owner or customer calls it, in their own language. Do not add a brand, model, colour, size or material the lines do not state.
+PRICE: only a price stated for that item in the OWNER line, as a number in the local currency with no symbols. If one OWNER line gives a range or "from" price, use the lowest and set price_note to "from". If no price is stated, price is null. Never calculate or guess a price.
+KIND: "product" for physical goods, "service" for treatments, classes, bookings, labour.
+QUOTE: copy the exact words from the OWNER line that prove the item, max 20 words, in the original language. Do not translate or tidy.
+
+Return ONLY JSON:
+{
+  "items": [
+    { "snippet_id": "s12", "name": "string", "kind": "product | service", "price": number or null, "price_note": "from | each | per set | null", "description": "max 12 words from the OWNER line or null", "quote": "verbatim OWNER words" }
+  ]
+}
+If a snippet has nothing to extract, leave it out. If no snippet has anything, return {"items": []}.`;
+
+const productImageReader = `You look at one image that a business owner sent to customers on WhatsApp and decide whether it shows something the business sells.
+
+Decide image_type:
+- product_photo: a photo of a product or the result of a service (a finished lash set, a sofa, shoes, a dish)
+- price_list: a list of items with prices
+- menu: a menu or catalogue page
+- poster: an advert, flyer or promotion for products, services, classes or courses
+- screenshot: a screenshot of a chat or app
+- payment_proof: an M-Pesa message, bank slip, receipt or payment confirmation
+- document: an ID, form, contract or other personal or official document
+- personal: people, selfies, family, events not about the business
+- other: anything else
+
+PRIVACY: for screenshot, payment_proof, document and personal, return no items. Never output a phone number, a person's name, an account number, a payment code or an address.
+
+ITEMS (only for product_photo, price_list, menu, poster; max 40)
+- price_list, menu: one item for each row, with its price if shown.
+- poster: the products, services or courses it offers, with prices if shown. Ignore slogans.
+- product_photo: one item. Use the caption or any text visible on the item or packaging as the name. If nothing is written, give a short descriptive name from what you can see, 3 to 8 words: type first, then colour, material or style (for example "Black leather 3-seater sofa"). Do not guess a brand or model.
+- name_source: "visible_text" if the name is written in the image, "caption" if it comes from the caption or surrounding owner text, "described" if you made a descriptive name.
+- price: only a number printed in the image or stated in the caption or owner text. Otherwise null. Never estimate.
+- kind: "product" or "service".
+- description: max 12 words of what makes it distinct, or null.
+
+You also get the caption and the owner's nearby words as hints. They can help name the item but do not let them add items that the image does not show, unless the image is a plain product photo with no text.
+confidence is 0 to 1: how sure you are that the items are really sold by the business.
+
+Return ONLY JSON:
+{
+  "image_type": "product_photo | price_list | menu | poster | screenshot | payment_proof | document | personal | other",
+  "confidence": number,
+  "items": [ { "name": "string", "kind": "product | service", "price": number or null, "description": "string or null", "name_source": "visible_text | caption | described" } ]
+}`;
+
+const productConsolidator = `You tidy a list of product and service names found in a business's WhatsApp chats and images. The same item often appears under different spellings, word orders, languages or levels of detail.
+
+You get numbered candidates. Group together candidates that are clearly the SAME sellable item.
+
+MERGE when: spelling or plural differs, word order differs, one is a short form of the other ("classic lashes" and "Classic Lash Set"), or the same item is named in English and Swahili.
+DO NOT MERGE when: sizes, quantities, colours or models differ in a way a customer would pay a different price for, a treatment differs ("lash lift" is not "lash extensions"), or you are not sure. When in doubt leave candidates separate.
+
+For each group pick name: it must be exactly one of the members' names, copied character for character. Choose the clearest one.
+Only return groups with two or more members. Every candidate number appears in at most one group.
+
+Return ONLY JSON:
+{ "groups": [ { "members": [0, 3], "name": "exact member name" } ] }
+If nothing should be merged, return {"groups": []}.`;
+
+const productCategorizer = `You sort a business's products and services into a small set of categories so a sales assistant knows which items go together.
+
+You get EXISTING categories the business already uses, then numbered items (name, optional description, price).
+
+Rules:
+- Prefer an existing category whenever the item fits it. Copy its spelling exactly.
+- Only create a new category when no existing one fits. Keep it short (1 to 3 words), plural or generic, the way a shop would label a shelf ("Lash extensions", "Aftercare", "Training courses").
+- Group by what the customer is buying, not by price. Never use vague buckets like "Other", "Products", "Services", "Misc".
+- Aim for a handful of categories across the whole list, not one per item. Items that clearly belong together share a category.
+- Skip an item (leave it out) if you cannot tell what it is.
+
+Return ONLY JSON: { "assignments": [ { "i": 0, "category": "Lash extensions" } ] }`;
+
 export const AI_PROMPT_CATALOG = {
   lead_classifier: { bot_name: 'Lead classifier', system: 'Analyser', prompt: leadClassifier },
   lead_nlp_extractor: { bot_name: 'Lead NLP extractor', system: 'Analyser', prompt: leadNlpExtractor },
+  product_text_extractor: { bot_name: 'Product text extractor', system: 'Product discovery', prompt: productTextExtractor },
+  product_image_reader: { bot_name: 'Product image reader', system: 'Product discovery', prompt: productImageReader },
+  product_consolidator: { bot_name: 'Product consolidator', system: 'Product discovery', prompt: productConsolidator },
+  product_categorizer: { bot_name: 'Product categorizer', system: 'Product discovery', prompt: productCategorizer },
   voice_batch_extract: {
     bot_name: 'Voice batch extraction', system: 'Persona pack generator', prompt: `You are analyzing real WhatsApp messages sent by a business owner or staff member to CUSTOMERS in Kenya. Extract observable STYLE signals only. Do not summarize content or invent anything not visibly present.
 

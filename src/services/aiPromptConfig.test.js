@@ -41,7 +41,7 @@ test('ignores inactive prompt overrides', async () => {
 });
 
 test('catalog entries have a system, display name, and built-in prompt', () => {
-    assert.equal(Object.keys(AI_PROMPT_CATALOG).length, 17);
+    assert.equal(Object.keys(AI_PROMPT_CATALOG).length, 21);
     for (const [id, entry] of Object.entries(AI_PROMPT_CATALOG)) {
         assert.ok(entry.system, `${id} is missing its system group`);
         assert.ok(entry.bot_name, `${id} is missing its display name`);
