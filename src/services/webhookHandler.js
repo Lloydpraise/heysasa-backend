@@ -19,7 +19,8 @@ import {
     recordCampaignStepReaction,
     requestStageReview
 } from './dbService.js';
-import { debugLog } from './debugConsole.js';
+import { debugLog, logEvent } from './debugConsole.js';
+import { describeConnectionUpdate, summariseClose } from './connectionDiagnostics.js';
 import { deleteSessionRecord } from './evolutionConnections.js';
 import { scheduleDisconnectNotice } from './disconnectNotice.js';
 
@@ -73,15 +74,51 @@ export async function processConnectionUpdate(payload, businessId) {
     const isConnected = state === 'open' || state === 'connected';
     const isDisconnected = state === 'close' || state === 'closed' || state === 'disconnected';
     const instanceName = payload?.instance || data.instance;
+    const info = describeConnectionUpdate(payload);
     if (isDisconnected) {
+        // Logged FIRST, before any database call, so the reason is kept even if
+        // the session lookup or delete below fails (e.g. a DNS blip to Supabase).
+        // 'warn' rows are kept 45 days and show in the admin persisted logs.
+        // This is the only thing that survives: the session record itself is
+        // still deleted below, old connections are not stored anywhere.
+        const disconnectLog = logEvent({
+            level: 'warn',
+            area: 'connection',
+            event: 'connection.disconnected',
+            message: summariseClose(info),
+            business_id: businessId,
+            entity_id: instanceName || null,
+            details: {
+                instance: instanceName,
+                state: info.state,
+                status_code: info.statusCode,
+                meaning: info.meaning,
+                reason_text: info.reasonText,
+                payload: info.raw,
+            },
+        });
         if (!instanceName) throw new Error('evolution_instance_missing');
-        // Only a number that was actually connected counts as "dropped" (not a QR that timed out).
-        const { data: wasConnected } = await supabase.from('whatsapp_sessions').select('id')
-            .eq('instance_name', instanceName).eq('status', 'connected').limit(1);
-        await deleteSessionRecord(instanceName, businessId);
-        console.log(`[Webhook] Removed inactive WhatsApp session ${instanceName}`);
-        if (wasConnected?.length) scheduleDisconnectNotice({ businessId, instanceName });
-        return;
+        try {
+            // Only a number that was actually connected counts as "dropped" (not a QR that timed out).
+            const { data: wasConnected } = await supabase.from('whatsapp_sessions').select('id')
+                .eq('instance_name', instanceName).eq('status', 'connected').limit(1);
+            await deleteSessionRecord(instanceName, businessId);
+            console.log(`[Webhook] Removed inactive WhatsApp session ${instanceName}`);
+            if (wasConnected?.length) scheduleDisconnectNotice({ businessId, instanceName });
+        } catch (error) {
+            // The disconnect itself is already logged above; say what failed afterwards.
+            logEvent({
+                level: 'error',
+                area: 'connection',
+                event: 'connection.disconnect_cleanup_failed',
+                message: `Disconnect was logged but cleaning up the session failed: ${error?.message || error}`,
+                business_id: businessId,
+                entity_id: instanceName,
+                details: { instance: instanceName, disconnect_log_id: disconnectLog.id, error },
+            });
+            throw error;
+        }
+        return info;
     }
     const sessionStatus = isConnected ? 'connected' : 'pending';
     const incomingQr = data.qrcode?.base64 || data.qrCode || data.base64 || null;
@@ -126,6 +163,7 @@ export async function processConnectionUpdate(payload, businessId) {
 
     const { error } = await query;
     if (error) throw error;
+    return info;
 }
 
 // Was called but never defined anywhere in this file — every live message

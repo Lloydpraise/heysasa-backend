@@ -14,6 +14,8 @@ const PERSIST_BATCH_MS = 2000;
 const PERSIST_BATCH_MAX = 200;
 const PERSIST_QUEUE_CAP = PERSIST_BATCH_MAX * 5;
 let pendingWrites = [];
+const MAX_PERSIST_ATTEMPTS = 6;
+const persistAttempts = new WeakMap(); // row -> failed write count (warn/error rows only)
 
 // Deliberately NOT the app's traced supabase client from config/supabase.js
 // — that client logs every call through this same module, which would
@@ -166,7 +168,17 @@ async function flushPendingWrites() {
             }
             return;
         }
-        console.error(`[DebugConsole] Failed to persist ${rows.length} log row(s): ${error.message}`);
+        // A network blip (DNS, timeout) must not silently lose the rows that matter.
+        // warn/error rows go back in the queue and are retried a few times; the
+        // routine ok/info rows are still dropped, as before.
+        const retry = batch.filter((e) => {
+            if (e.level !== 'warn' && e.level !== 'error') return false;
+            const attempts = (persistAttempts.get(e) || 0) + 1;
+            persistAttempts.set(e, attempts);
+            return attempts < MAX_PERSIST_ATTEMPTS;
+        });
+        if (retry.length) pendingWrites = [...retry, ...pendingWrites].slice(-PERSIST_QUEUE_CAP);
+        console.error(`[DebugConsole] Failed to persist ${rows.length} log row(s): ${error.message}${retry.length ? ` (retrying ${retry.length} warn/error row(s))` : ''}`);
     }
 }
 setInterval(() => { flushPendingWrites().catch((e) => console.error(`[DebugConsole] Flush error: ${e.message}`)); }, PERSIST_BATCH_MS);

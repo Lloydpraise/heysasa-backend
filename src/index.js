@@ -802,6 +802,12 @@ app.post('/webhook/evolution', async (req, res) => {
         return;
     }
     requestMeta.businessId = businessId;
+    if (normalizedEventType === 'connection.update') {
+        // So a failed connection update can be diagnosed from processing_failed alone.
+        requestMeta.connectionState = req.body?.data?.state ?? null;
+        requestMeta.statusReason = req.body?.data?.statusReason ?? req.body?.data?.statusCode ?? null;
+        requestMeta.instance = req.body?.instance ?? null;
+    }
     res.status(200).send('OK');
 
     // CHANGED: every branch below used to log to two places (a raw
@@ -834,8 +840,14 @@ app.post('/webhook/evolution', async (req, res) => {
                 logEvent({ level: 'debug', area: 'ingest', event: 'webhook.presence', message: 'Presence processed', business_id: businessId, duration_ms: Date.now() - startedAt });
                 break;
             case 'connection.update':
-                await processConnectionUpdate(req.body, businessId);
-                logEvent({ level: 'ok', area: 'connection', event: 'webhook.connection_update', message: 'Connection update persisted', business_id: businessId, duration_ms: Date.now() - startedAt });
+                {
+                    const connectionInfo = await processConnectionUpdate(req.body, businessId);
+                    // Disconnects are already logged (warn, with the reason) inside
+                    // processConnectionUpdate, so this ok line is for every other state.
+                    if (connectionInfo?.state !== 'close' && connectionInfo?.state !== 'closed' && connectionInfo?.state !== 'disconnected') {
+                        logEvent({ level: 'ok', area: 'connection', event: 'webhook.connection_update', message: `Connection update persisted (${connectionInfo?.state || 'unknown'})`, business_id: businessId, entity_id: connectionInfo?.instance || null, duration_ms: Date.now() - startedAt, details: { state: connectionInfo?.state, status_code: connectionInfo?.statusCode } });
+                    }
+                }
                 break;
             case 'contacts.set':
                 await processContactsSync(req.body, businessId);
