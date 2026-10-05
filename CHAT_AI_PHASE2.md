@@ -7,6 +7,8 @@
 3. Restart the backend and the follow-up engine (the engine now runs a second 1s loop that sends `chat_ai_outbox`).
 4. Nothing replies until a business has `chat_ai_enabled = true` AND `chat_ai_daily_cap > 0`.
 
+The function handles browser CORS preflight requests, but its service-role authentication is intended for server-to-server calls. Never put the service-role key in browser code; have the browser call your backend instead.
+
 ## First live check
 Call `sasa-brain` with `{business_id, simulate:true, message:"hi how much is the volume set"}` (service key as Bearer).
 You get reply, thoughts, steps, skills loaded, usage. Nothing is sent. Do this before enabling any business.

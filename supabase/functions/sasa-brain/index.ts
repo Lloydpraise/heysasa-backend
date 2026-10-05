@@ -10,10 +10,19 @@ import { createClient } from 'npm:@supabase/supabase-js@2';
 import { runTurn, type TurnInput } from './core/turn.ts';
 import { buildDeps } from './core/deps.ts';
 
-const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
+const corsHeaders = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Headers': 'authorization, apikey, x-client-info, content-type',
+  'Access-Control-Allow-Methods': 'POST, OPTIONS',
+};
+const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), {
+  status,
+  headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+});
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 Deno.serve(async (req) => {
+  if (req.method === 'OPTIONS') return new Response('ok', { headers: corsHeaders });
   if (req.method !== 'POST') return json({ error: 'POST only' }, 405);
 
   const url = Deno.env.get('SUPABASE_URL');
