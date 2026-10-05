@@ -6,6 +6,7 @@ import { evaluateMessageGates, evaluateChatGates, SKIP_MESSAGES } from './gates.
 
 // Only reasons the owner would want to know about get a row in chat_ai_turns. Everything else is routine.
 const LOGGED_SKIPS = new Set(['cap_reached']);
+const MAX_EXTRA_RUNS = 2;
 
 export function createOrchestrator({ store, brain = null, log = () => {}, now = () => new Date() }) {
   return async function handleInboundMessage(input) {
@@ -22,6 +23,8 @@ export function createOrchestrator({ store, brain = null, log = () => {}, now = 
 
     // Nothing below this line runs until a brain exists, so no lock or daily slot is wasted.
     if (!brain) return skip('no_brain');
+
+    if (!(await store.canAfford(businessId))) return skip('no_balance');
 
     const token = await store.acquireLock(conversationId);
     if (!token) return skip('chat_busy');
@@ -40,7 +43,18 @@ export function createOrchestrator({ store, brain = null, log = () => {}, now = 
         return result;
       }
 
-      const outcome = await brain({ businessId, conversationId, contactId, message, business, ...chat, slot, mode: 'live' });
+      // A message that arrives while this turn runs is skipped as 'chat_busy' (its row is saved, but nobody answers it).
+      // The brain re-checks before it sends; this catches the last gap, after the brain's final check. Up to 2 extra runs.
+      let current = message;
+      let outcome;
+      for (let run = 0; ; run++) {
+        const startedAt = now().toISOString();
+        outcome = await brain({ businessId, conversationId, contactId, message: current, business, ...chat, slot, mode: 'live' });
+        if (run >= MAX_EXTRA_RUNS) break;
+        const waiting = await store.unansweredInboundSince(conversationId, startedAt);
+        if (!waiting) break;
+        current = { ...current, keyId: waiting.keyId, text: waiting.text, type: waiting.type, sentAt: now() };
+      }
       return { status: 'handled', ...outcome };
     } catch (error) {
       await store.logTurn({

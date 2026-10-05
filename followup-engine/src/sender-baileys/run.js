@@ -1,5 +1,6 @@
-import { SENDER_POLL_INTERVAL_MS } from '../config.js'
+import { SENDER_POLL_INTERVAL_MS, CHAT_AI_POLL_INTERVAL_MS } from '../config.js'
 import { processBaileysBatch } from './worker.js'
+import { processChatAiOutbox } from './chatAiOutbox.js'
 import { log } from '../lib/log.js'
 
 let running = false
@@ -20,3 +21,18 @@ async function tick() {
 log('info', 'sender', 'sender.loop_started', `Sender starting — polling every ${SENDER_POLL_INTERVAL_MS}ms`, { details: { intervalMs: SENDER_POLL_INTERVAL_MS } })
 tick()
 setInterval(tick, SENDER_POLL_INTERVAL_MS)
+
+// The chat AI lane has its own loop so a slow campaign batch never delays a reply to a waiting customer.
+let chatAiRunning = false
+async function chatAiTick() {
+  if (chatAiRunning) return
+  chatAiRunning = true
+  try {
+    await processChatAiOutbox()
+  } catch (e) {
+    log('error', 'sender', 'chat_ai.tick_error', `Chat AI sender tick failed: ${e.message}`, { details: { error: { name: e.name, message: e.message } } })
+  } finally {
+    chatAiRunning = false
+  }
+}
+setInterval(chatAiTick, CHAT_AI_POLL_INTERVAL_MS)

@@ -16,6 +16,8 @@ function fakeStore(over = {}) {
     releaseLock: async () => { calls.release++; },
     claimSlot: async () => { calls.claim++; return { allowed: true, used: 1, cap: 5 }; },
     logTurn: async (r) => { calls.logs.push(r); },
+    unansweredInboundSince: async () => null,
+    canAfford: async () => true,
     ...over,
   };
   return store;
@@ -70,4 +72,30 @@ test('when the daily cap is used up the brain never runs, the lock is released a
 test('an owner who replied recently keeps the AI out', async () => {
   const store = fakeStore({ loadChat: async () => ({ conversation: { ai_enabled: true }, contact: {}, lastOwnerMessageAt: '2026-10-04T09:50:00Z' }) });
   assert.equal((await make(store, async () => ({}))(input)).reason, 'owner_active');
+});
+
+test('a message that landed while the turn was running gets its own run, with the newest message as the trigger', async () => {
+  const waiting = [{ keyId: 'K2', text: 'also, do you deliver?', type: 'text' }, null];
+  const store = fakeStore({ unansweredInboundSince: async () => waiting.shift() });
+  const seen = [];
+  const r = await make(store, async (ctx) => { seen.push(ctx.message.keyId); return { replied: true }; })(input);
+  assert.deepEqual(seen, ['K1', 'K2']);
+  assert.equal(r.status, 'handled');
+  assert.equal(store.calls.release, 1, 'one lock for the whole sequence, released once');
+  assert.equal(store.calls.claim, 1, 'the extra run does not use a second daily slot');
+});
+
+test('a customer who keeps writing cannot keep the brain running forever', async () => {
+  const store = fakeStore({ unansweredInboundSince: async () => ({ keyId: 'Kn', text: 'again', type: 'text' }) });
+  let runs = 0;
+  await make(store, async () => { runs++; return {}; })(input);
+  assert.equal(runs, 3);
+});
+
+test('an empty wallet pauses the AI before anything is locked, claimed or sent to the brain', async () => {
+  const store = fakeStore({ canAfford: async () => false });
+  let ran = false;
+  const r = await make(store, async () => { ran = true; })(input);
+  assert.equal(r.reason, 'no_balance');
+  assert.deepEqual([ran, store.calls.lock, store.calls.claim], [false, 0, 0]);
 });

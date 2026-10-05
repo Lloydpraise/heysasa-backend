@@ -22,6 +22,7 @@ export const SKIP_MESSAGES = {
   owner_active: 'The owner replied recently, so the AI stays quiet.',
   chat_busy: 'The AI is already working on this chat.',
   cap_reached: 'The daily chat limit is used up.',
+  no_balance: 'The wallet balance is empty, so the AI is paused.',
   no_brain: 'The AI brain is not installed yet.',
 };
 

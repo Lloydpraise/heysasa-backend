@@ -58,6 +58,8 @@ export async function sendContentViaEvolution(instanceName, target, content = {}
           fileName: media.file_name || undefined
         }
       : { number, text: content.text ?? '' }
+    // Optional "typing..." time in ms before the message appears. Only the chat AI uses it.
+    if (Number.isFinite(content.delay) && content.delay > 0) payload.delay = Math.round(content.delay)
 
     log('debug', 'connection', 'evolution.sending', `Sending ${media ? media.type : 'text'} via ${instanceName} to ${number}`, { details: { type: media ? media.type : 'text', instance: instanceName } })
     const controller = new AbortController()

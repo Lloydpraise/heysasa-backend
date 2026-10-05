@@ -1,5 +1,7 @@
 // Database access for the chat AI orchestrator. Kept separate so the orchestrator can be tested with a fake.
 
+import { canAffordChatAi } from './billing.js';
+
 const BUSINESS_COLUMNS = 'business_id, chat_ai_enabled, chat_ai_daily_cap, chat_ai_model, chat_ai_human_pause_minutes, chat_ai_settings, subscription_active, timezone';
 const BUSINESS_CACHE_MS = 15_000;
 
@@ -28,6 +30,11 @@ export function createStore(supabase) {
       return { conversation: convo.data, contact: contact.data, lastOwnerMessageAt: owner.data?.created_at || null };
     },
 
+    // Chat AI is billed per use, so it pauses when the wallet is empty (HeySasa's own business is never charged).
+    async canAfford(businessId) {
+      return canAffordChatAi(supabase, businessId);
+    },
+
     async acquireLock(conversationId, seconds = 120) {
       const { data, error } = await supabase.rpc('chat_ai_acquire_lock', { p_conversation_id: conversationId, p_seconds: seconds });
       if (error) throw error;
@@ -43,6 +50,17 @@ export function createStore(supabase) {
       const { data, error } = await supabase.rpc('chat_ai_claim_slot', { p_business_id: businessId, p_conversation_id: conversationId, p_cap: cap });
       if (error) throw error;
       return data;
+    },
+
+    // The customer's newest message, if it arrived after `sinceIso` and nothing has been sent in reply yet.
+    async unansweredInboundSince(conversationId, sinceIso) {
+      const { data, error } = await supabase.from('messages')
+        .select('whatsapp_message_id, direction, type, content, created_at')
+        .eq('conversation_id', conversationId).neq('type', 'reaction')
+        .order('created_at', { ascending: false }).limit(1).maybeSingle();
+      if (error) throw error;
+      if (!data || data.direction !== 'in' || !(data.created_at > sinceIso)) return null;
+      return { keyId: data.whatsapp_message_id, text: data.content?.text || '', type: data.type };
     },
 
     async logTurn(row) {

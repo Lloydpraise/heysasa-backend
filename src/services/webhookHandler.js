@@ -23,6 +23,7 @@ import { debugLog, logEvent } from './debugConsole.js';
 import { describeConnectionUpdate, summariseClose } from './connectionDiagnostics.js';
 import { deleteSessionRecord } from './evolutionConnections.js';
 import { scheduleDisconnectNotice } from './disconnectNotice.js';
+import { pauseCampaignsForDisconnectedInstance } from './disconnectCampaigns.js';
 import { triggerChatAi } from '../chatAi/index.js';
 
 async function notifyFollowupEngineActivity(contactId, conversationId, campaignStepEventId, inbound) {
@@ -101,18 +102,55 @@ export async function processConnectionUpdate(payload, businessId) {
         if (!instanceName) throw new Error('evolution_instance_missing');
         try {
             // Only a number that was actually connected counts as "dropped" (not a QR that timed out).
-            const { data: wasConnected } = await supabase.from('whatsapp_sessions').select('id')
-                .eq('instance_name', instanceName).eq('status', 'connected').limit(1);
+            const { data: existingSessions, error: sessionError } = await supabase.from('whatsapp_sessions').select('id, status')
+                .eq('business_id', businessId).eq('instance_name', instanceName).in('status', ['connected', 'disconnected']).limit(1);
+            if (sessionError) throw sessionError;
+            const existingSession = existingSessions?.[0];
+            const wasConnected = existingSession?.status === 'connected';
+            if (wasConnected) {
+                const { error: markDisconnectedError } = await supabase.from('whatsapp_sessions')
+                    .update({ status: 'disconnected', updated_at: new Date().toISOString() })
+                    .eq('id', existingSession.id)
+                    .eq('business_id', businessId);
+                if (markDisconnectedError) throw markDisconnectedError;
+            }
+            if (existingSession) {
+                try {
+                    const pausedCampaigns = await pauseCampaignsForDisconnectedInstance(supabase, { businessId, instanceName });
+                    if (pausedCampaigns.length) {
+                        logEvent({
+                            level: 'warn',
+                            area: 'campaign',
+                            event: 'campaigns.paused_whatsapp_disconnected',
+                            message: `Paused ${pausedCampaigns.length} campaign(s) because WhatsApp disconnected`,
+                            business_id: businessId,
+                            entity_id: instanceName,
+                            details: { instance: instanceName, campaign_ids: pausedCampaigns.map(campaign => campaign.id) },
+                        });
+                    }
+                } catch (error) {
+                    logEvent({
+                        level: 'error',
+                        area: 'campaign',
+                        event: 'campaigns.disconnect_pause_failed',
+                        message: `Could not pause campaigns after WhatsApp disconnected: ${error?.message || error}`,
+                        business_id: businessId,
+                        entity_id: instanceName,
+                        details: { instance: instanceName, error },
+                    });
+                    throw error;
+                }
+            }
             await deleteSessionRecord(instanceName, businessId);
             console.log(`[Webhook] Removed inactive WhatsApp session ${instanceName}`);
-            if (wasConnected?.length) scheduleDisconnectNotice({ businessId, instanceName });
+            if (existingSession) scheduleDisconnectNotice({ businessId, instanceName });
         } catch (error) {
             // The disconnect itself is already logged above; say what failed afterwards.
             logEvent({
                 level: 'error',
                 area: 'connection',
-                event: 'connection.disconnect_cleanup_failed',
-                message: `Disconnect was logged but cleaning up the session failed: ${error?.message || error}`,
+                event: 'connection.disconnect_handling_failed',
+                message: `Disconnect was logged but handling it failed: ${error?.message || error}`,
                 business_id: businessId,
                 entity_id: instanceName,
                 details: { instance: instanceName, disconnect_log_id: disconnectLog.id, error },

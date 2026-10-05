@@ -40,3 +40,13 @@ export const ANTIBAN_MIN_GAP_MS = 20_000       // floor gap between sends per bu
 export const ANTIBAN_JITTER_MS = 45_000        // extra random jitter added on top of the floor
 export const ANTIBAN_HOURLY_CEILING = 20       // hard ceiling regardless of configured daily cap
 export const ANTIBAN_WINDOW_MS = 60 * 60_000   // sliding window size for the hourly cap
+
+// ── Chat AI lane (replies to customers who wrote to the business first) ──
+// Same WhatsApp connection and send code as follow-ups, but its own pacing and its own counter
+// (chat_ai_outbox). A reply to a customer who just wrote in can't wait 20-65 seconds like a campaign message.
+export const CHAT_AI_POLL_INTERVAL_MS = parseInt(process.env.CHAT_AI_POLL_INTERVAL_MS ?? '1000')
+export const CHAT_AI_MIN_GAP_MS = parseInt(process.env.CHAT_AI_MIN_GAP_MS ?? '2000')            // floor gap between chat AI sends per business
+export const CHAT_AI_GAP_JITTER_MS = parseInt(process.env.CHAT_AI_GAP_JITTER_MS ?? '2500')      // random extra on top of the floor
+export const CHAT_AI_HOURLY_CEILING = parseInt(process.env.CHAT_AI_HOURLY_CEILING ?? '150')     // hard ceiling of chat AI messages per hour per business
+export const CHAT_AI_STALE_CLAIM_MS = 2 * 60_000
+
