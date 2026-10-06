@@ -34,6 +34,7 @@ import { getPublicStats } from './services/publicStatsService.js';
 import { checkOpenAIAvailability, getOpenAIAvailabilityState } from './services/openAiGate.js';
 import personaRoutes from './personaRoutes.js';
 import productRoutes from './productRoutes.js';
+import followupSettingsRoutes from './followupSettingsRoutes.js';
 
 dotenv.config();
 
@@ -634,6 +635,7 @@ app.get('/analysis/status', async (req, res, next) => {
 
 app.use(personaRoutes);
 app.use(productRoutes);
+app.use(followupSettingsRoutes);
 
 app.get('/debug/events', requireDebugToken, (req, res) => {
     // CHANGED: added no-transform (some proxies still buffer without it),
