@@ -10,19 +10,24 @@ import { createClient } from 'npm:@supabase/supabase-js@2';
 import { runTurn, type TurnInput } from './core/turn.ts';
 import { buildDeps } from './core/deps.ts';
 
-const corsHeaders = {
-  'Access-Control-Allow-Origin': '*',
+const allowedOrigins = new Set([
+  'http://localhost:5173',
+  'https://heysasa.co.ke',
+]);
+const corsHeaders = (origin: string | null) => ({
+  ...(origin && allowedOrigins.has(origin) ? { 'Access-Control-Allow-Origin': origin } : {}),
   'Access-Control-Allow-Headers': 'authorization, apikey, x-client-info, content-type',
   'Access-Control-Allow-Methods': 'POST, OPTIONS',
-};
-const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), {
-  status,
-  headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+  'Vary': 'Origin',
 });
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 Deno.serve(async (req) => {
-  if (req.method === 'OPTIONS') return new Response('ok', { headers: corsHeaders });
+  const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), {
+    status,
+    headers: { ...corsHeaders(req.headers.get('origin')), 'Content-Type': 'application/json' },
+  });
+  if (req.method === 'OPTIONS') return new Response('ok', { headers: corsHeaders(req.headers.get('origin')) });
   if (req.method !== 'POST') return json({ error: 'POST only' }, 405);
 
   const url = Deno.env.get('SUPABASE_URL');

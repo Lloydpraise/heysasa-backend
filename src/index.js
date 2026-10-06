@@ -21,6 +21,7 @@ import { attachDebugClient, debugLog, logEvent, queryLogs, getStreamClientCount 
 import { isDebugTokenValid, requireDebugToken } from './middleware/debugAuth.js';
 import { createAdminRouter } from './adminRoutes.js';
 import { startAlerts } from './services/alerts.js';
+import { startConnectionReconciler } from './services/connectionReconciler.js';
 import { EVOLUTION_API_KEY, EVOLUTION_URL } from './config/evolution.js';
 import {
     createEvolutionInstance,
@@ -231,6 +232,7 @@ logEvent({
 });
 
 startAlerts();
+startConnectionReconciler();
 startFollowupEngine();
 
 // ─── Heartbeat ──────────────────────────────────────────────────────────────
@@ -842,10 +844,11 @@ app.post('/webhook/evolution', async (req, res) => {
             case 'connection.update':
                 {
                     const connectionInfo = await processConnectionUpdate(req.body, businessId);
-                    // Disconnects are already logged (warn, with the reason) inside
-                    // processConnectionUpdate, so this ok line is for every other state.
-                    if (connectionInfo?.state !== 'close' && connectionInfo?.state !== 'closed' && connectionInfo?.state !== 'disconnected') {
-                        logEvent({ level: 'ok', area: 'connection', event: 'webhook.connection_update', message: `Connection update persisted (${connectionInfo?.state || 'unknown'})`, business_id: businessId, entity_id: connectionInfo?.instance || null, duration_ms: Date.now() - startedAt, details: { state: connectionInfo?.state, status_code: connectionInfo?.statusCode } });
+                    // A confirmed disconnect is logged (warn, with the reason) inside
+                    // processConnectionUpdate, so this ok line is for everything else.
+                    if (connectionInfo?.outcome !== 'disconnect') {
+                        const note = connectionInfo?.outcome ? `${connectionInfo.outcome}; Evolution: ${connectionInfo.evolution ?? 'unreachable'}` : 'persisted';
+                        logEvent({ level: 'ok', area: 'connection', event: 'webhook.connection_update', message: `Connection update ${note} (${connectionInfo?.state || 'unknown'})`, business_id: businessId, entity_id: connectionInfo?.instance || null, duration_ms: Date.now() - startedAt, details: { state: connectionInfo?.state, status_code: connectionInfo?.statusCode, outcome: connectionInfo?.outcome, evolution_state: connectionInfo?.evolution } });
                     }
                 }
                 break;
