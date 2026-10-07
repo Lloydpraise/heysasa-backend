@@ -1,0 +1,154 @@
+import express from 'express';
+import { UserFacingError } from './orchestrator.js';
+import { createRateLimiter } from './rateLimit.js';
+
+const LANGUAGES = ['auto', 'english', 'swahili', 'mixed'];
+const EMOJI = ['none', 'light', 'normal'];
+const LENGTHS = ['short', 'medium'];
+
+const isUuid = (v) => typeof v === 'string' && /^[0-9a-f-]{36}$/i.test(v);
+
+// `auth` (the business-ownership middleware) is passed in, so tests need no Supabase.
+export function createAssistantRouter({ store, notes, handleChat, skillsForBusiness, auth, limiter = createRateLimiter(), log = () => {} }) {
+  const router = express.Router();
+  router.use(auth);
+
+  const fail = (res, error) => {
+    if (error instanceof UserFacingError) {
+      const status = error.code === 'out_of_balance' ? 402 : error.code === 'busy' ? 409 : error.code === 'conversation_not_found' ? 404 : 400;
+      return res.status(status).json({ ok: false, error: error.code, message: error.message });
+    }
+    log('error', `assistant route failed: ${error.message}`);
+    return res.status(500).json({ ok: false, error: 'server_error', message: 'Something went wrong. Please try again.' });
+  };
+
+  // ── Chat (Server-Sent Events) ──────────────────────────────────────────────
+  router.post('/chat', async (req, res) => {
+    const body = req.body ?? {};
+    const check = limiter(req.businessId);
+    if (!check.ok) return res.status(429).json({ ok: false, error: 'slow_down', message: 'You are going fast. Try again in a minute.', retry_after: check.retryAfterSec });
+    if (body.conversation_id && !isUuid(body.conversation_id)) return res.status(400).json({ ok: false, error: 'bad_conversation_id' });
+
+    let started = false;
+    const send = (event) => {
+      if (res.writableEnded) return;
+      if (!started) {
+        started = true;
+        res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache, no-transform', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
+      }
+      res.write(`data: ${JSON.stringify(event)}\n\n`);
+    };
+    const heartbeat = setInterval(() => { if (started && !res.writableEnded) res.write(': keep-alive\n\n'); }, 15_000);
+    res.on('close', () => clearInterval(heartbeat));
+
+    try {
+      await handleChat({
+        businessId: req.businessId, userId: req.userId, conversationId: body.conversation_id || null,
+        surface: body.surface, contextKey: body.context_key, context: body.context, message: body.message,
+        currentText: body.current_text, retry: body.retry === true,
+      }, send);
+      clearInterval(heartbeat);
+      if (!res.writableEnded) res.end();
+    } catch (error) {
+      clearInterval(heartbeat);
+      if (!started) return fail(res, error);
+      const friendly = error instanceof UserFacingError ? error.message : 'Something went wrong. Please try again.';
+      if (!(error instanceof UserFacingError)) log('error', `assistant chat failed: ${error.message}`);
+      send({ type: 'error', message: friendly });
+      return res.end();
+    }
+    return undefined;
+  });
+
+  // ── Conversations ──────────────────────────────────────────────────────────
+  router.get('/conversations', async (req, res) => {
+    try {
+      const rows = await store.listConversations(req.businessId, {
+        contextKey: typeof req.query.context_key === 'string' ? req.query.context_key : null,
+        surface: typeof req.query.surface === 'string' ? req.query.surface : null,
+        limit: Number(req.query.limit) || 30,
+      });
+      res.json({ ok: true, conversations: rows });
+    } catch (error) { fail(res, error); }
+  });
+
+  router.get('/conversations/:id', async (req, res) => {
+    try {
+      if (!isUuid(req.params.id)) return res.status(400).json({ ok: false, error: 'bad_conversation_id' });
+      const conversation = await store.getConversation(req.params.id, req.businessId);
+      if (!conversation) return res.status(404).json({ ok: false, error: 'conversation_not_found' });
+      const messages = await store.listMessages(conversation.id, req.businessId);
+      return res.json({ ok: true, conversation: { id: conversation.id, surface: conversation.surface, context_key: conversation.context_key, context: conversation.context, title: conversation.title }, messages });
+    } catch (error) { return fail(res, error); }
+  });
+
+  router.post('/messages/:id/approve', async (req, res) => {
+    try {
+      if (!isUuid(req.params.id)) return res.status(400).json({ ok: false, error: 'bad_message_id' });
+      const finalText = typeof req.body?.final_text === 'string' ? req.body.final_text.slice(0, 8000) : null;
+      const row = await store.approveMessage(req.params.id, req.businessId, finalText);
+      if (!row) return res.status(404).json({ ok: false, error: 'message_not_found' });
+      return res.json({ ok: true });
+    } catch (error) { return fail(res, error); }
+  });
+
+  // ── Notes (what Ask HeySasa remembers) ─────────────────────────────────────
+  router.get('/notes', async (req, res) => {
+    try { res.json({ ok: true, notes: await store.listNotes(req.businessId) }); } catch (error) { fail(res, error); }
+  });
+
+  router.post('/notes', async (req, res) => {
+    try {
+      const result = await notes.save({ businessId: req.businessId, text: req.body?.text, pinned: req.body?.pinned === true, source: 'owner' });
+      if (result.status === 'ignored') return res.status(400).json({ ok: false, error: 'note_too_short' });
+      return res.json({ ok: true, ...result });
+    } catch (error) { return fail(res, error); }
+  });
+
+  router.patch('/notes/:id', async (req, res) => {
+    try {
+      if (!isUuid(req.params.id)) return res.status(400).json({ ok: false, error: 'bad_note_id' });
+      const result = await notes.edit({ businessId: req.businessId, id: req.params.id, text: req.body?.text, pinned: req.body?.pinned });
+      if (result.status === 'not_found') return res.status(404).json({ ok: false, error: 'note_not_found' });
+      if (result.status === 'invalid') return res.status(400).json({ ok: false, error: 'note_too_short' });
+      return res.json({ ok: true });
+    } catch (error) { return fail(res, error); }
+  });
+
+  router.delete('/notes/:id', async (req, res) => {
+    try {
+      if (!isUuid(req.params.id)) return res.status(400).json({ ok: false, error: 'bad_note_id' });
+      const row = await store.deleteNote(req.params.id, req.businessId);
+      return row ? res.json({ ok: true }) : res.status(404).json({ ok: false, error: 'note_not_found' });
+    } catch (error) { return fail(res, error); }
+  });
+
+  // ── Preferences ────────────────────────────────────────────────────────────
+  router.get('/preferences', async (req, res) => {
+    try {
+      const prefs = await store.loadPreferences(req.businessId);
+      res.json({ ok: true, preferences: prefs ?? { personalization: '', language: 'auto', emoji_level: 'light', message_length: 'short' } });
+    } catch (error) { fail(res, error); }
+  });
+
+  router.put('/preferences', async (req, res) => {
+    try {
+      const b = req.body ?? {};
+      const personalization = typeof b.personalization === 'string' ? b.personalization.trim() : '';
+      if (personalization.length > 1500) return res.status(400).json({ ok: false, error: 'personalization_too_long' });
+      if (!LANGUAGES.includes(b.language) || !EMOJI.includes(b.emoji_level) || !LENGTHS.includes(b.message_length)) return res.status(400).json({ ok: false, error: 'bad_preferences' });
+      const saved = await store.savePreferences(req.businessId, { personalization, language: b.language, emoji_level: b.emoji_level, message_length: b.message_length });
+      res.json({ ok: true, preferences: saved });
+    } catch (error) { fail(res, error); }
+  });
+
+  // ── Skills: names only. Owners can see what Ask HeySasa can do, never how. ──
+  router.get('/skills', async (req, res) => {
+    try {
+      const skills = await skillsForBusiness(req.businessId);
+      res.json({ ok: true, skills: skills.map((s) => ({ key: s.key, title: s.title })) });
+    } catch (error) { fail(res, error); }
+  });
+
+  return router;
+}

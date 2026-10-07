@@ -35,6 +35,7 @@ import { checkOpenAIAvailability, getOpenAIAvailabilityState } from './services/
 import personaRoutes from './personaRoutes.js';
 import productRoutes from './productRoutes.js';
 import followupSettingsRoutes from './followupSettingsRoutes.js';
+import { createAssistantRouterForApp } from './businessAi/index.js';
 
 dotenv.config();
 
@@ -636,6 +637,8 @@ app.get('/analysis/status', async (req, res, next) => {
 app.use(personaRoutes);
 app.use(productRoutes);
 app.use(followupSettingsRoutes);
+// Ask HeySasa, the business assistant (conversations, notes, preferences). Streams over Server-Sent Events.
+app.use('/assistant', createAssistantRouterForApp());
 
 app.get('/debug/events', requireDebugToken, (req, res) => {
     // CHANGED: added no-transform (some proxies still buffer without it),
