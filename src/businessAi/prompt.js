@@ -52,8 +52,8 @@ export function renderPreferences(prefs) {
   return [...lines, text ? `The owner also asks: ${clip(text, 1500)}` : ''].filter(Boolean).join('\n');
 }
 
-export function buildInstructions({ businessName, currency, preferences, pinnedNotes, skillMenu }) {
-  const parts = [CORE_RULES, `BUSINESS\nName: ${businessName}${currency ? `\nCurrency: ${currency}` : ''}`];
+export function buildInstructions({ businessName, currency, preferences, pinnedNotes, skillMenu, agentRules = '' }) {
+  const parts = [CORE_RULES, ...(agentRules ? [agentRules] : []), `BUSINESS\nName: ${businessName}${currency ? `\nCurrency: ${currency}` : ''}`];
   const prefs = renderPreferences(preferences);
   if (prefs) parts.push(`THE OWNER'S PREFERENCES FOR YOU\n${prefs}`);
   if (pinnedNotes.length) parts.push(`PINNED NOTES (always known)\n${pinnedNotes.map((n) => `- ${n.text}`).join('\n')}`);
@@ -97,9 +97,11 @@ export function buildInput({ surface, context, currentText, persona, loadedSkill
   if (recalled?.length) items.push({ role: 'developer', content: `NOTES THAT MAY BE RELEVANT (saved earlier)\n${recalled.map((n) => `- ${n.text}`).join('\n')}` });
 
   for (const m of history) {
-    const body = m.role === 'assistant' && m.draft
+    let body = m.role === 'assistant' && m.draft
       ? `${m.content}\n[Draft you proposed${m.approved ? ', and the owner approved it' : ''}]\n${draftAsText(m.draft)}`.trim()
       : m.content;
+    // Changes you prepared earlier, with what became of them (the owner may have tapped OK since).
+    if (m.role === 'assistant' && m.action_notes) body = `${body}\n[Changes you prepared]\n${m.action_notes}`.trim();
     items.push({ role: m.role, content: body });
   }
   const tail = [];

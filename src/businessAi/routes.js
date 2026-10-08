@@ -1,6 +1,7 @@
 import express from 'express';
 import { UserFacingError } from './orchestrator.js';
 import { createRateLimiter } from './rateLimit.js';
+import { ActionError } from './agent/engine.js';
 
 const LANGUAGES = ['auto', 'english', 'swahili', 'mixed'];
 const EMOJI = ['none', 'light', 'normal'];
@@ -9,11 +10,18 @@ const LENGTHS = ['short', 'medium'];
 const isUuid = (v) => typeof v === 'string' && /^[0-9a-f-]{36}$/i.test(v);
 
 // `auth` (the business-ownership middleware) is passed in, so tests need no Supabase.
-export function createAssistantRouter({ store, notes, handleChat, skillsForBusiness, auth, limiter = createRateLimiter(), log = () => {} }) {
+export function createAssistantRouter({ store, notes, handleChat, skillsForBusiness, auth, agent = null, limiter = createRateLimiter(), log = () => {} }) {
   const router = express.Router();
   router.use(auth);
 
+  const tokenOf = (req) => (req.headers.authorization?.startsWith('Bearer ') ? req.headers.authorization.slice(7).trim() : null);
+  const ctxFor = (req) => agent.makeCtx({ businessId: req.businessId, userId: req.userId, token: tokenOf(req) });
+
   const fail = (res, error) => {
+    if (error instanceof ActionError) {
+      const status = error.code === 'action_not_found' ? 404 : ['unknown_action', 'critical'].includes(error.code) ? 400 : 409;
+      return res.status(status).json({ ok: false, error: error.code, message: error.message });
+    }
     if (error instanceof UserFacingError) {
       const status = error.code === 'out_of_balance' ? 402 : error.code === 'busy' ? 409 : error.code === 'conversation_not_found' ? 404 : 400;
       return res.status(status).json({ ok: false, error: error.code, message: error.message });
@@ -45,7 +53,7 @@ export function createAssistantRouter({ store, notes, handleChat, skillsForBusin
       await handleChat({
         businessId: req.businessId, userId: req.userId, conversationId: body.conversation_id || null,
         surface: body.surface, contextKey: body.context_key, context: body.context, message: body.message,
-        currentText: body.current_text, retry: body.retry === true,
+        currentText: body.current_text, retry: body.retry === true, token: tokenOf(req),
       }, send);
       clearInterval(heartbeat);
       if (!res.writableEnded) res.end();
@@ -78,7 +86,9 @@ export function createAssistantRouter({ store, notes, handleChat, skillsForBusin
       const conversation = await store.getConversation(req.params.id, req.businessId);
       if (!conversation) return res.status(404).json({ ok: false, error: 'conversation_not_found' });
       const messages = await store.listMessages(conversation.id, req.businessId);
-      return res.json({ ok: true, conversation: { id: conversation.id, surface: conversation.surface, context_key: conversation.context_key, context: conversation.context, title: conversation.title }, messages });
+      const actionIds = messages.flatMap((m) => m.action_ids ?? []);
+      const actions = agent && actionIds.length ? (await store.listActionsByIds(actionIds, req.businessId)).map(agent.toPublicAction) : [];
+      return res.json({ ok: true, actions, conversation: { id: conversation.id, surface: conversation.surface, context_key: conversation.context_key, context: conversation.context, title: conversation.title }, messages });
     } catch (error) { return fail(res, error); }
   });
 
@@ -141,6 +151,62 @@ export function createAssistantRouter({ store, notes, handleChat, skillsForBusin
       res.json({ ok: true, preferences: saved });
     } catch (error) { fail(res, error); }
   });
+
+
+  // ── Actions: approve, refuse, undo, the Activity log, and "always allow" ───
+  if (agent) {
+    router.get('/actions/pending', async (req, res) => {
+      try {
+        await agent.engine.sweep(req.businessId);
+        const rows = await store.listPendingActions(req.businessId);
+        res.json({ ok: true, actions: rows.map(agent.toPublicAction) });
+      } catch (error) { fail(res, error); }
+    });
+
+    const actionRoute = (name, handler) => router.post(`/actions/:id/${name}`, async (req, res) => {
+      try {
+        if (!isUuid(req.params.id)) return res.status(400).json({ ok: false, error: 'bad_action_id' });
+        const out = await handler(req);
+        return res.json({ ok: true, action: agent.toPublicAction(out.action), already: out.already === true });
+      } catch (error) { return fail(res, error); }
+    });
+
+    actionRoute('approve', async (req) => {
+      // "Always allow" is chosen on the same tap; it is only ever stored for actions that are not critical.
+      if (req.body?.always_allow === true) {
+        const row = await store.getAction(req.params.id, req.businessId);
+        if (row) await agent.engine.setAlwaysAllow(req.businessId, row.type, true);
+      }
+      return agent.engine.approve(ctxFor(req), req.params.id);
+    });
+    actionRoute('reject', (req) => agent.engine.reject(ctxFor(req), req.params.id));
+    actionRoute('undo', (req) => agent.engine.undo(ctxFor(req), req.params.id));
+
+    router.get('/activity', async (req, res) => {
+      try {
+        await agent.engine.sweep(req.businessId);
+        const before = typeof req.query.before === 'string' && !Number.isNaN(Date.parse(req.query.before)) ? req.query.before : null;
+        const rows = await store.listActivity(req.businessId, { limit: Number(req.query.limit) || 30, before, area: typeof req.query.area === 'string' ? req.query.area : null });
+        res.json({ ok: true, activity: rows.map((r) => ({ ...agent.toPublicAction({ ...r, params: undefined }), result: undefined })), next_before: rows.length ? rows[rows.length - 1].created_at : null });
+      } catch (error) { fail(res, error); }
+    });
+
+    router.get('/action-prefs', async (req, res) => {
+      try {
+        const prefs = new Map((await store.listActionPrefs(req.businessId)).map((p) => [p.action_type, p.always_allow]));
+        res.json({ ok: true, actions: agent.registry.allowable().map((a) => ({ ...a, always_allow: !a.critical && prefs.get(a.type) === true })) });
+      } catch (error) { fail(res, error); }
+    });
+
+    router.put('/action-prefs', async (req, res) => {
+      try {
+        const type = req.body?.type;
+        if (typeof type !== 'string') return res.status(400).json({ ok: false, error: 'bad_type' });
+        const saved = await agent.engine.setAlwaysAllow(req.businessId, type, req.body?.always_allow === true);
+        return res.json({ ok: true, type: saved.action_type, always_allow: saved.always_allow });
+      } catch (error) { return fail(res, error); }
+    });
+  }
 
   // ── Skills: names only. Owners can see what Ask HeySasa can do, never how. ──
   router.get('/skills', async (req, res) => {

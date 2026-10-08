@@ -51,7 +51,7 @@ export function createStore(supabase) {
       return must(await q.order('updated_at', { ascending: false }).limit(Math.min(limit, 100)), 'conversations') ?? [];
     },
     async listMessages(conversationId, businessId, limit = 200) {
-      const rows = must(await supabase.from('ba_messages').select('id, role, content, draft, approved, approved_at, created_at')
+      const rows = must(await supabase.from('ba_messages').select('id, role, content, draft, approved, approved_at, action_ids, created_at')
         .eq('conversation_id', conversationId).eq('business_id', businessId).order('created_at', { ascending: false }).limit(limit), 'messages');
       return (rows ?? []).reverse();
     },
@@ -97,6 +97,56 @@ export function createStore(supabase) {
     // ── preferences ──
     async savePreferences(businessId, prefs) {
       return must(await supabase.from('ba_preferences').upsert({ business_id: businessId, ...prefs, updated_at: new Date().toISOString() }).select('*').single(), 'save preferences');
+    },
+
+    // ── actions: the approval queue and the activity log ──
+    async insertAction(row) {
+      return must(await supabase.from('ba_actions').insert(row).select('*').single(), 'save action');
+    },
+    async getAction(id, businessId) {
+      return must(await supabase.from('ba_actions').select('*').eq('id', id).eq('business_id', businessId).maybeSingle(), 'action');
+    },
+    // Moves an action from one status to another ONLY if it is still in `from`. Returns the row, or null if someone
+    // else got there first (a double tap, two tabs): this is what makes approve safe to press twice.
+    async transitionAction(id, businessId, from, patch) {
+      const fromList = Array.isArray(from) ? from : [from];
+      return must(await supabase.from('ba_actions').update(patch).eq('id', id).eq('business_id', businessId).in('status', fromList).select('*').maybeSingle(), 'update action');
+    },
+    async patchAction(id, businessId, patch) {
+      return must(await supabase.from('ba_actions').update(patch).eq('id', id).eq('business_id', businessId).select('*').maybeSingle(), 'patch action');
+    },
+    async listActionsByIds(ids, businessId) {
+      if (!ids?.length) return [];
+      return must(await supabase.from('ba_actions').select('*').in('id', ids).eq('business_id', businessId), 'actions') ?? [];
+    },
+    async listPendingActions(businessId, { limit = 50 } = {}) {
+      return must(await supabase.from('ba_actions').select('*').eq('business_id', businessId).eq('status', 'pending')
+        .order('created_at', { ascending: false }).limit(limit), 'pending actions') ?? [];
+    },
+    // Activity log: finished things only (done, failed, undone, rejected), newest first, paged by `before` (ISO time).
+    async listActivity(businessId, { limit = 30, before = null, area = null } = {}) {
+      let q = supabase.from('ba_actions')
+        .select('id, type, area, risk, title, status, approval, summary, undoable, created_at, executed_at, decided_at, undone_at, conversation_id, error, result')
+        .eq('business_id', businessId).in('status', ['done', 'failed', 'undone', 'rejected']);
+      if (area) q = q.eq('area', area);
+      if (before) q = q.lt('created_at', before);
+      return must(await q.order('created_at', { ascending: false }).limit(Math.min(limit, 100)), 'activity') ?? [];
+    },
+    async expireStaleActions(businessId) {
+      must(await supabase.from('ba_actions').update({ status: 'expired', decided_at: new Date().toISOString() })
+        .eq('business_id', businessId).eq('status', 'pending').lt('expires_at', new Date().toISOString()), 'expire actions');
+    },
+    // A server restart mid-action would leave a row on 'running' forever; after 10 minutes it is marked failed.
+    async failStuckActions(businessId) {
+      const cutoff = new Date(Date.now() - 10 * 60_000).toISOString();
+      must(await supabase.from('ba_actions').update({ status: 'failed', error: 'Interrupted before it finished.', summary: 'This was interrupted before it finished. Please check and try again.' })
+        .eq('business_id', businessId).eq('status', 'running').lt('decided_at', cutoff), 'fail stuck actions');
+    },
+    async listActionPrefs(businessId) {
+      return must(await supabase.from('ba_action_prefs').select('action_type, always_allow').eq('business_id', businessId), 'action prefs') ?? [];
+    },
+    async setActionPref(businessId, actionType, alwaysAllow) {
+      return must(await supabase.from('ba_action_prefs').upsert({ business_id: businessId, action_type: actionType, always_allow: !!alwaysAllow, updated_at: new Date().toISOString() }).select('action_type, always_allow').single(), 'save action pref');
     },
 
     // ── catalog ──

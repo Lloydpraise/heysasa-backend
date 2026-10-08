@@ -242,3 +242,111 @@ test('the logged cost is what was actually billed when the deps report it', asyn
   await runTurn(deps, SIM);
   assert.equal(log.turns[0].cost_usd, 0.0123);
 });
+
+// ── speed: photos in the background, burst wait, effort ──
+const PHOTO_TURN: Scripted[] = [
+  { calls: [{ name: 'search_products', args: { query: 'volume lash set' } }] },
+  { calls: [{ name: 'send_products', args: { product_ids: ['p1'] } }] },
+  { text: 'The volume set is KES 3,500. Want me to book you in this week?' },
+];
+
+test('photos go out while the AI writes, and the reply is only sent once they have landed', async () => {
+  let landPhotos!: () => void;
+  const landed = new Promise<void>((resolve) => { landPhotos = resolve; });
+  const events: string[] = [];
+  const { deps, log } = harness(PHOTO_TURN);
+  deps.queue = async (items) => {
+    events.push('queued');
+    log.sent.push(items);
+    return { ok: true, settled: landed.then(() => { events.push('photos landed'); return { ok: true, results: items.map(() => ({ ok: true, messageId: 'm' })) }; }) };
+  };
+  const plainSend = deps.send;
+  deps.send = async (items) => { events.push('reply sent'); return plainSend(items); };
+
+  const turn = runTurn(deps, LIVE);
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(log.bodies.length, 3, 'the AI wrote its message without waiting for WhatsApp');
+  assert.deepEqual(events, ['queued'], 'the reply is held back until the photos have landed');
+  landPhotos();
+  const out = await turn;
+  assert.deepEqual(events, ['queued', 'photos landed', 'reply sent']);
+  assert.equal(out.status, 'replied');
+  assert.match(JSON.stringify(out.steps), /being sent to the customer now/);
+  assert.equal(typeof log.turns[0].input.timings.delivery_wait_ms, 'number');
+});
+
+test('if a photo fails to send, the AI writes its reply again knowing which one, and never claims the customer saw it', async () => {
+  const { deps, log } = harness([
+    ...PHOTO_TURN.slice(0, 2),
+    { text: 'Here is the volume set, KES 3,500. Shall I book you in?' },
+    { text: 'The volume set is KES 3,500. The photo did not go through, so I will send it again shortly. Shall I book you in?' },
+  ]);
+  deps.queue = async (items) => ({ ok: true, settled: Promise.resolve({ ok: false, error: 'whatsapp_not_connected', results: items.map(() => ({ ok: false, error: 'whatsapp_not_connected' })) }) });
+  const out = await runTurn(deps, LIVE);
+  assert.equal(out.status, 'replied');
+  assert.match(out.reply!, /photo did not go through/);
+  assert.equal(log.bodies.length, 4);
+  assert.equal(log.bodies[3].previous_response_id, 'resp_3');
+  assert.match(JSON.stringify(log.bodies[3].input), /did not reach the customer, so they have not seen them: Volume Lash Set/);
+  assert.equal(log.sent.length, 1, 'only the corrected reply went out');
+  assert.match((log.sent[0][0] as { text: string }).text, /did not go through/);
+});
+
+test('after a failed photo the AI can still retry it, and that retry waits for WhatsApp so it sees the real outcome', async () => {
+  const { deps, log } = harness([
+    ...PHOTO_TURN.slice(0, 2),
+    { text: 'Here is the volume set, KES 3,500. Shall I book you in?' },
+    { calls: [{ name: 'send_products', args: { product_ids: ['p1'] } }] },
+    { text: 'Sent the volume set again, KES 3,500. Shall I book you in?' },
+  ]);
+  deps.queue = async (items) => ({ ok: true, settled: Promise.resolve({ ok: false, error: 'timed_out_waiting_for_sender', results: items.map(() => ({ ok: false, error: 'timed_out_waiting_for_sender' })) }) });
+  const out = await runTurn(deps, LIVE);
+  assert.equal(out.status, 'replied');
+  assert.equal(log.sent.length, 2, 'the retried photo, then the reply');
+  assert.ok((log.sent[0][0] as { media?: unknown }).media, 'the retry went through the waiting path');
+});
+
+test('the burst wait only covers what is left of the quiet time, and stretches while the customer keeps writing', async () => {
+  const settings = { effort: 'low', settleMs: 3000, holdingAfterMs: 0, maxRounds: 6, holdingModel: 'gpt-4.1-mini' };
+  const run = async (latest: ((clock: number, call: number) => number | null) | null) => {
+    const { deps } = harness([{ text: 'Which style do you want?' }], { ctx: baseCtx({ settings }) });
+    const sleeps: number[] = [];
+    let clock = 1_000_000;
+    let call = 0;
+    deps.now = () => clock;
+    deps.sleep = async (ms) => { sleeps.push(ms); clock += ms; };
+    if (latest) deps.latestInboundAt = async () => latest(clock, ++call);
+    await runTurn(deps, LIVE);
+    return sleeps;
+  };
+  assert.deepEqual(await run((c, n) => (n === 1 ? c - 2000 : n === 2 ? c - 200 : c - 10_000)), [1000, 2800], 'waits the rest, then again after a new message');
+  assert.deepEqual(await run((c) => c - 5000), [], 'no wait at all when the message is already old enough');
+  assert.deepEqual(await run(() => null), [3000], 'cannot tell when it arrived: the full wait');
+  assert.deepEqual(await run(null), [3000], 'no lookup available: the full wait');
+  assert.deepEqual(await run((c) => c), [3000, 3000], 'never more than twice the settle time');
+});
+
+test('only reasoning models are sent a reasoning setting', async () => {
+  const plain = harness([{ text: 'Which style do you want?' }], { ctx: baseCtx({ business: { name: 'Biz', currency: 'KES', model: 'gpt-4.1-mini' } }) });
+  await runTurn(plain.deps, SIM);
+  assert.equal('reasoning' in plain.log.bodies[0], false);
+  const reasoning = harness([{ text: 'Which style do you want?' }]);
+  await runTurn(reasoning.deps, SIM);
+  assert.equal(reasoning.log.bodies[0].reasoning.effort, 'medium', 'the business setting is passed through');
+});
+
+test('the wallet check and the settings read run together, and an empty wallet still stops the turn before any model call', async () => {
+  const order: string[] = [];
+  const { deps, log } = harness([{ text: 'never reached' }]);
+  deps.loadSettings = async () => { order.push('settings'); return baseCtx().settings; };
+  deps.canAfford = async () => { order.push('wallet'); return false; };
+  const out = await runTurn(deps, LIVE);
+  assert.deepEqual(order.sort(), ['settings', 'wallet']);
+  assert.deepEqual([out.status, out.skip_reason, log.bodies.length], ['skipped', 'no_balance', 0]);
+});
+
+test('where the time went is saved with every live turn', async () => {
+  const { deps, log } = harness([{ text: 'Which style do you want?' }]);
+  await runTurn(deps, LIVE);
+  assert.deepEqual(Object.keys(log.turns[0].input.timings).sort(), ['context_ms', 'delivery_wait_ms', 'prep_ms', 'settle_ms']);
+});

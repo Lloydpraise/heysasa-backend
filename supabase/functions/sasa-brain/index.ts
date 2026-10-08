@@ -9,6 +9,7 @@
 import { createClient } from 'npm:@supabase/supabase-js@2';
 import { runTurn, type TurnInput } from './core/turn.ts';
 import { buildDeps } from './core/deps.ts';
+import { createContextCache } from './core/context.ts';
 
 const allowedOrigins = new Set([
   'http://localhost:5173',
@@ -21,6 +22,9 @@ const corsHeaders = (origin: string | null) => ({
   'Vary': 'Origin',
 });
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+// Lives as long as this function instance does. Holds persona, skills, tools, flows and product categories for a short
+// while (30 seconds; categories 5 minutes), so a busy chat does not re-read them on every message. The Playground skips it.
+const contextCache = createContextCache();
 
 Deno.serve(async (req) => {
   const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), {
@@ -47,7 +51,7 @@ Deno.serve(async (req) => {
   if (input.simulate && !input.message && !input.history?.length) return json({ error: 'A simulation needs a message or a history.' }, 400);
 
   const db = createClient(url, serviceKey, { auth: { persistSession: false } });
-  const deps = buildDeps({ db, openaiKey, fetch, sleep, toolSecret: Deno.env.get('SASA_TOOL_SECRET') ?? undefined }, input);
+  const deps = buildDeps({ db, openaiKey, fetch, sleep, toolSecret: Deno.env.get('SASA_TOOL_SECRET') ?? undefined, contextCache }, input);
 
   try {
     const outcome = await runTurn(deps, input);

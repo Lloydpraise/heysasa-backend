@@ -116,6 +116,18 @@ test('the clock and the new message come last so the history stays cacheable', (
   assert.notEqual(a.at(-1)!.content, b.at(-1)!.content);
 });
 
+test('the customer file comes after the history, so a profile change does not make the whole history a cache miss', () => {
+  const history = [{ role: 'user' as const, text: 'hi' }, { role: 'assistant' as const, text: 'hello' }, { role: 'user' as const, text: 'price?' }];
+  const mk = (customer: Record<string, unknown>) => buildInput({ flow: null, loadedSkills: [], customer, history, nowLabel: 'Monday 09:00' });
+  const a = mk({ name: 'Amina' });
+  const b = mk({ name: 'Amina', stage: 'hot', lead_summary: 'wants volume set' });
+  const fileAt = a.findIndex((i) => i.content.startsWith('CUSTOMER FILE'));
+  assert.equal(fileAt, a.length - 2, 'just before the clock');
+  assert.deepEqual(a.slice(1, 4).map((i) => i.content), ['hi', 'hello', 'price?']);
+  assert.deepEqual(a.slice(0, fileAt), b.slice(0, fileAt), 'everything before the file is identical, so it stays cached');
+  assert.notEqual(a[fileAt].content, b[fileAt].content);
+});
+
 test('prices are shown with currency and thousands separators', () => {
   assert.equal(formatPrice(3500, 'KES'), 'KES 3,500');
   assert.equal(formatPrice(99.5, null), 'KES 99.50');

@@ -1,7 +1,7 @@
 // In-memory stand-ins used by the tests.
 
 export function fakeStore(over = {}) {
-  const db = { conversations: [], messages: [], notes: [], prefs: null, calls: { persona: 0, products: 0 }, seq: 0 };
+  const db = { conversations: [], messages: [], notes: [], actions: [], actionPrefs: [], prefs: null, calls: { persona: 0, products: 0 }, seq: 0 };
   const id = () => `00000000-0000-4000-8000-${String(++db.seq).padStart(12, '0')}`;
   const skills = [
     { key: 'copywriting', title: 'Copywriting', when_to_use: 'writing copy', instructions: 'COPY RULES' },
@@ -40,6 +40,20 @@ export function fakeStore(over = {}) {
     touchNotes: async () => {},
     savePreferences: async (b, prefs) => { db.prefs = { business_id: b, ...prefs }; return db.prefs; },
     matchProducts: async () => { db.calls.products++; return [{ title: 'Non-stick pan 28cm', price: 2500, category: 'Cookware', description_short: 'Heavy-bottom pan.' }]; },
+    // actions (approval queue + activity log)
+    insertAction: async (row) => { const a = { id: id(), created_at: new Date(++db.seq * 1000).toISOString(), status: 'pending', expires_at: new Date(Date.now() + 86_400_000).toISOString(), undoable: false, ...row }; db.actions.push(a); return { ...a }; },
+    getAction: async (aid, b) => { const a = db.actions.find((x) => x.id === aid && x.business_id === b); return a ? { ...a } : null; },
+    transitionAction: async (aid, b, from, patch) => { const a = db.actions.find((x) => x.id === aid && x.business_id === b && [].concat(from).includes(x.status)); if (!a) return null; Object.assign(a, patch); return { ...a }; },
+    patchAction: async (aid, b, patch) => { const a = db.actions.find((x) => x.id === aid && x.business_id === b); if (!a) return null; Object.assign(a, patch); return { ...a }; },
+    listActionsByIds: async (ids, b) => db.actions.filter((a) => ids.includes(a.id) && a.business_id === b).map((a) => ({ ...a })),
+    listPendingActions: async (b) => db.actions.filter((a) => a.business_id === b && a.status === 'pending').map((a) => ({ ...a })),
+    listActivity: async (b, { limit = 30, before = null, area = null } = {}) => db.actions
+      .filter((a) => a.business_id === b && ['done', 'failed', 'undone', 'rejected'].includes(a.status) && (!area || a.area === area) && (!before || a.created_at < before))
+      .sort((x, y) => (x.created_at < y.created_at ? 1 : -1)).slice(0, limit).map((a) => ({ ...a })),
+    expireStaleActions: async (b) => { for (const a of db.actions) if (a.business_id === b && a.status === 'pending' && a.expires_at < new Date().toISOString()) a.status = 'expired'; },
+    failStuckActions: async () => {},
+    listActionPrefs: async (b) => db.actionPrefs.filter((p) => p.business_id === b),
+    setActionPref: async (b, type, on) => { const p = db.actionPrefs.find((x) => x.business_id === b && x.action_type === type); if (p) p.always_allow = on; else db.actionPrefs.push({ business_id: b, action_type: type, always_allow: on }); return { action_type: type, always_allow: !!on }; },
     ...over,
   };
   return store;

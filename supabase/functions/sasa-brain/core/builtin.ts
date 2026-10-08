@@ -9,6 +9,9 @@ export type ProductRow = {
 
 export type SendItem = { text?: string; media?: { type: 'image'; url: string; caption: string } };
 export type SendResult = { ok: boolean; results?: Array<{ ok: boolean; error?: string; messageId?: string | null }>; error?: string };
+// Messages handed to the sender without waiting for them to go out. `settled` resolves once the sender is done with them.
+export type QueueResult = { ok: boolean; error?: string; settled: Promise<SendResult> };
+export type PendingSend = { ids: string[]; settled: Promise<SendResult> };
 
 export type TurnState = {
   businessId: string; contactId: number | null; conversationId: string | null; currency: string | null; simulate: boolean;
@@ -16,6 +19,7 @@ export type TurnState = {
   skills: Map<string, { key: string; title: string; instructions: string }>;
   skillsLoaded: Set<string>;
   productsSent: string[];
+  pending?: PendingSend[];         // product photos queued but not yet confirmed sent (see settlePending)
   handoff: { reason: string; urgency: string; summary: string } | null;
   corpus: string[];                // every legitimate fact the reply may use (feeds the price check)
 };
@@ -25,9 +29,29 @@ export type Deps = {
   db: any;
   embed: (text: string) => Promise<number[]>;
   send: (items: SendItem[]) => Promise<SendResult>;
+  // Optional. When present, send_products queues its photos and returns at once instead of waiting for WhatsApp.
+  queue?: (items: SendItem[]) => Promise<QueueResult>;
   fetch: typeof fetch;
   toolSecret?: string;
 };
+
+// Waits for every photo send queued this turn, records the ones that went out, and reports the ones that did not.
+// Called before the written reply is sent, so the customer never gets a message about photos that are still on their
+// way, and the AI is told about any that failed.
+export async function settlePending(state: TurnState): Promise<{ sent: string[]; failed: Array<{ id: string; error: string }> }> {
+  const batches = state.pending ?? [];
+  state.pending = [];
+  const sent: string[] = [];
+  const failed: Array<{ id: string; error: string }> = [];
+  for (const batch of batches) {
+    const result = await batch.settled.catch((e: unknown) => ({ ok: false, error: String((e as Error)?.message ?? e) } as SendResult));
+    batch.ids.forEach((id, i) => {
+      const r = result.results?.[i];
+      if (r?.ok) { sent.push(id); state.productsSent.push(id); } else failed.push({ id, error: r?.error || result.error || 'not sent' });
+    });
+  }
+  return { sent, failed };
+}
 
 export function formatPrice(price: number | null | undefined, currency: string | null): string {
   if (price === null || price === undefined || !Number.isFinite(Number(price))) return '';
@@ -122,6 +146,14 @@ export const builtinHandlers: Record<string, Handler> = {
       const photo = Array.isArray(p.images) ? p.images.find((u) => typeof u === 'string' && /^https?:\/\//.test(u)) : null;
       return photo ? { media: { type: 'image', url: photo, caption } } : { text: caption };
     });
+    if (deps.queue) {
+      // The photos go out while the AI writes its message. turn.ts waits for them before the message is sent, and tells
+      // the AI if any failed, so it still never claims the customer saw something they did not.
+      const queued = await deps.queue(items);
+      if (!queued.ok) return { sent: [], error: queued.error || 'The messages could not be queued. Do not claim the customer saw anything.' };
+      (state.pending ??= []).push({ ids, settled: queued.settled });
+      return { queued: ids, message: 'These products are being sent to the customer now. Write your message about them as if they can see them.' };
+    }
     const result = await deps.send(items);
     if (!result.ok && !result.results?.some((r) => r.ok)) return { sent: [], error: result.error || 'The messages could not be sent. Do not claim the customer saw anything.' };
     const sent: string[] = [];

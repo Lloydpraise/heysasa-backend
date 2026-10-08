@@ -1,9 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { enqueueAndWait } from './outbox.ts';
-import { toHistory, readSettings } from './context.ts';
+import { enqueue, enqueueAndWait, waitForDelivery } from './outbox.ts';
+import { toHistory, readSettings, loadContext, loadSettings, createContextCache } from './context.ts';
 import { makeCallModel, makeEmbed } from './openai.ts';
-import { builtinHandlers, runRegistryTool, type TurnState } from './builtin.ts';
+import { builtinHandlers, runRegistryTool, settlePending, type TurnState } from './builtin.ts';
 import type { ToolRow } from './tools.ts';
 
 // ── a tiny in-memory outbox table ──
@@ -57,6 +57,22 @@ test('if the sender never picks a message up, it is cancelled so it cannot go ou
   assert.equal(rows[0].error, 'timed_out_waiting_for_sender');
 });
 
+test('queueing returns at once; the wait for delivery can be done later and reports each result', async () => {
+  const { db, rows } = outboxDb((r, poll) => { if (poll === 2) r.forEach((x, i) => { x.status = 'sent'; x.whatsapp_message_id = `W${i}`; }); });
+  const queued = await enqueue(db, target, [{ text: 'a' }, { text: 'b' }]);
+  assert.equal(queued.ok, true);
+  assert.equal(rows.length, 2, 'rows are saved for the sender');
+  assert.equal(rows.every((r) => r.status === 'queued'), true, 'nothing has waited for the sender yet');
+  const result = await waitForDelivery(db, (queued as { ok: true; queued: any }).queued, { sleep: async () => {} });
+  assert.deepEqual(result.results, [{ ok: true, messageId: 'W0' }, { ok: true, messageId: 'W1' }]);
+});
+
+test('queueing reports a database failure instead of pretending the message was saved', async () => {
+  const db = { from: () => ({ insert: () => ({ select: async () => ({ data: null, error: { message: 'db down' } }) }) }) };
+  const queued = await enqueue(db, target, [{ text: 'a' }]);
+  assert.deepEqual(queued, { ok: false, error: 'could not queue the message: db down' });
+});
+
 // ── context helpers ──
 test('history labels the owner and automatic follow-ups, and shows photos and voice notes as labels', () => {
   const rows = [
@@ -79,9 +95,10 @@ test('history labels the owner and automatic follow-ups, and shows photos and vo
 });
 
 test('settings have safe defaults and limits', () => {
-  assert.deepEqual(readSettings(null), { effort: 'medium', settleMs: 3000, holdingAfterMs: 9000, maxRounds: 6, holdingModel: 'gpt-4.1-mini' });
+  assert.deepEqual(readSettings(null), { effort: 'low', settleMs: 3000, holdingAfterMs: 9000, maxRounds: 6, holdingModel: 'gpt-4.1-mini' });
   const s = readSettings({ effort: 'banana', settle_ms: 999999, holding_after_ms: 0, max_rounds: 1 });
-  assert.deepEqual([s.effort, s.settleMs, s.holdingAfterMs, s.maxRounds], ['medium', 15000, 0, 2]);
+  assert.deepEqual([s.effort, s.settleMs, s.holdingAfterMs, s.maxRounds], ['low', 15000, 0, 2]);
+  assert.equal(readSettings({ effort: 'high' }).effort, 'high', 'a business can still ask for more thinking');
 });
 
 // ── OpenAI calls ──
@@ -180,4 +197,101 @@ test('a tool you add as a database row runs without any new code: rpc and http k
 test('a registry row pointing at a missing built-in handler is an error, not a crash', async () => {
   const row: ToolRow = { name: 'ghost', business_id: null, description: 'd', parameters: {}, kind: 'builtin', target: 'ghost', phase: 'lookup' };
   await assert.rejects(runRegistryTool(row, {}, state(), { db: {}, embed: async () => [], send: async () => ({ ok: true }), fetch }), /does not exist/);
+});
+
+// ── settling photos queued in the background ──
+test('settlePending records the photos that went out and names the ones that did not', async () => {
+  const st = state({
+    pending: [
+      { ids: ['p1', 'p2'], settled: Promise.resolve({ ok: false, results: [{ ok: true, messageId: 'W1' }, { ok: false, error: 'bad media' }] }) },
+      { ids: ['p3'], settled: Promise.reject(new Error('network')) },
+    ],
+  });
+  const out = await settlePending(st);
+  assert.deepEqual(out.sent, ['p1']);
+  assert.deepEqual(out.failed, [{ id: 'p2', error: 'bad media' }, { id: 'p3', error: 'network' }]);
+  assert.deepEqual(st.productsSent, ['p1']);
+  assert.deepEqual((await settlePending(st)).failed, [], 'nothing is settled twice');
+});
+
+test('send_products with a queue returns at once and records what is pending; without one it still waits', async () => {
+  const st = state();
+  st.seenProducts.set('p1', { id: 'p1', title: 'Set', price: 1500, category: null, description_short: null, images: ['https://x/a.jpg'] });
+  let waited = false;
+  const queued: any = await builtinHandlers.send_products({ product_ids: ['p1'] }, st, {
+    db: {}, embed: async () => [], fetch, send: async () => { waited = true; return { ok: true }; },
+    queue: async () => ({ ok: true, settled: Promise.resolve({ ok: true, results: [{ ok: true }] }) }),
+  });
+  assert.deepEqual(queued.queued, ['p1']);
+  assert.equal(waited, false);
+  assert.equal(st.pending?.length, 1);
+  assert.equal(st.productsSent.length, 0, 'not counted as sent until delivery is confirmed');
+  const refused: any = await builtinHandlers.send_products({ product_ids: ['p1'] }, state({ seenProducts: st.seenProducts }), {
+    db: {}, embed: async () => [], fetch, send: async () => ({ ok: true }), queue: async () => ({ ok: false, error: 'could not queue', settled: Promise.resolve({ ok: false }) }),
+  });
+  assert.equal(refused.sent.length, 0);
+  assert.match(refused.error, /could not queue/);
+});
+
+// ── the business-level cache ──
+function contextDb(counter: Record<string, number>) {
+  const answers: Record<string, any> = {
+    businesses: { name: 'Biz', currency: 'KES', chat_ai_model: 'gpt-5-mini', chat_ai_settings: { effort: 'high' } },
+    persona_packs: [{ pack: { persona: 'warm' } }], products: [{ category: 'Lashes' }, { category: 'Lashes' }],
+    chat_ai_skills: [], chat_ai_tools: [], chat_flows: [], contacts: { name: 'Amina' }, conversations: { chat_ai_flow_id: null },
+    list_members: [], messages: [{ direction: 'in', type: 'text', content: { text: 'hi' } }],
+  };
+  const chain = (table: string): any => {
+    counter[table] = (counter[table] ?? 0) + 1;
+    const q: any = new Proxy({}, { get: (_t, prop) => {
+      if (prop === 'then') return (resolve: (v: unknown) => void) => resolve({ data: answers[table], error: null });
+      return () => q;
+    } });
+    return q;
+  };
+  return { from: chain };
+}
+
+test('business-level data is read once and reused for a short while; the chat itself is always read fresh', async () => {
+  let clock = 0;
+  const cache = createContextCache({ coreMs: 30_000, categoriesMs: 300_000, now: () => clock });
+  const counter: Record<string, number> = {};
+  const db = contextDb(counter);
+  const live = { business_id: 'b1', conversation_id: 'c1', contact_id: 7 };
+  const first = await loadContext(db, live, cache);
+  await loadContext(db, live, cache);
+  await loadSettings(db, live, cache);
+  assert.deepEqual([counter.businesses, counter.persona_packs, counter.chat_ai_skills, counter.chat_ai_tools, counter.chat_flows, counter.products], [1, 1, 1, 1, 1, 1]);
+  assert.deepEqual([counter.messages, counter.contacts, counter.conversations], [2, 2, 2], 'the customer and the history are read every time');
+  assert.deepEqual(first.categories, [{ name: 'Lashes', count: 2 }]);
+  assert.equal(first.settings.effort, 'high');
+
+  clock = 31_000;
+  await loadContext(db, live, cache);
+  assert.equal(counter.businesses, 2, 'persona, skills, tools and flows are re-read after 30 seconds');
+  assert.equal(counter.products, 1, 'the product categories are kept for 5 minutes');
+  clock = 301_000;
+  await loadContext(db, live, cache);
+  assert.equal(counter.products, 2);
+});
+
+test('the Playground never uses the cache, so an edited skill shows up at once', async () => {
+  const cache = createContextCache();
+  const counter: Record<string, number> = {};
+  const db = contextDb(counter);
+  const sim = { business_id: 'b1', simulate: true, message: 'hi' };
+  await loadContext(db, sim, cache);
+  await loadContext(db, sim, cache);
+  assert.equal(counter.businesses, 2);
+  assert.equal(counter.products, 2);
+});
+
+test('a failed read is never remembered', async () => {
+  const cache = createContextCache();
+  let calls = 0;
+  const db = { from: () => { calls++; const q: any = new Proxy({}, { get: (_t, p) => (p === 'then' ? (r: (v: unknown) => void) => r({ data: null, error: { message: 'boom' } }) : () => q) }); return q; } };
+  await assert.rejects(loadSettings(db, { business_id: 'b1' }, cache), /could not load the business/);
+  const before = calls;
+  await assert.rejects(loadSettings(db, { business_id: 'b1' }, cache), /could not load the business/);
+  assert.ok(calls > before, 'the second message tried again instead of replaying the failure');
 });

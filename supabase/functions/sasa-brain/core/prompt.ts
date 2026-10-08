@@ -4,8 +4,9 @@
 //   tools                    same for every business until the registry changes
 //   instructions             same for one business until its persona, categories or skill menu change
 //   input[0] flow + skills   same for every turn of one chat
-//   input[1] customer file   changes only when the profile changes
-//   input[2..] history       grows by appending, so earlier turns stay cached
+//   input[1..] history       grows by appending, so earlier turns stay cached
+//   then: customer file      changes whenever the profile or a summary changes, so it sits AFTER the history: a change
+//                            costs only its own few tokens, instead of making the whole history a cache miss
 //   last: the clock          changes every turn, and is never part of the cached beginning
 
 import { NO_REPLY } from './guards.ts';
@@ -99,9 +100,10 @@ export function buildInput(args: {
     ? `Loaded for this chat:\n${args.loadedSkills.map((s) => `### ${s.title} (${s.key})\n${s.instructions}`).join('\n\n')}`
     : 'Loaded for this chat: none');
   items.push({ role: 'developer', content: chatPart.join('\n\n') });
-  items.push({ role: 'developer', content: `CUSTOMER FILE\n${renderCustomerFile(args.customer)}` });
 
   for (const m of args.history) items.push({ role: m.role, content: m.text });
+
+  items.push({ role: 'developer', content: `CUSTOMER FILE\n${renderCustomerFile(args.customer)}` });
 
   for (const extra of args.extra ?? []) items.push({ role: 'developer', content: extra });
   items.push({ role: 'developer', content: `Now: ${args.nowLabel}. Reply to the customer's latest message.` });

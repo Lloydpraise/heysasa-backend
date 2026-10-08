@@ -2,14 +2,16 @@
 // because where messages go (this chat) and whether anything is really sent (simulation) depend on the request.
 
 import type { TurnContext, TurnDeps, TurnInput } from './turn.ts';
-import type { SendItem, SendResult } from './builtin.ts';
-import { loadContext } from './context.ts';
-import { enqueueAndWait } from './outbox.ts';
+import type { QueueResult, SendItem, SendResult } from './builtin.ts';
+import { loadContext, loadSettings, type ContextCache } from './context.ts';
+import { enqueue, enqueueAndWait, waitForDelivery } from './outbox.ts';
 import { makeCallModel, makeEmbed } from './openai.ts';
 
 export type RuntimeDeps = {
   // deno-lint-ignore no-explicit-any
   db: any; openaiKey: string; fetch: typeof fetch; sleep: (ms: number) => Promise<void>; toolSecret?: string;
+  // Kept by index.ts for the life of the function instance, so business-level data is not re-read on every message.
+  contextCache?: ContextCache;
 };
 
 const HOLDING_INSTRUCTIONS = `You write one very short WhatsApp line (at most 12 words) for a sales rep who is checking something and needs a moment.
@@ -48,7 +50,9 @@ export function buildDeps(rt: RuntimeDeps, request: TurnInput): TurnDeps {
   const callModel = async (body: Record<string, any>) => {
     const res = await rawCallModel(body);
     const u = res?.usage ?? {};
-    await bill(String(body.model), Number(u.input_tokens ?? 0), Number(u.input_tokens_details?.cached_tokens ?? 0), Number(u.output_tokens ?? 0)).catch(() => {});
+    // Billed in the background: the next model call does not wait for a database write. logTurn waits for every bill
+    // before it saves the turn, so the logged cost is still complete.
+    track(bill(String(body.model), Number(u.input_tokens ?? 0), Number(u.input_tokens_details?.cached_tokens ?? 0), Number(u.output_tokens ?? 0)));
     return res;
   };
   const embed = makeEmbed(openai, (model, tokens) => track(bill(model, tokens, 0, 0)));
@@ -63,6 +67,19 @@ export function buildDeps(rt: RuntimeDeps, request: TurnInput): TurnDeps {
     return enqueueAndWait(rt.db, { businessId: input.business_id, conversationId: input.conversation_id, contactId: input.contact_id }, items, { sleep: rt.sleep });
   };
 
+  // Same as `send`, but returns as soon as the messages are saved for the sender. `settled` finishes when the sender has.
+  const queue = async (items: SendItem[]): Promise<QueueResult> => {
+    const input = request;
+    const failed = (error: string): QueueResult => ({ ok: false, error, settled: Promise.resolve({ ok: false, error }) });
+    if (input.simulate) return { ok: true, settled: Promise.resolve({ ok: true, results: items.map(() => ({ ok: true, messageId: null })) }) };
+    if (!input.conversation_id || !input.contact_id) return failed('missing conversation or contact');
+    const queued = await enqueue(rt.db, { businessId: input.business_id, conversationId: input.conversation_id, contactId: input.contact_id }, items);
+    if (!queued.ok) return failed(queued.error);
+    const settled = waitForDelivery(rt.db, queued.queued, { sleep: rt.sleep });
+    settled.catch(() => {});   // the turn reads the outcome later; this only stops an early failure being reported as unhandled
+    return { ok: true, settled };
+  };
+
   return {
     turnId,
     spend: () => ({ base, billed }),
@@ -75,11 +92,22 @@ export function buildDeps(rt: RuntimeDeps, request: TurnInput): TurnDeps {
       if (biz?.business_type === 'heysasa') return true;
       return Boolean(bal) && Number(bal.balance_usd) > 0;
     },
-    loadContext: (input) => loadContext(rt.db, input),
+    loadContext: (input) => loadContext(rt.db, input, rt.contextCache),
+    loadSettings: (input) => loadSettings(rt.db, input, rt.contextCache),
     callModel,
     tools: { db: rt.db, embed, fetch: rt.fetch, toolSecret: rt.toolSecret },
     send,
+    queue,
     sleep: rt.sleep,
+
+    // When the customer's newest message arrived, so the burst wait only covers what is left of the quiet time.
+    async latestInboundAt(input: TurnInput) {
+      if (!input.conversation_id) return null;
+      const { data, error } = await rt.db.from('messages').select('created_at').eq('conversation_id', input.conversation_id)
+        .eq('direction', 'in').neq('type', 'reaction').order('created_at', { ascending: false }).limit(1).maybeSingle();
+      const at = error || !data?.created_at ? NaN : Date.parse(data.created_at);
+      return Number.isFinite(at) ? at : null;
+    },
 
     async hasNewerInbound(input: TurnInput) {
       if (!input.conversation_id || !input.trigger_message_id) return false;

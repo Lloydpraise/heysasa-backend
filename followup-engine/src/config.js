@@ -44,9 +44,15 @@ export const ANTIBAN_WINDOW_MS = 60 * 60_000   // sliding window size for the ho
 // ── Chat AI lane (replies to customers who wrote to the business first) ──
 // Same WhatsApp connection and send code as follow-ups, but its own pacing and its own counter
 // (chat_ai_outbox). A reply to a customer who just wrote in can't wait 20-65 seconds like a campaign message.
-export const CHAT_AI_POLL_INTERVAL_MS = parseInt(process.env.CHAT_AI_POLL_INTERVAL_MS ?? '1000')
-export const CHAT_AI_MIN_GAP_MS = parseInt(process.env.CHAT_AI_MIN_GAP_MS ?? '2000')            // floor gap between chat AI sends per business
+export const CHAT_AI_POLL_INTERVAL_MS = parseInt(process.env.CHAT_AI_POLL_INTERVAL_MS ?? '500')
+export const CHAT_AI_MIN_GAP_MS = parseInt(process.env.CHAT_AI_MIN_GAP_MS ?? '2000')            // floor gap between chat AI sends per business, when the next message is for a DIFFERENT customer
 export const CHAT_AI_GAP_JITTER_MS = parseInt(process.env.CHAT_AI_GAP_JITTER_MS ?? '2500')      // random extra on top of the floor
+// Messages in the SAME chat (product photos, then the written reply) go out close together, the way a person sends them.
+// The typing time set on each message still applies on top of this, so they do not arrive in a single burst.
+export const CHAT_AI_SAME_CHAT_GAP_MS = parseInt(process.env.CHAT_AI_SAME_CHAT_GAP_MS ?? '600')
+export const CHAT_AI_SAME_CHAT_JITTER_MS = parseInt(process.env.CHAT_AI_SAME_CHAT_JITTER_MS ?? '700')
+export const CHAT_AI_MAX_INLINE_WAIT_MS = 6000                                                   // longer than this and the message waits for the next pass instead of sleeping
 export const CHAT_AI_HOURLY_CEILING = parseInt(process.env.CHAT_AI_HOURLY_CEILING ?? '150')     // hard ceiling of chat AI messages per hour per business
 export const CHAT_AI_STALE_CLAIM_MS = 2 * 60_000
+export const CHAT_AI_STALE_SWEEP_MS = 30_000                                                     // how often stuck "sending" rows are cleaned up
 

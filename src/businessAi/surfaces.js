@@ -33,8 +33,9 @@ export const SURFACES = {
   general: {
     label: 'a general chat with the owner',
     audience: 'owner',
-    skills: ['owner_discovery'],
+    skills: ['plain_language', 'owner_discovery'],
     draft: 'text',
+    agent: true,
   },
 };
 

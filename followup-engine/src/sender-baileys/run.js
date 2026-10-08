@@ -23,16 +23,13 @@ tick()
 setInterval(tick, SENDER_POLL_INTERVAL_MS)
 
 // The chat AI lane has its own loop so a slow campaign batch never delays a reply to a waiting customer.
-let chatAiRunning = false
+// Ticks may overlap on purpose: processChatAiOutbox runs one lane per business and skips a business whose lane is still
+// busy, so a business sending several messages never holds up the next tick for the others.
 async function chatAiTick() {
-  if (chatAiRunning) return
-  chatAiRunning = true
   try {
     await processChatAiOutbox()
   } catch (e) {
     log('error', 'sender', 'chat_ai.tick_error', `Chat AI sender tick failed: ${e.message}`, { details: { error: { name: e.name, message: e.message } } })
-  } finally {
-    chatAiRunning = false
   }
 }
 setInterval(chatAiTick, CHAT_AI_POLL_INTERVAL_MS)

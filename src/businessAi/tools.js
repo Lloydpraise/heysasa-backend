@@ -1,3 +1,5 @@
+import { ToolError } from './agent/helpers.js';
+
 // The tools Ask HeySasa can call. All four are shown to the model on every turn (same list for everyone, so the
 // prompt cache stays warm), and all four are safe: none of them sends anything to a customer.
 
@@ -47,7 +49,7 @@ function formatPrice(price, currency) {
 }
 
 // state: { businessId, conversationId, currency, skills (all available), loaded: Set<key>, recordLoaded(key) }
-export function createToolRunner({ store, notes, embed, state, log = () => {} }) {
+export function createToolRunner({ store, notes, embed, state, agent = null, log = () => {} }) {
   const handlers = {
     async load_skill({ key }) {
       const skill = state.skills.find((s) => s.key === asText(key));
@@ -74,9 +76,21 @@ export function createToolRunner({ store, notes, embed, state, log = () => {} })
     },
     async save_note({ text, pinned }) {
       const result = await notes.save({ businessId: state.businessId, text: asText(text), pinned: pinned === true, conversationId: state.conversationId });
+      if (result.status !== 'ignored') await state.recordNote?.(asText(text));
       return { status: result.status };
     },
   };
+
+  async function runAgentTool(tool, args) {
+    const ctx = state.agentCtx;
+    if (tool.kind !== 'propose') return tool.run(ctx, args);
+    const { action, auto } = await agent.engine.propose(ctx, tool, args);
+    state.actionIds.push(action.id);
+    state.emit?.({ type: auto ? 'action_done' : 'action', action: agent.toPublicAction(action) });
+    if (action.status === 'done') return { status: 'done', action_id: action.id, what: action.title, result: action.summary };
+    if (action.status === 'failed') return { status: 'failed', action_id: action.id, what: action.title, problem: action.summary };
+    return { status: 'waiting_for_owner', action_id: action.id, what: action.title, note: 'A card is now in front of the owner. Nothing has changed yet.' };
+  }
 
   return async function runCalls(calls) {
     return Promise.all(calls.map(async (call) => {
@@ -84,14 +98,18 @@ export function createToolRunner({ store, notes, embed, state, log = () => {} })
       let args = {};
       try { args = call.arguments ? JSON.parse(call.arguments) : {}; } catch { /* handled below */ }
       const handler = handlers[call.name];
+      const agentTool = !handler && agent?.registry.byName.get(call.name);
       let output; let ok = true;
       try {
-        output = handler ? await handler(args) : { error: `Unknown tool ${call.name}` };
+        if (handler) output = await handler(args);
+        else if (agentTool) output = await runAgentTool(agentTool, args);
+        else output = { error: `Unknown tool ${call.name}` };
         if (output?.error) ok = false;
       } catch (error) {
         ok = false;
-        output = { error: 'That tool failed. Carry on without it.' };
-        log('warn', `tool ${call.name} failed: ${error.message}`);
+        // A ToolError is written for the owner to read; anything else is a bug and stays in the logs.
+        output = error instanceof ToolError ? { error: error.message } : { error: 'That tool failed. Carry on without it.' };
+        if (!(error instanceof ToolError)) log('warn', `tool ${call.name} failed: ${error.message}`);
       }
       return { call_id: call.call_id, name: call.name, ok, ms: Date.now() - started, output: JSON.stringify(output).slice(0, 6000) };
     }));

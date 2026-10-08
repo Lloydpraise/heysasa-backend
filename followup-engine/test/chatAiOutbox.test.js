@@ -49,15 +49,17 @@ function setup(items, overrides = {}) {
   resetChatAiLaneState()
   const state = { chat_ai_outbox: items, whatsapp_sessions: [{ business_id: 'b1', status: 'connected', instance_name: 'heysasa_b1', updated_at: '2026-10-04T09:00:00Z' }], messages: [], follow_up_queue: [] }
   const sends = []
+  const sleeps = []
   let clock = T0
   const deps = {
     supabase: fakeSupabase(state),
     getContact: async () => contact,
     send: async (instance, number, content) => { sends.push({ instance, number, content }); return { ok: true, messageId: `W${sends.length}` } },
     now: () => clock, rand: () => 0,
+    sleep: async (ms) => { sleeps.push(ms); clock += ms },
     ...overrides,
   }
-  return { state, sends, deps, advance: (ms) => { clock += ms } }
+  return { state, sends, sleeps, deps, advance: (ms) => { clock += ms } }
 }
 
 test('a queued reply is sent through the same Evolution sender, saved as chat_ai, and the outbox row is marked sent', async () => {
@@ -79,19 +81,72 @@ test('a product photo goes out as an image with its caption', async () => {
   assert.equal(state.messages[0].content.text, 'Set\nKES 3,500')
 })
 
-test('a chat\'s messages go out in order, one per pass, with a gap between them', async () => {
-  const { sends, deps, advance, state } = setup([
-    item({ id: 'o1', seq: 0, text: 'photo caption' }), item({ id: 'o2', seq: 1, text: 'the reply', created_at: '2026-10-04T09:59:59Z' }),
+test('a chat\'s messages go out in order and close together; a different customer waits the longer gap', async () => {
+  const { sends, sleeps, deps, state } = setup([
+    item({ id: 'o1', seq: 0, text: 'photo caption' }),
+    item({ id: 'o2', seq: 1, text: 'the reply' }),
+    item({ id: 'o3', seq: 0, conversation_id: 'c2', text: 'someone else', created_at: '2026-10-04T10:00:00Z' }),
   ])
-  let r = await processChatAiOutbox(deps)
-  assert.equal(r.sent, 1)
-  r = await processChatAiOutbox(deps)
-  assert.equal(r.sent, 0, 'second message waits for the gap')
-  advance(2100)
-  r = await processChatAiOutbox(deps)
-  assert.equal(r.sent, 1)
-  assert.deepEqual(sends.map((s) => s.content.text), ['photo caption', 'the reply'])
+  const r = await processChatAiOutbox(deps)
+  assert.equal(r.sent, 3, 'one pass sends the whole chat')
+  assert.deepEqual(sends.map((x) => x.content.text), ['photo caption', 'the reply', 'someone else'])
+  assert.deepEqual(sleeps, [600, 2000], 'short gap inside a chat, the usual gap before another customer')
+  assert.deepEqual(state.chat_ai_outbox.map((o) => o.status), ['sent', 'sent', 'sent'])
+})
+
+test('each business is its own lane: one business being slow does not hold up another', async () => {
+  let releaseA
+  const gateA = new Promise((resolve) => { releaseA = resolve })
+  const order = []
+  const { state, deps } = setup([
+    item({ id: 'a1', business_id: 'b1', contact_id: 7, conversation_id: 'ca' }),
+    item({ id: 'b1x', business_id: 'b2', contact_id: 8, conversation_id: 'cb' }),
+  ], {
+    getContact: async (_s, id) => ({ ...contact, id, business_id: id === 7 ? 'b1' : 'b2', phone: id === 7 ? '0712345678' : '0722222222' }),
+    send: async (instance) => { if (instance === 'heysasa_b1') await gateA; order.push(instance); return { ok: true, messageId: `W-${instance}` } },
+  })
+  state.whatsapp_sessions.push({ business_id: 'b2', status: 'connected', instance_name: 'heysasa_b2', updated_at: '2026-10-04T09:00:00Z' })
+  const run = processChatAiOutbox(deps)
+  for (let i = 0; i < 100 && !order.includes('heysasa_b2'); i++) await new Promise((resolve) => setImmediate(resolve))
+  assert.deepEqual(order, ['heysasa_b2'], 'business 2 was sent while business 1 was still waiting on WhatsApp')
+  releaseA()
+  const r = await run
+  assert.deepEqual(order, ['heysasa_b2', 'heysasa_b1'])
+  assert.equal(r.sent, 2)
+})
+
+test('overlapping passes never send a message twice', async () => {
+  const { sends, deps, state } = setup([item({ id: 'o1', text: 'one' }), item({ id: 'o2', seq: 1, text: 'two' })])
+  const [a, b] = await Promise.all([processChatAiOutbox(deps), processChatAiOutbox(deps)])
+  assert.equal(sends.length, 2)
+  assert.deepEqual(sends.map((x) => x.content.text).sort(), ['one', 'two'])
+  assert.equal(a.sent + b.sent, 2)
   assert.deepEqual(state.chat_ai_outbox.map((o) => o.status), ['sent', 'sent'])
+})
+
+test('a photo that fails does not stop the rest of its chat, and is not retried', async () => {
+  const attempted = []
+  const { state, deps } = setup([
+    item({ id: 'o1', seq: 0, kind: 'image', text: null, media: { type: 'image', url: 'https://img.test/bad.jpg', caption: 'A' } }),
+    item({ id: 'o2', seq: 1, text: 'the reply' }),
+  ], { send: async (_instance, _number, content) => { attempted.push(content.text); return attempted.length === 1 ? { ok: false, error: '400: bad media' } : { ok: true, messageId: 'W2' } } })
+  const r = await processChatAiOutbox(deps)
+  assert.deepEqual([r.failed, r.sent], [1, 1])
+  assert.deepEqual(state.chat_ai_outbox.map((o) => [o.status, o.error ?? null]), [['failed', '400: bad media'], ['sent', null]])
+  assert.deepEqual(attempted, ['A', 'the reply'], 'each message tried exactly once')
+})
+
+test('stuck "sending" rows are cleaned up every half minute, not on every pass', async () => {
+  const stuck = (id) => item({ id, status: 'sending', claimed_at: '2026-10-04T09:50:00.000Z' })
+  const { state, deps, advance } = setup([stuck('o1')])
+  await processChatAiOutbox(deps)
+  assert.equal(state.chat_ai_outbox[0].error, 'stale_sending_claim')
+  state.chat_ai_outbox.push(stuck('o2'))
+  await processChatAiOutbox(deps)
+  assert.equal(state.chat_ai_outbox[1].status, 'sending', 'not swept again within 30 seconds')
+  advance(31_000)
+  await processChatAiOutbox(deps)
+  assert.equal(state.chat_ai_outbox[1].error, 'stale_sending_claim')
 })
 
 test('chat AI sends never touch the follow-up queue or the follow-up antiban timers', async () => {
