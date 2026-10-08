@@ -17,7 +17,23 @@ export function createAssistantRouter({ store, notes, handleChat, skillsForBusin
   const tokenOf = (req) => (req.headers.authorization?.startsWith('Bearer ') ? req.headers.authorization.slice(7).trim() : null);
   const ctxFor = (req) => agent.makeCtx({ businessId: req.businessId, userId: req.userId, token: tokenOf(req) });
 
-  const fail = (res, error) => {
+  const logUnexpectedError = (message, error, metadata = {}) => {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    const details = {
+      ...metadata.details,
+      errorName: error instanceof Error ? error.name : typeof error,
+      ...(error instanceof Error && error.stack ? { stack: error.stack } : {}),
+    };
+    const entry = { ...metadata, details };
+    console.error(`[Ask HeySasa] ${message}: ${errorMessage}`, {
+      businessId: metadata.businessId ?? null,
+      durationMs: metadata.durationMs ?? null,
+      details,
+    });
+    log('error', `${message}: ${errorMessage}`, entry);
+  };
+
+  const fail = (res, error, metadata = {}) => {
     if (error instanceof ActionError) {
       const status = error.code === 'action_not_found' ? 404 : ['unknown_action', 'critical'].includes(error.code) ? 400 : 409;
       return res.status(status).json({ ok: false, error: error.code, message: error.message });
@@ -26,12 +42,13 @@ export function createAssistantRouter({ store, notes, handleChat, skillsForBusin
       const status = error.code === 'out_of_balance' ? 402 : error.code === 'busy' ? 409 : error.code === 'conversation_not_found' ? 404 : 400;
       return res.status(status).json({ ok: false, error: error.code, message: error.message });
     }
-    log('error', `assistant route failed: ${error.message}`);
+    logUnexpectedError('assistant route failed', error, metadata);
     return res.status(500).json({ ok: false, error: 'server_error', message: 'Something went wrong. Please try again.' });
   };
 
   // ── Chat (Server-Sent Events) ──────────────────────────────────────────────
   router.post('/chat', async (req, res) => {
+    const requestStartedAt = Date.now();
     const body = req.body ?? {};
     const check = limiter(req.businessId);
     if (!check.ok) return res.status(429).json({ ok: false, error: 'slow_down', message: 'You are going fast. Try again in a minute.', retry_after: check.retryAfterSec });
@@ -59,9 +76,19 @@ export function createAssistantRouter({ store, notes, handleChat, skillsForBusin
       if (!res.writableEnded) res.end();
     } catch (error) {
       clearInterval(heartbeat);
-      if (!started) return fail(res, error);
+      if (!started) return fail(res, error, {
+        event: 'assistant.chat_failed',
+        businessId: req.businessId,
+        durationMs: Date.now() - requestStartedAt,
+        details: { surface: body.surface ?? 'general' },
+      });
       const friendly = error instanceof UserFacingError ? error.message : 'Something went wrong. Please try again.';
-      if (!(error instanceof UserFacingError)) log('error', `assistant chat failed: ${error.message}`);
+      if (!(error instanceof UserFacingError)) logUnexpectedError('assistant chat failed', error, {
+        event: 'assistant.chat_failed',
+        businessId: req.businessId,
+        durationMs: Date.now() - requestStartedAt,
+        details: { surface: body.surface ?? 'general' },
+      });
       send({ type: 'error', message: friendly });
       return res.end();
     }

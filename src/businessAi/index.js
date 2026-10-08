@@ -1,5 +1,5 @@
 import { supabase } from '../config/supabase.js';
-import { debugLog } from '../services/debugConsole.js';
+import { logEvent } from '../services/debugConsole.js';
 import { createStore } from './store.js';
 import { createNotes } from './notes.js';
 import { createOrchestrator } from './orchestrator.js';
@@ -9,7 +9,15 @@ import { makeEmbedder, makeStreamingModel } from './openai.js';
 import { billEmbeddingUsage, billModelUsage, canAffordAssistant } from './billing.js';
 import { createAgent } from './agent/index.js';
 
-const log = (level, message) => debugLog(level === 'warn' ? 'warn' : level, 'Ask HeySasa', message);
+const log = (level, message, metadata = {}) => logEvent({
+  level: level === 'warn' ? 'warn' : level,
+  area: 'assistant',
+  event: metadata.event ?? 'assistant.activity',
+  message,
+  business_id: metadata.businessId ?? null,
+  duration_ms: metadata.durationMs ?? null,
+  details: metadata.details ?? {},
+});
 
 // Wires Ask HeySasa to the real database and OpenAI. app.use('/assistant', assistantRouter) in index.js.
 export function createAssistantRouterForApp() {

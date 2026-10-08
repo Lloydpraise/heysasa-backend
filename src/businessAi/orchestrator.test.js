@@ -9,13 +9,15 @@ function setup({ script, afford = true, storeOver = {} } = {}) {
   const notes = createNotes({ store, embed: fakeEmbed });
   const callModel = scriptedModel(script);
   const bills = [];
+  const logs = [];
   const handleChat = createOrchestrator({
     store, notes, embed: fakeEmbed, callModel, canAfford: async () => afford,
     billModel: async (b) => { bills.push(b); }, now: () => new Date('2026-10-06T09:30:00Z'),
+    log: (...args) => logs.push(args),
   });
   const events = [];
   const run = (input) => handleChat({ businessId: 'b1', userId: 'u1', surface: 'campaign_message', message: 'remind them about the pan', ...input }, (e) => events.push(e));
-  return { store, notes, callModel, bills, events, run };
+  return { store, notes, callModel, bills, events, logs, run };
 }
 
 const text = (body) => body.input.map((i) => (typeof i.content === 'string' ? i.content : '')).join('\n---\n');
@@ -42,6 +44,21 @@ test('customer-facing surface: persona + surface skills are loaded, reply stream
   assert.deepEqual(saved.map((m) => m.role), ['user', 'assistant']);
   assert.equal(saved[1].draft.type, 'text');
   assert.equal(t.store.db.conversations[0].message_count, 2);
+});
+
+test('chat lifecycle logs business-scoped metadata without logging chat content', async () => {
+  const t = setup({ script: [{ text: 'Here is a nudge.' }] });
+  await t.run({});
+
+  assert.equal(t.logs[0][0], 'info');
+  assert.equal(t.logs[0][2].event, 'assistant.chat_started');
+  assert.equal(t.logs[0][2].businessId, 'b1');
+  assert.equal(t.logs[0][2].details.surface, 'campaign_message');
+  assert.equal(t.logs[1][0], 'ok');
+  assert.equal(t.logs[1][2].event, 'assistant.chat_completed');
+  assert.equal(t.logs[1][2].businessId, 'b1');
+  assert.equal(t.logs[1][2].details.rounds, 1);
+  assert.doesNotMatch(JSON.stringify(t.logs), /remind them about the pan/);
 });
 
 test('owner-only surface: the persona pack is NOT loaded and the AI is told to stay plain', async () => {

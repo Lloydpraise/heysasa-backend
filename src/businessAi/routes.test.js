@@ -7,14 +7,14 @@ import { createNotes } from './notes.js';
 import { createRateLimiter } from './rateLimit.js';
 import { fakeEmbed, fakeStore, scriptedModel } from './fakes.js';
 
-async function boot({ script = [{ text: 'Hi.\n<draft>Hello {{first_name}}</draft>' }], afford = true, limiter } = {}) {
+async function boot({ script = [{ text: 'Hi.\n<draft>Hello {{first_name}}</draft>' }], afford = true, limiter, handleChatOverride, log = () => {} } = {}) {
   const store = fakeStore();
   const notes = createNotes({ store, embed: fakeEmbed });
-  const handleChat = createOrchestrator({ store, notes, embed: fakeEmbed, callModel: scriptedModel(script), canAfford: async () => afford, billModel: async () => {} });
+  const handleChat = handleChatOverride ?? createOrchestrator({ store, notes, embed: fakeEmbed, callModel: scriptedModel(script), canAfford: async () => afford, billModel: async () => {} });
   const auth = (req, res, next) => { req.businessId = req.headers['x-business-id'] || 'b1'; req.userId = 'u1'; next(); };
   const app = express();
   app.use(express.json());
-  app.use('/assistant', createAssistantRouter({ store, notes, handleChat, skillsForBusiness: store.loadSkills, auth, limiter }));
+  app.use('/assistant', createAssistantRouter({ store, notes, handleChat, skillsForBusiness: store.loadSkills, auth, limiter, log }));
   const server = await new Promise((r) => { const s = app.listen(0, () => r(s)); });
   const base = `http://127.0.0.1:${server.address().port}/assistant`;
   const call = (path, init = {}) => fetch(base + path, { ...init, headers: { 'Content-Type': 'application/json', ...(init.headers ?? {}) }, body: init.body ? JSON.stringify(init.body) : undefined });
@@ -41,6 +41,27 @@ test('an empty balance is a normal 402 before any stream starts', async () => {
   const res = await t.call('/chat', { method: 'POST', body: { surface: 'general', message: 'hi' } });
   assert.equal(res.status, 402);
   assert.equal((await res.json()).error, 'out_of_balance');
+  t.close();
+});
+
+test('unexpected streaming failures are logged with safe request context', async () => {
+  const logs = [];
+  const t = await boot({
+    handleChatOverride: async (_input, emit) => {
+      emit({ type: 'conversation', conversation_id: 'conversation-1' });
+      throw new Error('model provider unavailable');
+    },
+    log: (...args) => logs.push(args),
+  });
+  const res = await t.call('/chat', { method: 'POST', body: { surface: 'general', message: 'hi' } });
+  const ev = await events(res);
+  assert.equal(ev.at(-1).type, 'error');
+  assert.equal(ev.at(-1).message, 'Something went wrong. Please try again.');
+  const failure = logs.find(([level, , metadata]) => level === 'error' && metadata?.event === 'assistant.chat_failed');
+  assert.ok(failure);
+  assert.match(failure[1], /model provider unavailable/);
+  assert.equal(failure[2].details.errorName, 'Error');
+  assert.match(failure[2].details.stack, /model provider unavailable/);
   t.close();
 });
 

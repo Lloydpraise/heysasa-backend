@@ -13,6 +13,7 @@ Node module in `src/businessAi/`, mounted at `/assistant` in `src/index.js`. Fro
 - Persona pack is loaded only for customer-facing surfaces (`campaign_message`, `product_description`).
 - Memory: pinned notes (<=1500 chars, in every prompt) + vector recall (`recall_notes` tool, and once automatically on the first turn). Near-duplicate notes update instead of adding.
 - Billing: runner `business_assistant` (multiplier editable in /admin), billed after every model response and embedding.
+- Debugging: the protected live debug console has an `assistant` area. Filter by it to see chat started/completed/failed and assistant warnings/errors; entries include business ID and request metadata, not the chat text. Unexpected chat failures also print their stack to the backend process output (`pm2 logs`).
 - Tests: `node --test src/businessAi/*.test.js`.
 
 ## Not yet verified live

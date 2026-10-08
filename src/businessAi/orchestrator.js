@@ -39,6 +39,11 @@ export function createOrchestrator({ store, notes, embed, callModel, canAfford, 
     if (!(await canAfford(businessId))) {
       throw new UserFacingError('out_of_balance', 'Your balance is empty, so Ask HeySasa is paused. Top up to keep going.');
     }
+    log('info', 'Business assistant chat started', {
+      event: 'assistant.chat_started',
+      businessId,
+      details: { surface },
+    });
 
     // Conversation: resume the given one (it must belong to this business) or start a new one.
     let conversation = null;
@@ -168,6 +173,18 @@ export function createOrchestrator({ store, notes, embed, callModel, canAfford, 
 
       const done = { type: 'done', conversation_id: conversation.id, message_id: saved.id, reply, draft, action_ids: state.actionIds, ms: Date.now() - started };
       emit(done);
+      log('ok', 'Business assistant chat completed', {
+        event: 'assistant.chat_completed',
+        businessId,
+        durationMs: done.ms,
+        details: {
+          surface,
+          model,
+          rounds: result.rounds,
+          toolsUsed: result.toolsUsed,
+          conversationId: conversation.id,
+        },
+      });
       return done;
     } finally {
       inFlight.delete(lockKey);
