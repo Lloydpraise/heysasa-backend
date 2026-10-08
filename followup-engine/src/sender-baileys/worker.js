@@ -23,7 +23,7 @@ async function logSendEvent(businessId, { queueId = null, contactId = null, inst
   if (error) log('error', 'sender', 'sender.log_event_failed', `Failed to log send event: ${error.message}`, { business_id: businessId, details: { error: error.message } })
 }
 
-async function recoverStaleClaims() {
+export async function recoverStaleClaims() {
   const cutoff = new Date(Date.now() - STALE_CLAIM_MS).toISOString()
   const { data, error } = await supabase
     .from('follow_up_queue')
@@ -45,8 +45,6 @@ async function recoverStaleClaims() {
 }
 
 export async function processBaileysBatch() {
-  await recoverStaleClaims()
-
   const { data: items, error } = await supabase
     .from('follow_up_queue')
     .select('*')
@@ -58,11 +56,12 @@ export async function processBaileysBatch() {
 
   if (error) {
     log('error', 'sender', 'sender.fetch_batch_failed', `Failed to fetch batch: ${error.message}`, { details: { error: error.message } })
-    return { dispatched: 0 }
+    return { dispatched: 0, retryNeeded: true }
   }
-  if (!items?.length) return { dispatched: 0 }
+  if (!items?.length) return { dispatched: 0, retryNeeded: false }
 
   let dispatched = 0
+  let retryNeeded = false
 
   for (const item of items) {
     try {
@@ -119,12 +118,12 @@ export async function processBaileysBatch() {
 
       if (sessionError) {
         await logSendEvent(item.business_id, { queueId: item.id, contactId: item.contact_id, eventType: 'session_lookup_failed', reason: sessionError.message })
+        retryNeeded = true
         continue
       }
       const activeSession = session?.[0] ?? null
       if (!activeSession?.instance_name) {
-        // No connected session row at all right now — leave it
-        // ready_to_send and pick it back up next poll, no event logged.
+        // Connection-update events wake the sender if the number reconnects.
         continue
       }
 
@@ -132,13 +131,14 @@ export async function processBaileysBatch() {
       // again next poll cycle. Don't count this as a failed attempt.
       await primeAntiban(supabase, item.business_id)
       const gate = checkAntiban(item.business_id, business.followup_daily_cap)
-      if (!gate.allowed) continue
+      if (!gate.allowed) { retryNeeded = true; continue }
 
       // Slow start for new numbers: only during a business's first week is the
       // daily total held lower. After that this check does nothing.
       const warm = await effectiveDailyCap(supabase, item.business_id, business.followup_daily_cap)
       if (warm.warmupActive && (await sentTodayCount(supabase, item.business_id)) >= warm.cap) {
         logWarmupHold(item.business_id, warm.day, warm.cap)
+        retryNeeded = true
         continue
       }
 
@@ -156,7 +156,7 @@ export async function processBaileysBatch() {
         : (await needsNumberLookup(supabase, item))
           ? await ensureNumberOnWhatsApp(supabase, { instanceName: activeSession.instance_name, contact, businessId: item.business_id })
           : (contact.wa_exists === false ? { status: 'not_on_whatsapp' } : { status: 'ok' })
-      if (numberCheck.status === 'wait') continue
+      if (numberCheck.status === 'wait') { retryNeeded = true; continue }
       if (numberCheck.status === 'not_on_whatsapp') {
         await supabase.from('follow_up_queue').update({
           status: 'skipped', skip_reason: 'number_not_on_whatsapp', failure_class: 'not_on_whatsapp', processed_at: new Date().toISOString()
@@ -237,5 +237,5 @@ export async function processBaileysBatch() {
   if (dispatched) {
     log('info', 'sender', 'sender.batch_done', `Dispatched ${dispatched}/${items.length}`, { details: { dispatched, total: items.length } })
   }
-  return { dispatched }
+  return { dispatched, retryNeeded }
 }

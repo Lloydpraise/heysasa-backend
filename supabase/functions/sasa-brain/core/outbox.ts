@@ -8,7 +8,7 @@
 import type { SendItem, SendResult } from './builtin.ts';
 
 export type OutboxTarget = { businessId: string; conversationId: string; contactId: number };
-export type OutboxOptions = { sleep: (ms: number) => Promise<void>; timeoutMs?: number; pollMs?: number; now?: () => number };
+export type OutboxOptions = { timeoutMs?: number };
 export type Queued = { ids: string[]; idBySeq: Map<number, string>; count: number };
 
 export async function enqueue(
@@ -27,43 +27,89 @@ export async function enqueue(
 
 export async function waitForDelivery(
   // deno-lint-ignore no-explicit-any
-  db: any, queued: Queued, opts: OutboxOptions,
+  db: any, queued: Queued,   opts: OutboxOptions = {},
 ): Promise<SendResult> {
   const timeoutMs = opts.timeoutMs ?? 45_000;
-  const pollMs = opts.pollMs ?? 400;
-  const now = opts.now ?? Date.now;
   const { ids, idBySeq, count } = queued;
 
-  const deadline = now() + timeoutMs;
-  // deno-lint-ignore no-explicit-any
-  let latest: any[] = [];
-  for (;;) {
-    const { data, error: readError } = await db.from('chat_ai_outbox').select('id, status, error, whatsapp_message_id').in('id', ids);
-    if (!readError && data) latest = data;
-    const open = latest.length < ids.length || latest.some((r) => r.status === 'queued' || r.status === 'sending');
-    if (!open) break;
-    if (now() >= deadline) {
-      // Cancel anything the sender has not started, so it cannot go out late, after the AI has moved on.
-      await db.from('chat_ai_outbox').update({ status: 'failed', error: 'timed_out_waiting_for_sender' }).in('id', ids).eq('status', 'queued');
-      const { data } = await db.from('chat_ai_outbox').select('id, status, error, whatsapp_message_id').in('id', ids);
-      if (data) latest = data;
-      break;
-    }
-    await opts.sleep(pollMs);
-  }
+  return new Promise((resolve, reject) => {
+    // deno-lint-ignore no-explicit-any
+    let latest: any[] = [];
+    let settled = false;
+    let refreshing = false;
+    let refreshAgain = false;
+    let timeout: ReturnType<typeof setTimeout>;
+    // deno-lint-ignore no-explicit-any
+    let channel: any;
 
-  const byId = new Map(latest.map((r) => [r.id, r]));
-  const results = Array.from({ length: count }, (_, seq) => {
-    const row = byId.get(idBySeq.get(seq) ?? '');
-    if (row?.status === 'sent') return { ok: true, messageId: row.whatsapp_message_id ?? null };
-    return { ok: false, error: row?.error || (row?.status === 'sending' ? 'still sending when the wait ended' : 'not sent') };
+    const cleanup = () => {
+      clearTimeout(timeout);
+      void db.removeChannel(channel);
+    };
+    const fail = (error: unknown) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(error);
+    };
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      const byId = new Map(latest.map((r) => [r.id, r]));
+      const results = Array.from({ length: count }, (_, seq) => {
+        const row = byId.get(idBySeq.get(seq) ?? '');
+        if (row?.status === 'sent') return { ok: true, messageId: row.whatsapp_message_id ?? null };
+        return { ok: false, error: row?.error || (row?.status === 'sending' ? 'still sending when the wait ended' : 'not sent') };
+      });
+      resolve({ ok: results.every((r) => r.ok), results, error: results.find((r) => !r.ok)?.error });
+    };
+    const refresh = () => {
+      if (settled) return;
+      if (refreshing) { refreshAgain = true; return; }
+      refreshing = true;
+      void (async () => {
+        do {
+          refreshAgain = false;
+          const { data, error } = await db.from('chat_ai_outbox')
+            .select('id, status, error, whatsapp_message_id').in('id', ids);
+          if (error) throw error;
+          latest = data ?? [];
+          const open = latest.length < ids.length || latest.some((r) => r.status === 'queued' || r.status === 'sending');
+          if (!open) { finish(); return; }
+        } while (refreshAgain && !settled);
+      })().catch(fail).finally(() => {
+        refreshing = false;
+        if (refreshAgain && !settled) refresh();
+      });
+    };
+
+    channel = db.channel(`chat-ai-delivery-${crypto.randomUUID()}`)
+      .on('postgres_changes', {
+        event: 'UPDATE', schema: 'public', table: 'chat_ai_outbox', filter: `id=in.(${ids.join(',')})`,
+      }, refresh);
+    timeout = setTimeout(() => {
+      void (async () => {
+        // Do not let a queued message be sent after the AI has already moved on.
+        const { error } = await db.from('chat_ai_outbox').update({ status: 'failed', error: 'timed_out_waiting_for_sender' })
+          .in('id', ids).eq('status', 'queued');
+        if (error) throw error;
+        refresh();
+      })().catch(fail);
+    }, timeoutMs);
+
+    channel.subscribe((status: string) => {
+      if (status === 'SUBSCRIBED') refresh();
+      else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
+        fail(new Error(`Chat AI delivery notifications unavailable: ${status}`));
+      }
+    });
   });
-  return { ok: results.every((r) => r.ok), results, error: results.find((r) => !r.ok)?.error };
 }
 
 export async function enqueueAndWait(
   // deno-lint-ignore no-explicit-any
-  db: any, target: OutboxTarget, items: SendItem[], opts: OutboxOptions,
+  db: any, target: OutboxTarget, items: SendItem[], opts: OutboxOptions = {},
 ): Promise<SendResult> {
   if (!items.length) return { ok: true, results: [] };
   const queued = await enqueue(db, target, items);

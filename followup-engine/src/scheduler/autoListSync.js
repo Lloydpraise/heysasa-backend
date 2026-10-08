@@ -5,13 +5,8 @@ import { log } from '../lib/log.js'
 // output (v_lead_summary-equivalent signals: intent, price_objection,
 // last_inbound_at, cart_state, conversions, payment_confirmed_at, etc.)
 // and reconciles public.list_members to match each enabled rule, for
-// every business at once. A pg_cron job runs it every 10 minutes as a
-// safety net so lists never go fully stale even if this process is down.
-//
-// This loop rides the same 60s cadence as StageClassifier (which is what
-// most rules react to — a stage change is often exactly what moves a
-// lead from one auto-list to another) so that a rule's list reflects the
-// stage the lead is now in within a minute, not up to 10.
+// every business at once. The event-driven scheduler invokes it after
+// inbound messages, conversation changes and list membership changes.
 //
 // No AI calls, no billing — this is pure reconciliation against data the
 // analyser and message triggers already produced.

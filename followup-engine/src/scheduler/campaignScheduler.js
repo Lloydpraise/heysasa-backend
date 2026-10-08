@@ -4,8 +4,6 @@ import { isBusinessAwake } from '../lib/timing.js'
 import { log } from '../lib/log.js'
 
 const BATCH_SIZE = 30
-const CAMPAIGN_SEED_INTERVAL_MS = parseInt(process.env.CAMPAIGN_SEED_INTERVAL_MS ?? `${5 * 60_000}`)
-let lastCampaignSeedAt = 0
 
 async function pauseCampaign(supabase, campaignId, reason) {
   await supabase.from('campaigns')
@@ -179,7 +177,7 @@ async function seedCampaignEnrollments(supabase) {
 // also means campaign sends currently go through worker.js's zone-based
 // approval routing same as AI-drafted follow-ups — flag if campaigns
 // should instead always auto-send regardless of zone.
-export async function runCampaignScheduler(supabase) {
+export async function runCampaignScheduler(supabase, { seed = true } = {}) {
   const now = new Date().toISOString()
 
   // followup_ai_enabled is now an active blocker for campaigns: off
@@ -187,12 +185,8 @@ export async function runCampaignScheduler(supabase) {
   // right back up, since nothing marked them permanently dead).
   await syncCampaignsWithFollowupToggle(supabase)
 
-  let seeded = 0
-  if (Date.now() - lastCampaignSeedAt >= CAMPAIGN_SEED_INTERVAL_MS) {
-    seeded = await seedCampaignEnrollments(supabase)
-    lastCampaignSeedAt = Date.now()
-    if (seeded) log('info', 'engine', 'campaign_scheduler.seeded', `Seeded ${seeded} campaign enrollments`, { details: { seeded } })
-  }
+  const seeded = seed ? await seedCampaignEnrollments(supabase) : 0
+  if (seeded) log('info', 'engine', 'campaign_scheduler.seeded', `Seeded ${seeded} campaign enrollments`, { details: { seeded } })
 
   const { data: due, error } = await supabase
     .from('campaign_enrollments')

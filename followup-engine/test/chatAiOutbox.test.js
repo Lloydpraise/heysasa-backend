@@ -136,7 +136,7 @@ test('a photo that fails does not stop the rest of its chat, and is not retried'
   assert.deepEqual(attempted, ['A', 'the reply'], 'each message tried exactly once')
 })
 
-test('stuck "sending" rows are cleaned up every half minute, not on every pass', async () => {
+test('stuck "sending" rows are cleaned up at most once per 30 seconds of sender activity', async () => {
   const stuck = (id) => item({ id, status: 'sending', claimed_at: '2026-10-04T09:50:00.000Z' })
   const { state, deps, advance } = setup([stuck('o1')])
   await processChatAiOutbox(deps)

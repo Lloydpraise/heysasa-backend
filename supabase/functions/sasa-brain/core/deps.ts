@@ -64,7 +64,7 @@ export function buildDeps(rt: RuntimeDeps, request: TurnInput): TurnDeps {
       return { ok: true, results: items.map(() => ({ ok: true, messageId: null })) };
     }
     if (!input.conversation_id || !input.contact_id) return { ok: false, error: 'missing conversation or contact' };
-    return enqueueAndWait(rt.db, { businessId: input.business_id, conversationId: input.conversation_id, contactId: input.contact_id }, items, { sleep: rt.sleep });
+    return enqueueAndWait(rt.db, { businessId: input.business_id, conversationId: input.conversation_id, contactId: input.contact_id }, items);
   };
 
   // Same as `send`, but returns as soon as the messages are saved for the sender. `settled` finishes when the sender has.
@@ -75,7 +75,7 @@ export function buildDeps(rt: RuntimeDeps, request: TurnInput): TurnDeps {
     if (!input.conversation_id || !input.contact_id) return failed('missing conversation or contact');
     const queued = await enqueue(rt.db, { businessId: input.business_id, conversationId: input.conversation_id, contactId: input.contact_id }, items);
     if (!queued.ok) return failed(queued.error);
-    const settled = waitForDelivery(rt.db, queued.queued, { sleep: rt.sleep });
+    const settled = waitForDelivery(rt.db, queued.queued);
     settled.catch(() => {});   // the turn reads the outcome later; this only stops an early failure being reported as unhandled
     return { ok: true, settled };
   };

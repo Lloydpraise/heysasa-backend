@@ -6,24 +6,25 @@ const FIVE_DAYS_MS = 5 * 24 * 60 * 60_000
 const BATCH_SIZE = 500
 const CLOSED_STATES = new Set(['won', 'lost', 'do_not_contact'])
 
-export async function runLeadTemperatureReview(supabase) {
+export async function runLeadTemperatureReview(supabase, onlyContactId = null) {
   const now = Date.now()
   const warmCutoff = new Date(now - THREE_DAYS_MS).toISOString()
   const coldCutoff = new Date(now - FIVE_DAYS_MS).toISOString()
-  const [warmResult, coldResult] = await Promise.all([
-    supabase.from('contacts')
+  let warmQuery = supabase.from('contacts')
       .select('id, business_id, lead_state, lead_quality, last_seen')
       .eq('lead_type', 'business')
       .gte('last_seen', warmCutoff)
       .or('lead_quality.is.null,lead_quality.neq.warm')
-      .limit(BATCH_SIZE),
-    supabase.from('contacts')
+  let coldQuery = supabase.from('contacts')
       .select('id, business_id, lead_state, lead_quality, last_seen')
       .eq('lead_type', 'business')
       .lte('last_seen', coldCutoff)
       .or('lead_quality.is.null,lead_quality.neq.cold')
-      .limit(BATCH_SIZE),
-  ])
+  if (onlyContactId) {
+    warmQuery = warmQuery.eq('id', onlyContactId)
+    coldQuery = coldQuery.eq('id', onlyContactId)
+  }
+  const [warmResult, coldResult] = await Promise.all([warmQuery.limit(BATCH_SIZE), coldQuery.limit(BATCH_SIZE)])
 
   if (warmResult.error || coldResult.error) {
     throw new Error(`Lead temperature lookup failed: ${(warmResult.error || coldResult.error).message}`)

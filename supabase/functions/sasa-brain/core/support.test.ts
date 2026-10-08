@@ -7,10 +7,16 @@ import { builtinHandlers, runRegistryTool, settlePending, type TurnState } from 
 import type { ToolRow } from './tools.ts';
 
 // ── a tiny in-memory outbox table ──
-function outboxDb(onPoll: (rows: any[], poll: number) => void) {
+function outboxDb(onSubscribe: (rows: any[], emit: () => void) => void) {
   const rows: any[] = [];
-  let polls = 0;
+  let onChange = () => {};
+  const channel = {
+    on: (_event: string, _filter: unknown, callback: () => void) => { onChange = callback; return channel; },
+    subscribe: (callback: (status: string) => void) => { queueMicrotask(() => { callback('SUBSCRIBED'); onSubscribe(rows, onChange); }); return channel; },
+  };
   const db = {
+    channel: () => channel,
+    removeChannel: async () => 'ok',
     from: (table: string) => {
       assert.equal(table, 'chat_ai_outbox');
       return {
@@ -21,7 +27,7 @@ function outboxDb(onPoll: (rows: any[], poll: number) => void) {
             return { data: made.map((r) => ({ id: r.id, seq: r.seq })), error: null };
           },
         }),
-        select: () => ({ in: async (_c: string, ids: string[]) => { polls++; onPoll(rows, polls); return { data: rows.filter((r) => ids.includes(r.id)).map((r) => ({ ...r })), error: null }; } }),
+        select: () => ({ in: async (_c: string, ids: string[]) => ({ data: rows.filter((r) => ids.includes(r.id)).map((r) => ({ ...r })), error: null }) }),
         update: (patch: any) => ({ in: (_c: string, ids: string[]) => ({ eq: async (_s: string, status: string) => { rows.filter((r) => ids.includes(r.id) && r.status === status).forEach((r) => Object.assign(r, patch)); return { error: null }; } }) }),
       };
     },
@@ -31,11 +37,15 @@ function outboxDb(onPoll: (rows: any[], poll: number) => void) {
 const target = { businessId: 'b1', conversationId: 'c1', contactId: 7 };
 
 test('the outbox waits until every message is sent and reports each result in order', async () => {
-  const { db, rows } = outboxDb((r, poll) => {
-    if (poll === 2) { r[0].status = 'sent'; r[0].whatsapp_message_id = 'W1'; }
-    if (poll === 3) { r[1].status = 'sent'; r[1].whatsapp_message_id = 'W2'; }
+  const { db, rows } = outboxDb((r, emit) => {
+    queueMicrotask(() => {
+      r[0].status = 'sent'; r[0].whatsapp_message_id = 'W1';
+      emit();
+      r[1].status = 'sent'; r[1].whatsapp_message_id = 'W2';
+      emit();
+    });
   });
-  const result = await enqueueAndWait(db, target, [{ media: { type: 'image', url: 'https://x/a.jpg', caption: 'A\nKES 100' } }, { text: 'hello' }], { sleep: async () => {} });
+  const result = await enqueueAndWait(db, target, [{ media: { type: 'image', url: 'https://x/a.jpg', caption: 'A\nKES 100' } }, { text: 'hello' }]);
   assert.equal(result.ok, true);
   assert.deepEqual(result.results, [{ ok: true, messageId: 'W1' }, { ok: true, messageId: 'W2' }]);
   assert.deepEqual(rows.map((r) => [r.kind, r.seq]), [['image', 0], ['text', 1]]);
@@ -43,27 +53,31 @@ test('the outbox waits until every message is sent and reports each result in or
 });
 
 test('a message the sender rejects comes back as failed with the reason', async () => {
-  const { db } = outboxDb((r) => { r[0].status = 'failed'; r[0].error = 'no_send_target'; });
-  const result = await enqueueAndWait(db, target, [{ text: 'hi' }], { sleep: async () => {} });
+  const { db } = outboxDb((r, emit) => { r[0].status = 'failed'; r[0].error = 'no_send_target'; emit(); });
+  const result = await enqueueAndWait(db, target, [{ text: 'hi' }]);
   assert.deepEqual([result.ok, result.results?.[0]?.error], [false, 'no_send_target']);
 });
 
 test('if the sender never picks a message up, it is cancelled so it cannot go out late', async () => {
   const { db, rows } = outboxDb(() => {});
-  let clock = 0;
-  const result = await enqueueAndWait(db, target, [{ text: 'hi' }], { sleep: async () => { clock += 1000; }, timeoutMs: 3000, now: () => clock });
+  const result = await enqueueAndWait(db, target, [{ text: 'hi' }], { timeoutMs: 10 });
   assert.equal(result.ok, false);
   assert.equal(rows[0].status, 'failed');
   assert.equal(rows[0].error, 'timed_out_waiting_for_sender');
 });
 
 test('queueing returns at once; the wait for delivery can be done later and reports each result', async () => {
-  const { db, rows } = outboxDb((r, poll) => { if (poll === 2) r.forEach((x, i) => { x.status = 'sent'; x.whatsapp_message_id = `W${i}`; }); });
+  const { db, rows } = outboxDb((r, emit) => {
+    queueMicrotask(() => {
+      r.forEach((x, i) => { x.status = 'sent'; x.whatsapp_message_id = `W${i}`; });
+      emit();
+    });
+  });
   const queued = await enqueue(db, target, [{ text: 'a' }, { text: 'b' }]);
   assert.equal(queued.ok, true);
   assert.equal(rows.length, 2, 'rows are saved for the sender');
   assert.equal(rows.every((r) => r.status === 'queued'), true, 'nothing has waited for the sender yet');
-  const result = await waitForDelivery(db, (queued as { ok: true; queued: any }).queued, { sleep: async () => {} });
+  const result = await waitForDelivery(db, (queued as { ok: true; queued: any }).queued);
   assert.deepEqual(result.results, [{ ok: true, messageId: 'W0' }, { ok: true, messageId: 'W1' }]);
 });
 

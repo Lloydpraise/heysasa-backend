@@ -21,7 +21,7 @@ import { sendContentViaEvolution } from './evolutionSender.js'
 import { log } from '../lib/log.js'
 import {
   CHAT_AI_MIN_GAP_MS, CHAT_AI_GAP_JITTER_MS, CHAT_AI_SAME_CHAT_GAP_MS, CHAT_AI_SAME_CHAT_JITTER_MS,
-  CHAT_AI_MAX_INLINE_WAIT_MS, CHAT_AI_HOURLY_CEILING, CHAT_AI_STALE_CLAIM_MS, CHAT_AI_STALE_SWEEP_MS,
+  CHAT_AI_HOURLY_CEILING, CHAT_AI_STALE_CLAIM_MS, CHAT_AI_STALE_SWEEP_MS,
 } from '../config.js'
 
 const BATCH = 30
@@ -49,7 +49,7 @@ async function sentInLastHour(s, businessId, now) {
     .select('id', { count: 'exact', head: true })
     .eq('business_id', businessId).eq('status', 'sent')
     .gte('sent_at', new Date(now - HOUR_MS).toISOString())
-  if (error) return hit?.count ?? 0
+  if (error) throw error
   hourCache.set(businessId, { count: count ?? 0, at: now })
   return count ?? 0
 }
@@ -68,16 +68,17 @@ export async function processChatAiOutbox(deps = {}) {
   const clock = deps.now ?? Date.now
   const rand = deps.rand ?? Math.random
   const sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)))
-  const result = { sent: 0, failed: 0, held: 0 }
+  const result = { sent: 0, failed: 0 }
 
   // A message stuck in "sending" (the process died mid-send) is failed, not re-sent: we cannot know whether the
-  // customer got it, and the AI has stopped waiting. Checked every half minute, not on every pass.
+  // customer got it, and the AI has stopped waiting. The sweep runs only on startup/reconnect or an outbox insert.
   if (clock() - lastSweepAt >= CHAT_AI_STALE_SWEEP_MS) {
     lastSweepAt = clock()
-    await s.from('chat_ai_outbox')
+    const { error: sweepError } = await s.from('chat_ai_outbox')
       .update({ status: 'failed', error: 'stale_sending_claim' })
       .eq('status', 'sending')
       .lte('claimed_at', new Date(clock() - CHAT_AI_STALE_CLAIM_MS).toISOString())
+    if (sweepError) throw sweepError
   }
 
   const { data: queued, error } = await s.from('chat_ai_outbox')
@@ -85,7 +86,7 @@ export async function processChatAiOutbox(deps = {}) {
     .order('created_at', { ascending: true }).order('seq', { ascending: true }).limit(BATCH)
   if (error) {
     log('error', 'sender', 'chat_ai.fetch_failed', `Could not read the chat AI outbox: ${error.message}`, { details: { error: error.message } })
-    return result
+    throw error
   }
 
   const fail = async (item, reason, extra = {}) => {
@@ -95,11 +96,7 @@ export async function processChatAiOutbox(deps = {}) {
   }
 
   async function runLane(items) {
-    // A chat's messages always go out in order: if one has to wait, the rest of that chat waits behind it.
-    const waiting = new Set()
-
     for (const item of items) {
-      if (waiting.has(item.conversation_id)) continue
       try {
         // Pacing for this business's chat AI lane.
         const last = lastSent.get(item.business_id)
@@ -109,7 +106,6 @@ export async function processChatAiOutbox(deps = {}) {
             ? CHAT_AI_SAME_CHAT_GAP_MS + Math.floor(rand() * CHAT_AI_SAME_CHAT_JITTER_MS)
             : CHAT_AI_MIN_GAP_MS + Math.floor(rand() * CHAT_AI_GAP_JITTER_MS)
           const wait = gap - (clock() - last.at)
-          if (wait > CHAT_AI_MAX_INLINE_WAIT_MS) { result.held++; waiting.add(item.conversation_id); continue }
           if (wait > 0) await sleep(wait)
         }
         const now = clock()

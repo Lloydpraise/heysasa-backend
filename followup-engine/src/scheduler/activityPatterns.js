@@ -2,14 +2,16 @@ import { DEFAULT_TIMEZONE } from '../config.js'
 import { getZonedParts } from '../lib/timing.js'
 import { log } from '../lib/log.js'
 
-export async function runActivityPatterns(supabase) {
+export async function runActivityPatterns(supabase, onlyContactId = null) {
   const cutoff = new Date(Date.now() - 3_600_000).toISOString()
 
-  const { data: recent } = await supabase
+  let recentQuery = supabase
     .from('messages')
     .select('contact_id, business_id')
     .eq('direction', 'in')
     .gte('created_at', cutoff)
+  if (onlyContactId) recentQuery = recentQuery.eq('contact_id', onlyContactId)
+  const { data: recent } = await recentQuery
 
   if (!recent?.length) return { updated: 0 }
 
