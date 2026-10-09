@@ -10,6 +10,9 @@ import { log } from '../lib/log.js'
 
 const RETRY_MS = 60_000
 const QUIET_MS = 150
+// Customer profile + auto-list syncs are heavy Postgres functions (sync_auto_lists averages ~3s).
+// Debounce them hard so a burst of inbound messages triggers one run, not hundreds.
+const HEAVY_QUIET_MS = 30_000
 const LEAD_COLD_MS = 5 * 24 * 60 * 60_000
 const STAGE_RETRY_MS = 3 * 60 * 60_000
 const timers = new Map()
@@ -24,6 +27,19 @@ async function runCustomerProfileSync(sb) {
   return { profilesChanged: data?.profiles_changed ?? 0 }
 }
 
+// A timer callback must never be able to take the whole engine down: an uncaught throw inside
+// setTimeout kills the process, and the parent respawns it every 5s (a crash loop that hammers the DB).
+function safely(key, callback) {
+  try {
+    const result = callback()
+    if (result && typeof result.catch === 'function') {
+      result.catch((e) => log('error', 'engine', 'engine.timer_failed', `${key} timer failed: ${e?.message ?? e}`))
+    }
+  } catch (e) {
+    log('error', 'engine', 'engine.timer_failed', `${key} timer failed: ${e?.message ?? e}`)
+  }
+}
+
 function scheduleAt(key, at, callback, replace = false) {
   if (!Number.isFinite(at)) return
   const old = timers.get(key)
@@ -31,7 +47,7 @@ function scheduleAt(key, at, callback, replace = false) {
   if (old) clearTimeout(old.timer)
   const timer = setTimeout(() => {
     timers.delete(key)
-    callback()
+    safely(key, callback)
   }, Math.max(0, at - Date.now()))
   timers.set(key, { at, timer })
 }
@@ -41,7 +57,7 @@ function afterQuiet(key, callback, delay = QUIET_MS) {
   if (old) clearTimeout(old.timer)
   const timer = setTimeout(() => {
     timers.delete(key)
-    callback()
+    safely(key, callback)
   }, delay)
   timers.set(key, { at: Date.now() + delay, timer })
 }
@@ -217,7 +233,7 @@ function subscribe() {
   watch('campaign_steps', () => void invoke('CampaignScheduler', runCampaignScheduler, [{ seed: true }]))
   watch('list_members', () => {
     void invoke('CampaignScheduler', runCampaignScheduler, [{ seed: true }])
-    void invoke('AutoListSync', runAutoListSync)
+    afterQuiet('AutoListSync', () => void invoke('AutoListSync', runAutoListSync), HEAVY_QUIET_MS)
   })
   watch('businesses', () => void invoke('CampaignScheduler', runCampaignScheduler, [{ seed: false }]))
   watch('whatsapp_sessions', () => void invoke('CampaignScheduler', runCampaignScheduler, [{ seed: false }]))
@@ -226,13 +242,13 @@ function subscribe() {
       afterQuiet('LeadTemperatureReview', () => void invoke('LeadTemperatureReview', runLeadTemperatureReview))
       void invoke('CampaignScheduler', runCampaignScheduler, [{ seed: false }])
     }
-    afterQuiet('CustomerProfiles', runCustomerProfileSync)
-    afterQuiet('AutoListSync', runAutoListSync)
+    afterQuiet('CustomerProfiles', () => void invoke('CustomerProfiles', runCustomerProfileSync), HEAVY_QUIET_MS)
+    afterQuiet('AutoListSync', () => void invoke('AutoListSync', runAutoListSync), HEAVY_QUIET_MS)
   })
   watch('conversations', (payload) => {
     onStageRequest(payload)
-    void invoke('AutoListSync', runAutoListSync)
-    afterQuiet('CustomerProfiles', runCustomerProfileSync)
+    afterQuiet('AutoListSync', () => void invoke('AutoListSync', runAutoListSync), HEAVY_QUIET_MS)
+    afterQuiet('CustomerProfiles', () => void invoke('CustomerProfiles', runCustomerProfileSync), HEAVY_QUIET_MS)
   })
   watch('messages', (payload) => {
     if (payload.eventType !== 'INSERT' || payload.new?.direction !== 'in') return
@@ -241,8 +257,8 @@ function subscribe() {
       void invoke(`ActivityPatterns:${row.contact_id}`, runActivityPatterns, [row.contact_id])
     })
     afterQuiet('LeadTemperatureReview', () => void invoke('LeadTemperatureReview', runLeadTemperatureReview))
-    afterQuiet('CustomerProfiles', runCustomerProfileSync)
-    afterQuiet('AutoListSync', runAutoListSync)
+    afterQuiet('CustomerProfiles', () => void invoke('CustomerProfiles', runCustomerProfileSync), HEAVY_QUIET_MS)
+    afterQuiet('AutoListSync', () => void invoke('AutoListSync', runAutoListSync), HEAVY_QUIET_MS)
   })
   channel.subscribe((status, error) => {
     if (status === 'SUBSCRIBED') {

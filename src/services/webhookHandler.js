@@ -19,13 +19,9 @@ import {
     recordCampaignStepReaction,
     requestStageReview
 } from './dbService.js';
-import { debugLog, logEvent } from './debugConsole.js';
-import { describeConnectionUpdate, summariseClose } from './connectionDiagnostics.js';
-import { decideSettle, normaliseEvolutionState, readConfirmedState, webhookStateOf } from './connectionSettle.js';
-import { deleteSessionRecord, getEvolutionConnectionState } from './evolutionConnections.js';
+import { debugLog } from './debugConsole.js';
+import { deleteSessionRecord } from './evolutionConnections.js';
 import { scheduleDisconnectNotice } from './disconnectNotice.js';
-import { pauseCampaignsForDisconnectedInstance } from './disconnectCampaigns.js';
-import { triggerChatAi } from '../chatAi/index.js';
 
 async function notifyFollowupEngineActivity(contactId, conversationId, campaignStepEventId, inbound) {
     const token = process.env.DEBUG_TOKEN;
@@ -50,24 +46,9 @@ async function notifyFollowupEngineActivity(contactId, conversationId, campaignS
     }
 }
 
-// instance -> business never changes in practice, and for sessions whose
-// businesses.evolution_instance_id is empty (e.g. lashesbyshazz) every webhook paid for
-// two Supabase round trips, which were 4-5s during the Oct 6 reconnect. Positive
-// results only, so an unknown instance still errors every time.
-const BUSINESS_CACHE_TTL_MS = 5 * 60_000;
-const businessIdCache = new Map();
-
 export async function resolveBusinessId(payload) {
     const instanceName = payload?.instance || payload?.data?.instance;
     if (!instanceName) throw new Error('evolution_instance_missing');
-    const cached = businessIdCache.get(instanceName);
-    if (cached && cached.expires > Date.now()) return cached.businessId;
-    const businessId = await lookupBusinessId(instanceName);
-    businessIdCache.set(instanceName, { businessId, expires: Date.now() + BUSINESS_CACHE_TTL_MS });
-    return businessId;
-}
-
-async function lookupBusinessId(instanceName) {
 
     const { data: business, error: businessError } = await supabase
         .from('businesses')
@@ -86,191 +67,65 @@ async function lookupBusinessId(instanceName) {
     throw new Error(`unknown_evolution_instance:${instanceName}`);
 }
 
-// One connection.update at a time per instance, so settling one webhook (which
-// reads Evolution and then writes the row) never interleaves with the next.
-const instanceLocks = new Map();
-export async function withInstanceLock(instanceName, fn) {
-    const previous = instanceLocks.get(instanceName) || Promise.resolve();
-    const run = previous.catch(() => {}).then(fn);
-    const tail = run.catch(() => {});
-    instanceLocks.set(instanceName, tail);
-    try { return await run; } finally { if (instanceLocks.get(instanceName) === tail) instanceLocks.delete(instanceName); }
-}
-
-const EVOLUTION_READ_TIMEOUT_MS = 8000;
-const CLOSE_CONFIRM_DELAY_MS = Number(process.env.CLOSE_CONFIRM_DELAY_MS || 4000);
-
-// What Evolution itself says right now: 'open' | 'connecting' | 'close' | 'missing'
-// (instance does not exist there) | null (could not be reached, so nothing is confirmed).
-export async function readEvolutionState(instanceName) {
-    let timer;
-    try {
-        const timeout = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('evolution_timeout')), EVOLUTION_READ_TIMEOUT_MS); });
-        const payload = await Promise.race([getEvolutionConnectionState(instanceName), timeout]);
-        return normaliseEvolutionState(payload);
-    } catch (error) {
-        return error?.status === 404 ? 'missing' : null;
-    } finally {
-        clearTimeout(timer);
-    }
-}
-
-// Runs only after Evolution has confirmed the number is disconnected: logs it, pauses
-// campaigns, deletes the session row and tells the owner.
-export async function handleConfirmedDisconnect({ info, businessId, instanceName }) {
-    // Logged FIRST, before any database call, so the reason is kept even if
-    // the session lookup or delete below fails (e.g. a DNS blip to Supabase).
-    // 'warn' rows are kept 45 days and show in the admin persisted logs.
-    const disconnectLog = logEvent({
-        level: 'warn',
-        area: 'connection',
-        event: 'connection.disconnected',
-        message: `${summariseClose(info)} (confirmed by Evolution)`,
-        business_id: businessId,
-        entity_id: instanceName || null,
-        details: {
-            instance: instanceName,
-            state: info.state,
-            status_code: info.statusCode,
-            meaning: info.meaning,
-            reason_text: info.reasonText,
-            payload: info.raw,
-        },
-    });
-    try {
-        // Only a number that was actually connected counts as "dropped" (not a QR that timed out).
-        const { data: existingSessions, error: sessionError } = await supabase.from('whatsapp_sessions').select('id, status')
-            .eq('business_id', businessId).eq('instance_name', instanceName).in('status', ['connected', 'disconnected']).limit(1);
-        if (sessionError) throw sessionError;
-        const existingSession = existingSessions?.[0];
-        const wasConnected = existingSession?.status === 'connected';
-        if (wasConnected) {
-            const { error: markDisconnectedError } = await supabase.from('whatsapp_sessions')
-                .update({ status: 'disconnected', updated_at: new Date().toISOString() })
-                .eq('id', existingSession.id)
-                .eq('business_id', businessId);
-            if (markDisconnectedError) throw markDisconnectedError;
-        }
-        if (existingSession) {
-            try {
-                const pausedCampaigns = await pauseCampaignsForDisconnectedInstance(supabase, { businessId, instanceName });
-                if (pausedCampaigns.length) {
-                    logEvent({
-                        level: 'warn',
-                        area: 'campaign',
-                        event: 'campaigns.paused_whatsapp_disconnected',
-                        message: `Paused ${pausedCampaigns.length} campaign(s) because WhatsApp disconnected`,
-                        business_id: businessId,
-                        entity_id: instanceName,
-                        details: { instance: instanceName, campaign_ids: pausedCampaigns.map(campaign => campaign.id) },
-                    });
-                }
-            } catch (error) {
-                logEvent({
-                    level: 'error',
-                    area: 'campaign',
-                    event: 'campaigns.disconnect_pause_failed',
-                    message: `Could not pause campaigns after WhatsApp disconnected: ${error?.message || error}`,
-                    business_id: businessId,
-                    entity_id: instanceName,
-                    details: { instance: instanceName, error },
-                });
-                throw error;
-            }
-        }
-        await deleteSessionRecord(instanceName, businessId);
-        console.log(`[Webhook] Removed disconnected WhatsApp session ${instanceName}`);
-        if (existingSession) scheduleDisconnectNotice({ businessId, instanceName });
-    } catch (error) {
-        // The disconnect itself is already logged above; say what failed afterwards.
-        logEvent({
-            level: 'error',
-            area: 'connection',
-            event: 'connection.disconnect_handling_failed',
-            message: `Disconnect was logged but handling it failed: ${error?.message || error}`,
-            business_id: businessId,
-            entity_id: instanceName,
-            details: { instance: instanceName, disconnect_log_id: disconnectLog.id, error },
-        });
-        throw error;
-    }
-}
-
 export async function processConnectionUpdate(payload, businessId) {
-    const info = describeConnectionUpdate(payload);
-    const instanceName = payload?.instance || payload?.data?.instance;
-    if (!instanceName) throw new Error('evolution_instance_missing');
-    const webhookState = webhookStateOf(info.state);
-    if (webhookState === 'close') {
-        // Kept even if everything after fails; the row is only deleted once Evolution confirms.
-        logEvent({
-            level: 'warn', area: 'connection', event: 'connection.close_received',
-            message: `${summariseClose(info)} (checking with Evolution before doing anything)`,
-            business_id: businessId, entity_id: instanceName,
-            details: { instance: instanceName, status_code: info.statusCode, meaning: info.meaning, reason_text: info.reasonText, payload: info.raw },
-        });
+    const data = payload?.data || {};
+    const state = String(data.state || data.status || data.connection || '').toLowerCase();
+    const isConnected = state === 'open' || state === 'connected';
+    const isDisconnected = state === 'close' || state === 'closed' || state === 'disconnected';
+    const instanceName = payload?.instance || data.instance;
+    if (isDisconnected) {
+        if (!instanceName) throw new Error('evolution_instance_missing');
+        // Only a number that was actually connected counts as "dropped" (not a QR that timed out).
+        const { data: wasConnected } = await supabase.from('whatsapp_sessions').select('id')
+            .eq('instance_name', instanceName).eq('status', 'connected').limit(1);
+        await deleteSessionRecord(instanceName, businessId);
+        console.log(`[Webhook] Removed inactive WhatsApp session ${instanceName}`);
+        if (wasConnected?.length) scheduleDisconnectNotice({ businessId, instanceName });
+        return;
     }
-    return withInstanceLock(instanceName, () => settleConnection({ payload, businessId, instanceName, info, webhookState }));
-}
-
-async function settleConnection({ payload, businessId, instanceName, info, webhookState }) {
-    const evolution = await readConfirmedState(() => readEvolutionState(instanceName), { delayMs: CLOSE_CONFIRM_DELAY_MS });
+    const sessionStatus = isConnected ? 'connected' : 'pending';
+    const incomingQr = data.qrcode?.base64 || data.qrCode || data.base64 || null;
+    const incomingPairingCode = data.pairingCode || data.pairing_code || null;
+    const values = {
+        business_id: businessId,
+        instance_name: instanceName,
+        status: sessionStatus,
+        session_data: {
+            qr_code: incomingQr,
+            pairing_code: incomingPairingCode,
+            raw_payload: payload,
+        },
+        updated_at: new Date().toISOString(),
+    };
 
     // whatsapp_sessions has no unique constraint on instance_name, so
     // upsert({ onConflict: 'instance_name' }) fails with a Postgres
     // "no unique or exclusion constraint" error on every call. Look the
-    // row up first, then update or insert, same pattern saveConnectionState
+    // row up first, then update or insert — same pattern saveConnectionState
     // in evolutionConnections.js already uses.
     const { data: existing, error: findError } = await supabase
         .from('whatsapp_sessions')
-        .select('id, status, session_data')
+        .select('id, session_data')
         .eq('instance_name', instanceName)
         .order('updated_at', { ascending: false })
         .limit(1)
         .maybeSingle();
     if (findError) throw findError;
 
-    const { action } = decideSettle({ webhookState, evolution, existingStatus: existing?.status });
-    const result = { ...info, outcome: action, evolution };
-
-    if (action === 'disconnect') {
-        await handleConfirmedDisconnect({ info, businessId, instanceName });
-        return result;
+    // A bare "connecting" update carries no pairing code or QR. Keep the ones
+    // already stored instead of overwriting them with null while the user is
+    // still typing the code into WhatsApp.
+    if (!isConnected && existing?.session_data) {
+        values.session_data.pairing_code = incomingPairingCode || existing.session_data.pairing_code || null;
+        values.session_data.qr_code = incomingQr || existing.session_data.qr_code || null;
     }
 
-    if (action === 'keep') {
-        logEvent({
-            level: webhookState === 'close' ? 'warn' : 'debug', area: 'connection', event: 'connection.update_kept',
-            message: webhookState === 'close'
-                ? `Close for ${instanceName} not confirmed (Evolution says ${evolution ?? 'unreachable'}): session kept`
-                : `Kept ${instanceName} as ${existing?.status ?? 'none'} (webhook ${webhookState}, Evolution ${evolution ?? 'unreachable'})`,
-            business_id: businessId, entity_id: instanceName,
-            details: { webhook_state: webhookState, evolution_state: evolution, status: existing?.status ?? null },
-        });
-        return result;
-    }
+    const query = existing?.id
+        ? supabase.from('whatsapp_sessions').update(values).eq('id', existing.id)
+        : supabase.from('whatsapp_sessions').insert(values);
 
-    const confirmed = action === 'connected';
-    const previous = existing?.session_data || {};
-    const values = {
-        business_id: businessId,
-        instance_name: instanceName,
-        status: action,
-        session_data: {
-            // Pairing codes only matter while pending; once connected they are cleared.
-            qr_code: confirmed ? null : (previous.qr_code || null),
-            pairing_code: confirmed ? null : (previous.pairing_code || null),
-            raw_payload: payload,
-            evolution_state: evolution ?? 'unreachable',
-            confirmed_at: evolution ? new Date().toISOString() : (previous.confirmed_at || null),
-        },
-        updated_at: new Date().toISOString(),
-    };
-    const { error } = existing?.id
-        ? await supabase.from('whatsapp_sessions').update(values).eq('id', existing.id)
-        : await supabase.from('whatsapp_sessions').insert(values);
+    const { error } = await query;
     if (error) throw error;
-    return result;
 }
 
 // Was called but never defined anywhere in this file — every live message
@@ -361,23 +216,14 @@ export async function processLiveMessage(messages, businessId) {
             // even once bugs #1/#2 above were fixed. Upserting on
             // whatsapp_message_id (which has a real unique constraint) also
             // makes this safe against Evolution redelivering the same event.
-            // Evolution echoes every message we send back as fromMe. If the follow-up engine or the chat AI
-            // already saved that message under its own agent_role, keep it: relabelling it 'human' would make
-            // the chat AI think the owner had taken over the chat.
-            let echoOf = null;
-            if (isFromMe && keyId) {
-                const { data: known } = await supabase.from('messages').select('role, agent_role').eq('whatsapp_message_id', keyId).maybeSingle();
-                if (known?.agent_role && known.agent_role !== 'human') echoOf = known;
-            }
-
             const { error: msgError } = await supabase.from('messages').upsert({
                 business_id: businessId,
                 conversation_id: conversationId,
                 contact_id: contactId,
                 whatsapp_message_id: keyId,
                 direction: isFromMe ? 'out' : 'in',
-                role: echoOf ? echoOf.role : (isFromMe ? 'admin' : 'user'),
-                agent_role: echoOf ? echoOf.agent_role : (isFromMe ? 'human' : 'legacy_ai'),
+                role: isFromMe ? 'admin' : 'user',
+                agent_role: isFromMe ? 'human' : 'legacy_ai',
                 type,
                 content: { text, type },
                 status: 'sent',
@@ -390,15 +236,6 @@ export async function processLiveMessage(messages, businessId) {
                 debugLog('error', 'Message Insert', 'Failed to store incoming message', { businessId, keyId, error: msgError });
             } else if (type !== 'reaction') {
                 void notifyFollowupEngineActivity(contactId, conversationId, campaignStepEventId, !isFromMe);
-                if (!isFromMe) {
-                    triggerChatAi({
-                        businessId, conversationId, contactId,
-                        message: {
-                            keyId, text, type, isFromMe, isGroupOrBroadcast: isGroupOrBroadcast(jid),
-                            sentAt: Number(timestamp) ? new Date(Number(timestamp) * 1000) : null,
-                        },
-                    });
-                }
             }
 
         } catch (error) {
