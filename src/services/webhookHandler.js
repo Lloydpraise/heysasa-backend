@@ -262,25 +262,56 @@ export async function processHistorySync(payload, businessIdOverride) {
     debugLog('info', 'History sync', 'Preparing history records', { businessId, contacts: contacts.length, chats: chats.length, messages: messages.length });
 
     const validContacts = contacts.filter(c => c.id && !isGroupOrBroadcast(c.id));
-    const contactPayloads = validContacts.map(c => ({
+
+    // A history sync must never reset a chat we already know: it used to overwrite lead_type, lead_state and
+    // is_ad_lead on every contact it saw, which brought back chats the owner had marked as personal and wiped ad
+    // attribution. Only brand-new chats get those starting values; known chats just get their name/phone refreshed.
+    const knownIds = new Set();
+    const allIds = validContacts.map(c => c.id);
+    for (let i = 0; i < allIds.length; i += 200) {
+        const { data: rows, error: knownError } = await supabase
+            .from('contacts')
+            .select('social_id')
+            .eq('business_id', businessId)
+            .eq('social_platform', 'whatsapp')
+            .in('social_id', allIds.slice(i, i + 200));
+        if (knownError) {
+            debugLog('error', 'DB history contacts', 'Known-contact lookup failed', { businessId, error: knownError });
+            continue;
+        }
+        (rows || []).forEach(r => knownIds.add(r.social_id));
+    }
+
+    const resolvedName = (c) => c.name || c.notify || c.verifiedName || null;
+    const baseFor = (c) => ({
         business_id:     businessId,
         social_platform: 'whatsapp',
         social_id:       c.id,
-        name:            c.name || c.notify || c.verifiedName || 'Unknown',
-        phone:           extractPhone(c.id),
-        lead_state:      'new',
-        lead_type:       'pending_analysis',
-        is_ad_lead:      false
-    }));
+        phone:           extractPhone(c.id)
+    });
+    const newPayloads = [];
+    const knownNamed = [];
+    const knownUnnamed = [];
+    for (const c of validContacts) {
+        const name = resolvedName(c);
+        if (!knownIds.has(c.id)) {
+            newPayloads.push({ ...baseFor(c), name: name || 'Unknown', lead_state: 'new', lead_type: 'pending_analysis', is_ad_lead: false });
+        } else if (name) {
+            knownNamed.push({ ...baseFor(c), name });
+        } else {
+            knownUnnamed.push(baseFor(c));
+        }
+    }
 
     let contactMap = {};
-    if (contactPayloads.length > 0) {
+    for (const group of [newPayloads, knownNamed, knownUnnamed]) {
+        if (group.length === 0) continue;
         const { data: inserted, error } = await supabase
             .from('contacts')
-            .upsert(contactPayloads, { onConflict: 'business_id, social_platform, social_id' })
+            .upsert(group, { onConflict: 'business_id, social_platform, social_id' })
             .select('id, social_id');
         if (!error && inserted) {
-            contactMap = inserted.reduce((acc, c) => { acc[c.social_id] = c.id; return acc; }, {});
+            inserted.forEach(c => { contactMap[c.social_id] = c.id; });
             debugLog('ok', 'DB history contacts', `Upserted ${inserted.length} contacts`, { businessId });
         } else if (error) {
             debugLog('error', 'DB history contacts', 'Contact history upsert failed', { businessId, error });

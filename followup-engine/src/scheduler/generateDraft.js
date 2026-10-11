@@ -1,6 +1,7 @@
 import { getMessages, getMaterialsForTouchpoint, getLastSentFollowups, getSequenceStep } from '../lib/db.js'
 import { callBot } from '../lib/ai.js'
 import { runQC } from '../lib/qc.js'
+import { getAdContext, formatAdContext } from '../lib/adContext.js'
 import { FOLLOWUP_FALLBACK, SUMMARISER_FALLBACK, SUGGESTION_REWRITE_FALLBACK } from './prompts.js'
 
 // Caps how much thread is sent to the model: the latest messages carry the
@@ -84,12 +85,15 @@ export async function generateFollowupDraft(supabase, item, contact, business, p
     ? `\n\nLAST LEAD SENTIMENT: ${lastInbound.sentiment_score} | Intent: ${lastInbound.intent_level ?? '?'}/10\nAdjust tone accordingly.`
     : ''
 
+  const adBlock = formatAdContext(await getAdContext(supabase, contact))
+
   const userContent = [
     `PERSONA:\n${JSON.stringify(pack.persona ?? {})}`,
     `BUSINESS CONTEXT:\n${JSON.stringify(pack.business_context ?? {})}`,
     `OBJECTION PLAYBOOK:\n${JSON.stringify(pack.objection_playbook ?? [])}`,
     `CUSTOMER PROFILES:\n${JSON.stringify(pack.customer_profiles ?? [])}`,
     `CONVERSATION SUMMARY:\n${convSummary}`,
+    adBlock,
     `LEAD NAME: ${contact.name ?? 'Customer'}`,
     `LEAD STAGE: ${leadStage}`,
     `FOLLOW-UP NUMBER: ${item.sequence_step}`,
@@ -140,6 +144,9 @@ export async function rewriteSuggestedMessage(supabase, suggestion, contact, bus
   if (extra.objective) parts.push(`CAMPAIGN OBJECTIVE:\n${extra.objective}`)
   if (extra.playbook) parts.push(`HOW TO FOLLOW UP (playbook):\n${extra.playbook}`)
   if (extra.profile) parts.push(`CUSTOMER PROFILE (this lead):\n${JSON.stringify(extra.profile)}`)
+  // A lead who came from an ad: the message is rewritten around that ad (what the lead actually asked about).
+  const adBlock = formatAdContext(await getAdContext(supabase, contact))
+  if (adBlock) parts.push(adBlock)
   if (extra.objective || extra.playbook || extra.profile) {
     parts.push('HOW TO USE THIS CONTEXT: the owner message is an EXAMPLE of the message for this step. Rewrite it for this exact lead: keep the step\'s intent, serve the campaign objective, follow the playbook, use the lead\'s real product interest and objections from the profile, and match the persona voice. Fill any {{placeholder}} tokens from the lead data. Never invent prices, discounts or facts not present in the context.')
   }

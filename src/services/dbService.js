@@ -242,15 +242,31 @@ export async function recordAdAttribution(businessId, contactId, adData) {
 
         if (adError) throw adError;
 
-        const { error: contactError } = await supabase.from('contacts').update({
+        // Everything we know about the ad goes on the contact, so lists, filters and AI drafts can use it without
+        // another lookup. (ad_id / ad_body / thumbnail used to be filled only after an analysis run.)
+        const adFields = {
             is_ad_lead:        true,
-            lead_type:         'business',
             ad_attribution_id: adRecord.id,
+            ad_id:             adData.ad_id,
             original_ad_id:    adData.ad_id,
             ad_headline:       adData.ad_headline,
+            ad_body:           adData.ad_body,
+            ad_thumbnail_url:  adData.ad_thumbnail_url,
+            ad_source_url:     adData.ad_source_url,
             ad_platform:       adData.ad_platform,
             ad_attributed_at:  adData.captured_at || new Date().toISOString()
-        }).eq('id', contactId);
+        };
+
+        // An ad click means a real customer, so the chat becomes a business lead. The one exception is a type the
+        // owner set themselves (or an old "personal" mark): that stays. This used to force 'business' on every ad
+        // message, which brought back chats the owner had marked as personal.
+        const { data: current, error: currentError } = await supabase
+            .from('contacts').select('lead_type, lead_type_source').eq('id', contactId).maybeSingle();
+        if (currentError) throw currentError;
+        const ownerSet = current?.lead_type_source === 'manual' || (current?.lead_type === 'personal' && !current?.lead_type_source);
+        if (!ownerSet) adFields.lead_type = 'business';
+
+        const { error: contactError } = await supabase.from('contacts').update(adFields).eq('id', contactId);
 
         if (contactError) throw contactError;
 

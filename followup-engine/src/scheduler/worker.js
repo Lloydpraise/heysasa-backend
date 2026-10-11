@@ -13,6 +13,7 @@ import { resolveMediaMergeFields, resolveMergeFields } from '../lib/mergeFields.
 import { log } from '../lib/log.js'
 import { effectiveDailyCap } from '../lib/warmup.js'
 import { resolveSendTarget } from '../lib/sendTarget.js'
+import { NON_CUSTOMER_TYPES } from '../lib/leadTypes.js'
 
 const STALL_RETRY_MS = 5 * 60_000
 // When the AI call itself failed (rate limit, outage, out of credits) the
@@ -123,6 +124,8 @@ export async function runWorker(supabase, queueItemId) {
   // opting a lead out happens explicitly from the lead detail panel
   // and is what sets do_not_contact.
   if (contact.do_not_contact) return skipItem('do_not_contact')
+  // A chat the owner marked personal (or that is a supplier, staff or spam) is never followed up, whatever queued it.
+  if (NON_CUSTOMER_TYPES.has(contact.lead_type)) return skipItem('not_a_customer')
   // wa_exists describes a phone number; it says nothing about a @lid ID.
   if (contact.wa_exists === false && sendTarget.kind !== 'lid') return skipItem('number_not_on_whatsapp')
 

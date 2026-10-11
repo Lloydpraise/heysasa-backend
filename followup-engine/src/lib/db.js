@@ -25,7 +25,8 @@ export async function getContact(s, contactId) {
     current_sequence_step, follow_up_count, consent_message_sent_at,
     created_at, last_seen, daily_followup_count, daily_followup_reset_at,
     lifetime_followups_sent, followup_zone, product_interests,
-    wa_exists, wa_checked_at
+    wa_exists, wa_checked_at,
+    lead_type, is_ad_lead, ad_id, original_ad_id, ad_headline, ad_body, ad_platform, ad_source_url
   `).eq('id', contactId).single()
   return data
 }

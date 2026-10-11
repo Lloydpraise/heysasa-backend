@@ -2,6 +2,7 @@ import { getContact, getConversation } from '../lib/db.js'
 import { resolveMediaMergeFields, resolveMergeFields } from '../lib/mergeFields.js'
 import { isBusinessAwake } from '../lib/timing.js'
 import { log } from '../lib/log.js'
+import { NON_CUSTOMER_TYPES } from '../lib/leadTypes.js'
 
 const BATCH_SIZE = 30
 
@@ -100,7 +101,7 @@ async function seedCampaignEnrollments(supabase) {
     if (!leadIds.length) continue
 
     const [{ data: contacts, error: contactsError }, { data: existingOpen, error: existingError }, { data: existingHere, error: hereError }] = await Promise.all([
-      supabase.from('contacts').select('id, business_id, do_not_contact, wa_exists').in('id', leadIds),
+      supabase.from('contacts').select('id, business_id, do_not_contact, wa_exists, lead_type').in('id', leadIds),
       supabase.from('campaign_enrollments').select('lead_id, campaign_id')
         .in('lead_id', leadIds).in('status', ['pending', 'active', 'awaiting_opt_in']),
       // Any status, this campaign only: a completed/exited enrollment still
@@ -127,7 +128,8 @@ async function seedCampaignEnrollments(supabase) {
     const rows = []
     for (const leadId of leadIds) {
       const contact = contactsById.get(leadId)
-      if (!contact || contact.business_id !== campaign.business_id || contact.do_not_contact || contact.wa_exists === false || existingByLead.has(leadId)) continue
+      // Personal chats, suppliers, staff and spam are never enrolled, even if they ended up on a list.
+      if (!contact || contact.business_id !== campaign.business_id || contact.do_not_contact || contact.wa_exists === false || NON_CUSTOMER_TYPES.has(contact.lead_type) || existingByLead.has(leadId)) continue
       rows.push({
         campaign_id: campaign.id,
         lead_id: leadId,
