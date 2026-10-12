@@ -21,7 +21,9 @@ import { attachDebugClient, debugLog, logEvent, queryLogs, getStreamClientCount 
 import { isDebugTokenValid, requireDebugToken } from './middleware/debugAuth.js';
 import { createAdminRouter } from './adminRoutes.js';
 import { startAlerts } from './services/alerts.js';
-import { startConnectionReconciler } from './services/connectionReconciler.js';
+// Disabled: the reconciler needs readEvolutionState/withInstanceLock/handleConfirmedDisconnect({info,...}),
+// which were removed from webhookHandler.js in 2e5fc4c. Re-enable only after restoring them.
+// import { startConnectionReconciler } from './services/connectionReconciler.js';
 import { EVOLUTION_API_KEY, EVOLUTION_URL } from './config/evolution.js';
 import {
     createEvolutionInstance,
@@ -234,7 +236,7 @@ logEvent({
 });
 
 startAlerts();
-startConnectionReconciler();
+// startConnectionReconciler();
 startFollowupEngine();
 
 // ─── Heartbeat ──────────────────────────────────────────────────────────────
