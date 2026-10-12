@@ -623,3 +623,16 @@ export async function processChatsUpsert(payload, businessIdOverride) {
         }
     }
 }
+
+export async function handleConfirmedDisconnect(instanceName, businessId) {
+    if (!instanceName) return;
+    try {
+        await deleteSessionRecord(instanceName, businessId);
+        console.log(`[Webhook] Removed confirmed disconnected WhatsApp session ${instanceName}`);
+        if (businessId) {
+            scheduleDisconnectNotice({ businessId, instanceName });
+        }
+    } catch (error) {
+        debugLog('error', 'Connection Reconciler', 'Failed to handle confirmed disconnect', { instanceName, businessId, error: error.message });
+    }
+}
