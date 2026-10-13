@@ -1,6 +1,7 @@
 import { billSend } from '../lib/billing.js'
 import { decideRetry } from '../lib/sendFailures.js'
 import { log } from '../lib/log.js'
+import { advanceAiEnrollment } from '../followupAi/advance.js'
 
 
 export async function recordSuccessfulSend(supabase, { item, contact, business, finalMessage, whatsappMessageId }) {
@@ -165,6 +166,14 @@ export async function recordSuccessfulSend(supabase, { item, contact, business, 
   // above, and deliberately lives here rather than in reconciliation.js:
   // only the sender knows the send genuinely happened, and campaigns track
   // their own step via campaign_enrollments, not contact.follow_up_sequence_id.
+  if (item.campaign_id) {
+    // Follow-up AI campaigns keep a per-lead step order and pick the next send time from the lead's active hours.
+    const { data: aiCampaign } = await supabase.from('campaigns').select('ai_managed, min_gap_hours').eq('id', item.campaign_id).maybeSingle()
+    if (aiCampaign?.ai_managed) {
+      await advanceAiEnrollment(supabase, { campaignId: item.campaign_id, contact, business, campaign: aiCampaign, sentStep: item.campaign_step ?? item.sequence_step })
+      return
+    }
+  }
   if (item.campaign_id) {
     const { data: nextStep } = await supabase
       .from('campaign_steps')

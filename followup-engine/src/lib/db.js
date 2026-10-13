@@ -2,8 +2,7 @@
 import { log } from './log.js'
 
 // ── Business ──────────────────────────────────────────────────
-export async function getBusiness(s, businessId) {
-  const { data } = await s.from('businesses').select(`
+const BUSINESS_COLUMNS = `
     business_id, name, timezone, whatsapp_channel, evolution_instance_id,
     followup_ai_enabled, business_type, currency, subscription_active,
     followup_daily_cap, followup_total_sent, followup_zone_recent,
@@ -13,8 +12,15 @@ export async function getBusiness(s, businessId) {
     hot_lead_intent_threshold, followup_stop_at_stage,
     followup_alert_at_stage, waba_phone_number_id,
     followup_quiet_start, followup_quiet_end, followup_active_days,
-    followup_zone_recent_mode, followup_zone_medium_mode, followup_zone_old_mode
-  `).eq('business_id', businessId).single()
+    followup_zone_recent_mode, followup_zone_medium_mode, followup_zone_old_mode`
+// Follow-up AI settings. If the database does not have these columns yet (code deployed before the migration ran),
+// the engine keeps working without them instead of treating every business as missing.
+const FOLLOWUP_AI_COLUMNS = `, followup_ai_scheduling, followup_min_gap_hours, followup_silence_hours, followup_approval_default`
+
+export async function getBusiness(s, businessId) {
+  const full = await s.from('businesses').select(BUSINESS_COLUMNS + FOLLOWUP_AI_COLUMNS).eq('business_id', businessId).single()
+  if (!full.error) return full.data
+  const { data } = await s.from('businesses').select(BUSINESS_COLUMNS).eq('business_id', businessId).single()
   return data
 }
 

@@ -27,6 +27,10 @@ const FIELD_MAP = {
   nudge_interval_hrs: 'followup_nudge_interval_hrs',
   hot_lead_alert: 'hot_lead_alert_enabled',
   hot_lead_threshold: 'hot_lead_intent_threshold',
+  ai_scheduling: 'followup_ai_scheduling',
+  min_gap_hours: 'followup_min_gap_hours',
+  silence_hours: 'followup_silence_hours',
+  approval_default: 'followup_approval_default',
 }
 
 // Stats shown in Preferences but never written by the Save button —
@@ -102,6 +106,19 @@ followupSettingsRouter.put('/settings/followup', async (req, res) => {
   }
   if (prefs.nudge_min_pending != null && prefs.nudge_min_pending < 0) {
     return res.status(400).json({ error: 'invalid_nudge_min_pending' })
+  }
+
+  if (prefs.ai_scheduling != null && !['off', 'draft', 'auto'].includes(prefs.ai_scheduling)) {
+    return res.status(400).json({ error: 'invalid_ai_scheduling' })
+  }
+  if (prefs.approval_default != null && !['granular', 'all'].includes(prefs.approval_default)) {
+    return res.status(400).json({ error: 'invalid_approval_default' })
+  }
+  if (prefs.min_gap_hours != null && !(Number.isInteger(prefs.min_gap_hours) && prefs.min_gap_hours >= 1 && prefs.min_gap_hours <= 168)) {
+    return res.status(400).json({ error: 'invalid_min_gap_hours' })
+  }
+  if (prefs.silence_hours != null && !(Number.isInteger(prefs.silence_hours) && prefs.silence_hours >= 2 && prefs.silence_hours <= 168)) {
+    return res.status(400).json({ error: 'invalid_silence_hours' })
   }
 
   const row = toDbRow(prefs)

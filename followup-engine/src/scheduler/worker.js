@@ -14,6 +14,7 @@ import { log } from '../lib/log.js'
 import { effectiveDailyCap } from '../lib/warmup.js'
 import { resolveSendTarget } from '../lib/sendTarget.js'
 import { NON_CUSTOMER_TYPES } from '../lib/leadTypes.js'
+import { processAiManagedItem, processAiScheduledItem } from '../followupAi/workerFlow.js'
 
 const STALL_RETRY_MS = 5 * 60_000
 // When the AI call itself failed (rate limit, outage, out of credits) the
@@ -74,13 +75,14 @@ export async function runWorker(supabase, queueItemId) {
   } catch (error) {
     return skipItem(error.message)
   }
-  if (!String(item.final_message ?? item.draft_message ?? '').trim() && !item.media) {
+  const aiIntentOnly = item.authored_by === 'ai_scheduled' && String(item.ai_intent ?? '').trim()
+  if (!String(item.final_message ?? item.draft_message ?? '').trim() && !item.media && !aiIntentOnly) {
     return skipItem('message_required')
   }
 
   if (item.campaign_id) {
     const { data: campaign, error: campaignError } = await supabase
-      .from('campaigns').select('id, status, business_id, whatsapp_instance_name').eq('id', item.campaign_id).maybeSingle()
+      .from('campaigns').select('id, status, business_id, whatsapp_instance_name, ai_managed').eq('id', item.campaign_id).maybeSingle()
     if (campaignError) throw new Error(`campaign status lookup failed: ${campaignError.message}`)
     // Campaign not active right now (e.g. paused because follow-ups are
     // toggled off) — nothing here fails or pauses it further, just wait.
@@ -101,6 +103,7 @@ export async function runWorker(supabase, queueItemId) {
       .maybeSingle()
     if (!connectedSession) return stallItem('instance_not_connected')
     item.assigned_instance_name = selectedInstance
+    item.aiManaged = campaign.ai_managed === true
   }
 
   // ── 2. Load contact + business ───────────────────────────────
@@ -135,6 +138,13 @@ export async function runWorker(supabase, queueItemId) {
   // than dying, so nothing is lost while the toggle is off.
   if (!business.followup_ai_enabled) return stallItem('followup_disabled')
   if (!business.subscription_active) return stallItem('subscription_inactive')
+
+  // A hold (the chat AI or the owner asked for quiet, or repeated negative replies): wait it out, however many items are queued.
+  const { data: leadState } = await supabase.from('lead_ai_state').select('hold_until')
+    .eq('business_id', item.business_id).eq('contact_id', item.contact_id).maybeSingle()
+  if (leadState?.hold_until && new Date(leadState.hold_until).getTime() > Date.now()) {
+    return stallItem('followup_hold', Math.min(new Date(leadState.hold_until).getTime() - Date.now(), 24 * 3_600_000))
+  }
 
   // Deal already closed either way — more follow-ups are just noise/risk.
   if (['won', 'lost'].includes(contact.lead_state ?? '')) return skipItem(`lead_${contact.lead_state}`)
@@ -178,6 +188,8 @@ export async function runWorker(supabase, queueItemId) {
   // ── 8. Don't interrupt active conversation ───────────────────
   const conv = await getConversation(supabase, item.contact_id, item.business_id)
   if (conv?.last_user_message_at && hoursSince(conv.last_user_message_at) < 2) {
+    // Follow-up AI items wait instead of dying: the planner will place the next send properly.
+    if (item.aiManaged || item.authored_by === 'ai_scheduled') return stallItem('lead_recently_active', 30 * 60_000)
     return skipItem('lead_recently_active')
   }
 
@@ -195,7 +207,12 @@ export async function runWorker(supabase, queueItemId) {
   // ── 9. Campaign items: own toggles, no AI zone system ──────────
   if (item.campaign_id) {
     const { data: campaign } = await supabase
-      .from('campaigns').select('ai_rewrite_enabled, auto_approve, kind, rule_id, business_id').eq('id', item.campaign_id).single()
+      .from('campaigns').select('ai_rewrite_enabled, auto_approve, kind, rule_id, business_id, ai_managed, min_gap_hours').eq('id', item.campaign_id).single()
+
+    // Follow-up AI campaigns: the director decides before anything is written or sent.
+    if (campaign?.ai_managed) {
+      return processAiManagedItem(supabase, { skipItem, stallItem, updateQueueItem }, { item, contact, business, pack, conv, campaign })
+    }
 
     let finalMessage = item.final_message || item.draft_message || ''
     let draft = item.draft_message || finalMessage
@@ -250,6 +267,11 @@ export async function runWorker(supabase, queueItemId) {
       details: { campaignId: item.campaign_id, step: item.campaign_step }
     })
     return { status: 'awaiting_approval', step: item.sequence_step }
+  }
+
+  // Follow-ups the AI scheduled on its own: director, writer and quality control, routed by the owner's AI scheduling setting.
+  if (item.authored_by === 'ai_scheduled') {
+    return processAiScheduledItem(supabase, { skipItem, stallItem, updateQueueItem }, { item, contact, business, pack, conv })
   }
 
   // ── 10-16. Standalone items: resolve the message first ─────────

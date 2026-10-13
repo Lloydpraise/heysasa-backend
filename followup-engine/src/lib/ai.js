@@ -30,7 +30,10 @@ export async function callOpenAI(options) {
     max_tokens: options.maxTokens ?? 500,
     messages: [
       { role: 'system', content: options.systemPrompt },
-      { role: 'user', content: options.userContent }
+      // options.images (URLs or data: URLs) lets a job look at a picture, e.g. the Follow-up AI reading an ad's image.
+      { role: 'user', content: options.images?.length
+        ? [{ type: 'text', text: options.userContent }, ...options.images.map(url => ({ type: 'image_url', image_url: { url, detail: 'low' } }))]
+        : options.userContent }
     ]
   }
   if (options.json) body.response_format = { type: 'json_object' }
@@ -150,6 +153,7 @@ export async function callBot(supabase, botId, userContent, fallbackPrompt, opti
     purpose: options.purpose ?? botId,
     businessId: options.businessId ?? null,
     skipBilling: options.skipBilling === true,
-    cacheKey: options.cacheKey ?? null
+    cacheKey: options.cacheKey ?? null,
+    images: options.images ?? null
   })
 }

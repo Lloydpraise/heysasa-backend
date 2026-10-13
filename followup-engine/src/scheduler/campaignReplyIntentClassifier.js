@@ -2,6 +2,7 @@ import { getConversation, getMessages } from '../lib/db.js'
 import { callBot } from '../lib/ai.js'
 import { CAMPAIGN_REPLY_INTENT_FALLBACK } from './prompts.js'
 import { log } from '../lib/log.js'
+import { recordFeedback } from '../followupAi/feedback.js'
 
 const BATCH_SIZE = 30
 const VALID_LABELS = ['action', 'opt_out', 'positive', 'negative', 'neutral']
@@ -51,9 +52,10 @@ export async function runCampaignReplyIntentClassifier(supabase, onlyEventId = n
   const campaignIds = [...new Set((enrollments ?? []).map(e => e.campaign_id))]
   const { data: campaigns } = await supabase
     .from('campaigns')
-    .select('id, business_id')
+    .select('id, business_id, ai_managed')
     .in('id', campaignIds)
   const businessIdByCampaign = new Map((campaigns ?? []).map(c => [c.id, c.business_id]))
+  const aiManagedCampaigns = new Set((campaigns ?? []).filter(c => c.ai_managed).map(c => c.id))
 
   const stepIds = [...new Set(pendingEvents.map(e => e.step_id))]
   const { data: steps } = await supabase
@@ -130,6 +132,13 @@ export async function runCampaignReplyIntentClassifier(supabase, onlyEventId = n
       // "attention" mechanism needed.
       if (label === 'action') {
         await supabase.from('contacts').update({ lead_state: 'engaged' }).eq('id', enrollment.lead_id)
+      }
+
+      // Follow-up AI feedback loop: only for campaigns the Follow-up AI manages (manual campaigns stay as they are).
+      if (aiManagedCampaigns.has(enrollment.campaign_id) && ['negative', 'opt_out', 'positive', 'action'].includes(label)) {
+        await recordFeedback(supabase, {
+          businessId, contactId: enrollment.lead_id, campaignId: enrollment.campaign_id, label, replyText: candidate.content.text,
+        })
       }
 
       classified++

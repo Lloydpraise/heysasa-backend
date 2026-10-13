@@ -7,9 +7,12 @@ import { runActivityPatterns } from './activityPatterns.js'
 import { runLeadTemperatureReview } from './leadTemperatureReview.js'
 import { runAutoListSync } from './autoListSync.js'
 import { log } from '../lib/log.js'
+import { runAdIntake } from '../followupAi/adIntake.js'
+import { ensureDefaultSkills } from '../followupAi/skills.js'
 import { isAnalysisActive, onAnalysisFinished, deferUntilAnalysisEnds } from '../lib/analysisGate.js'
 
 const RETRY_MS = 60_000
+const AD_INTAKE_FALLBACK_MS = 5 * 60_000
 // Realtime events can arrive many times a second (the analyser rewrites contacts in bulk, every send updates
 // follow_up_queue). Event-driven runs of a job are therefore limited to one per gap, with one trailing run so
 // the last change is never missed. Timers and startup runs are not throttled.
@@ -296,6 +299,12 @@ function subscribe() {
     invokeThrottled('CampaignScheduler', runCampaignScheduler, [{ seed: true }])
     afterQuiet('AutoListSync', () => void invoke('AutoListSync', runAutoListSync), HEAVY_QUIET_MS)
   })
+  // a new ad row, or an owner edit in the ad editor, starts the Follow-up AI's ad intake after a short quiet period
+  watch('ad_attributions', () => afterQuiet('AdIntake', () => void invoke('AdIntake', runAdIntake), 5_000))
+  watch('ad_playbooks', (payload) => {
+    const row = payload.new
+    if (row && (row.status === 'pending' || row.regenerate_requested_at)) afterQuiet('AdIntake', () => void invoke('AdIntake', runAdIntake), 2_000)
+  })
   watch('businesses', () => invokeThrottled('CampaignScheduler', runCampaignScheduler, [{ seed: false }]))
   watch('whatsapp_sessions', () => invokeThrottled('CampaignScheduler', runCampaignScheduler, [{ seed: false }]))
   watch('contacts', (payload) => { void onContactChange(payload) })
@@ -325,6 +334,8 @@ function subscribe() {
       void invoke('ActivityPatterns', runActivityPatterns)
       void invoke('CustomerProfiles', runCustomerProfileSync)
       void invoke('AutoListSync', runAutoListSync)
+      void ensureDefaultSkills(supabase).catch((e) => log('warn', 'followup_ai', 'followup_ai.skills_sync_failed', e.message))
+      void invoke('AdIntake', runAdIntake)
       void armDueWork().catch((e) => log('error', 'engine', 'engine.due_schedule_failed', e.message))
       void armTemperatureDue().catch((e) => log('error', 'engine', 'lead_temperature.schedule_failed', e.message))
       void armStageRetry().catch((e) => log('error', 'engine', 'stage_classifier.schedule_failed', e.message))
@@ -336,3 +347,4 @@ function subscribe() {
 
 log('info', 'engine', 'engine.started', 'Scheduler waiting for database events and due work')
 subscribe()
+setInterval(() => void invoke('AdIntake', runAdIntake), AD_INTAKE_FALLBACK_MS).unref?.()

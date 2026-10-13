@@ -1,8 +1,9 @@
-import { getContactsByIds, getConversationsByContactIds } from '../lib/db.js'
+import { getBusiness, getContactsByIds, getConversationsByContactIds } from '../lib/db.js'
 import { resolveMediaMergeFields, resolveMergeFields } from '../lib/mergeFields.js'
 import { isBusinessAwake } from '../lib/timing.js'
 import { log } from '../lib/log.js'
 import { NON_CUSTOMER_TYPES } from '../lib/leadTypes.js'
+import { planAiEnrollment } from '../followupAi/campaignPlanner.js'
 
 // Due enrollments handled per cycle. Everything a cycle needs is read in a handful of requests and the queue
 // rows are written together, so this can be large without the request count growing with it.
@@ -202,7 +203,7 @@ export async function runCampaignScheduler(supabase, { seed = true } = {}) {
 
   const { data: due, error } = await supabase
     .from('campaign_enrollments')
-    .select('id, campaign_id, lead_id, current_step, status')
+    .select('id, campaign_id, lead_id, current_step, status, step_order, schedule_reason')
     .in('status', ['pending', 'active'])
     .or(`next_send_at.is.null,next_send_at.lte.${now}`)
     .limit(BATCH_SIZE)
@@ -220,7 +221,7 @@ export async function runCampaignScheduler(supabase, { seed = true } = {}) {
   for (const ids of chunked(campaignIds, IN_CHUNK)) {
     const { data, error: campaignError } = await supabase
       .from('campaigns')
-      .select('id, business_id, status, whatsapp_instance_name')
+      .select('id, business_id, status, whatsapp_instance_name, ai_managed, min_gap_hours')
       .in('id', ids)
     if (campaignError) {
       log('error', 'engine', 'campaign_scheduler.campaign_lookup_failed', `Campaign lookup failed: ${campaignError.message}`, { details: { error: campaignError.message } })
@@ -285,11 +286,25 @@ export async function runCampaignScheduler(supabase, { seed = true } = {}) {
   }
 
   // Which enrollments have no further step (finished) and which still have one to send.
+  // Follow-up AI campaigns keep their own per-lead step order and send time, so the planner decides for them.
   const finishedEnrollments = []
   const withStep = []
+  const businessCache = new Map()
   for (const enrollment of eligible) {
-    const nextStepNumber = (enrollment.current_step ?? 0) + 1
-    const step = stepsByKey.get(`${enrollment.campaign_id}|${nextStepNumber}`)
+    const campaign = campaignsById.get(enrollment.campaign_id)
+    let step
+    let nextStepNumber = (enrollment.current_step ?? 0) + 1
+    if (campaign.ai_managed) {
+      let business = businessCache.get(campaign.business_id)
+      if (!business) { business = await getBusiness(supabase, campaign.business_id); businessCache.set(campaign.business_id, business) }
+      if (!business) continue
+      const planned = await planAiEnrollment(supabase, { enrollment, campaign, business })
+      if (planned.action === 'wait') continue
+      step = planned.action === 'queue' ? planned.step : null
+      if (step) nextStepNumber = step.step_number
+    } else {
+      step = stepsByKey.get(`${enrollment.campaign_id}|${nextStepNumber}`)
+    }
     if (!step) finishedEnrollments.push({ enrollment, nextStepNumber })
     else withStep.push({ enrollment, step })
   }
@@ -372,7 +387,7 @@ export async function runCampaignScheduler(supabase, { seed = true } = {}) {
           campaign_step: step.step_number,
           sequence_step: step.step_number,
           touchpoint_type: 'campaign',
-          klt_phase: 'know',
+          klt_phase: campaign.ai_managed ? (step.klt_phase ?? 'know') : 'know',
           final_message: resolveMergeFields(step.content, contact),
           media: resolveMediaMergeFields(step.media, contact),
           assigned_instance_name: campaign.whatsapp_instance_name,
