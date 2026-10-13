@@ -1270,7 +1270,8 @@ async function applyNLPResults(businessId, contactId, conversationId, rawNlp, ca
 async function runProductDiscoveryPhase() {
     const skipped = (reason) => ({ skipped: true, reason });
     if (requestedAnalysisConfig.skipProducts === true || process.env.SKIP_PRODUCT_DISCOVERY === '1') return skipped('disabled');
-    if (REQUESTED_CONTACT_IDS.length > 0) return skipped('single_contact_run');
+    // A single-contact run skips discovery. A setup bundle asks for it (discoverProducts), so the first bundle finds products too.
+    if (REQUESTED_CONTACT_IDS.length > 0 && requestedAnalysisConfig.discoverProducts !== true) return skipped('single_contact_run');
     if (!BUSINESS_ID) return skipped('no_business');
     try {
         const result = await runProductDiscovery({
@@ -1278,6 +1279,8 @@ async function runProductDiscoveryPhase() {
             textModel: OPENAI_MODEL, visionModel: process.env.OPENAI_VISION_MODEL || OPENAI_MODEL,
             // Re-analysing everyone must not re-read every image: discovery has its own force switch.
             force: requestedAnalysisConfig.forceProducts === true || process.env.FORCE_PRODUCT_DISCOVERY === '1',
+            // Setup bundle 1: text only (fast). A normal discovery run adds the images afterwards.
+            textOnly: requestedAnalysisConfig.productsTextOnly === true,
             log, warn, err, progress,
             recordUsage: ({ businessId, model, promptTokens, cachedTokens, completionTokens }) =>
                 billAiUsage(supabase, { businessId, runner: 'product_discovery', model, promptTokens, cachedTokens, completionTokens, runId: crypto.randomUUID() }),

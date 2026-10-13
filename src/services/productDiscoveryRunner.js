@@ -126,7 +126,9 @@ export async function runProductDiscovery(ctx) {
     }
 
     // ── images ──────────────────────────────────────────────────────────────
-    const imageResult = await mineImages(ctx, run, state, business, byContact, contactIds, visionModel, summary);
+    const imageResult = ctx.textOnly
+      ? { candidates: [] }   // text-only run (setup bundle 1): images are read by the next, normal run
+      : await mineImages(ctx, run, state, business, byContact, contactIds, visionModel, summary);
     candidates.push(...imageResult.candidates);
     log('Products', `Evidence collection finished with ${candidates.length} product candidates (${summary.text_candidates} from text, ${imageResult.candidates.length} from images).`);
 

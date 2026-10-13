@@ -35,6 +35,7 @@ import { createWaitlistSignup } from './services/waitlistService.js';
 import { getPublicStats } from './services/publicStatsService.js';
 import { checkOpenAIAvailability, getOpenAIAvailabilityState } from './services/openAiGate.js';
 import personaRoutes from './personaRoutes.js';
+import setupRoutes, { resumeSetups } from './setup/setupRoutes.js';
 import productRoutes from './productRoutes.js';
 import followupSettingsRoutes from './followupSettingsRoutes.js';
 import { createAssistantRouterForApp } from './businessAi/index.js';
@@ -564,7 +565,12 @@ async function startAnalysis(req, res) {
         cwd: projectRoot,
         env: {
             ...process.env,
-            ANALYSIS_CONFIG: JSON.stringify({ businessId, contactIds }),
+            ANALYSIS_CONFIG: JSON.stringify({
+                businessId, contactIds,
+                // Setup bundles only (booleans, nothing else is forwarded).
+                ...(req.body?.discoverProducts === true ? { discoverProducts: true } : {}),
+                ...(req.body?.productsTextOnly === true ? { productsTextOnly: true } : {}),
+            }),
         },
         stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -637,6 +643,7 @@ app.get('/analysis/status', async (req, res, next) => {
 });
 
 app.use(personaRoutes);
+app.use(setupRoutes);
 app.use(productRoutes);
 app.use(followupSettingsRoutes);
 // Ask HeySasa, the business assistant (conversations, notes, preferences). Streams over Server-Sent Events.
@@ -901,7 +908,11 @@ app.use((err, _req, res, _next) => {
 app.get('/health', (_req, res) => res.json({ status: 'ok', mode: 'single-tenant' }));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`heysasa backend listening on port ${PORT}`));
+app.listen(PORT, () => {
+    console.log(`heysasa backend listening on port ${PORT}`);
+    // A restart kills any setup that was running: pick those back up.
+    resumeSetups().catch((error) => console.error('resumeSetups failed:', error.message));
+});
 
 process.once('SIGINT', stopProcesses);
 process.once('SIGTERM', stopProcesses);
