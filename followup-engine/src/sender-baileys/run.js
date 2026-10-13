@@ -2,6 +2,7 @@ import { processBaileysBatch, recoverStaleClaims } from './worker.js'
 import { processChatAiOutbox } from './chatAiOutbox.js'
 import { log } from '../lib/log.js'
 import { supabase } from '../supabaseClient.js'
+import { isAnalysisActive, onAnalysisFinished, deferUntilAnalysisEnds } from '../lib/analysisGate.js'
 
 const RETRY_WHEN_BLOCKED_MS = 60_000
 const CHAT_AI_RETRY_MS = 60_000
@@ -41,6 +42,39 @@ async function scheduleNextDue() {
     senderWakeAt = 0
   }
 }
+
+// Realtime events wake the sender, but a burst (every send updates follow_up_queue; the analyser rewrites
+// contacts in bulk) must not mean a database round-trip per event. Event wake-ups are limited to one per gap with
+// one trailing wake so nothing is missed. Timers (scheduled sends, retries) still call wakeSender() directly.
+const SENDER_QUEUE_GAP_MS = parseInt(process.env.SENDER_QUEUE_EVENT_GAP_MS ?? '2000')
+const SENDER_OTHER_GAP_MS = parseInt(process.env.SENDER_OTHER_EVENT_GAP_MS ?? '10000')
+const SENDER_CONTACT_GAP_MS = parseInt(process.env.SENDER_CONTACT_EVENT_GAP_MS ?? '15000')
+const lastEventWake = new Map()
+const trailingWake = new Map()
+
+function wakeSenderFromEvent(source, gapMs) {
+  const wait = (lastEventWake.get(source) ?? 0) + gapMs - Date.now()
+  if (wait <= 0 && !trailingWake.has(source)) {
+    lastEventWake.set(source, Date.now())
+    void wakeSender()
+    return
+  }
+  if (trailingWake.has(source)) return
+  trailingWake.set(source, setTimeout(() => {
+    trailingWake.delete(source)
+    lastEventWake.set(source, Date.now())
+    void wakeSender()
+  }, Math.max(0, wait)))
+}
+
+async function onContactEvent() {
+  if (await isAnalysisActive()) {
+    deferUntilAnalysisEnds()
+    return
+  }
+  wakeSenderFromEvent('contacts', SENDER_CONTACT_GAP_MS)
+}
+onAnalysisFinished(() => wakeSender())
 
 function wakeSender() {
   senderWakePending = true
@@ -115,11 +149,11 @@ const chatAiChannel = supabase
 
 const senderChannel = supabase
   .channel('follow-up-sender-events')
-  .on('postgres_changes', { event: '*', schema: 'public', table: 'follow_up_queue' }, wakeSender)
-  .on('postgres_changes', { event: '*', schema: 'public', table: 'whatsapp_sessions' }, wakeSender)
-  .on('postgres_changes', { event: '*', schema: 'public', table: 'campaigns' }, wakeSender)
-  .on('postgres_changes', { event: '*', schema: 'public', table: 'businesses' }, wakeSender)
-  .on('postgres_changes', { event: '*', schema: 'public', table: 'contacts' }, wakeSender)
+  .on('postgres_changes', { event: '*', schema: 'public', table: 'follow_up_queue' }, () => wakeSenderFromEvent('queue', SENDER_QUEUE_GAP_MS))
+  .on('postgres_changes', { event: '*', schema: 'public', table: 'whatsapp_sessions' }, () => wakeSenderFromEvent('sessions', SENDER_OTHER_GAP_MS))
+  .on('postgres_changes', { event: '*', schema: 'public', table: 'campaigns' }, () => wakeSenderFromEvent('campaigns', SENDER_OTHER_GAP_MS))
+  .on('postgres_changes', { event: '*', schema: 'public', table: 'businesses' }, () => wakeSenderFromEvent('businesses', SENDER_OTHER_GAP_MS))
+  .on('postgres_changes', { event: '*', schema: 'public', table: 'contacts' }, () => { void onContactEvent() })
   .subscribe((status, error) => {
     if (status === 'SUBSCRIBED') {
       void (async () => {

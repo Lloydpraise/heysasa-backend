@@ -1,10 +1,20 @@
-import { getContact, getConversation } from '../lib/db.js'
+import { getContactsByIds, getConversationsByContactIds } from '../lib/db.js'
 import { resolveMediaMergeFields, resolveMergeFields } from '../lib/mergeFields.js'
 import { isBusinessAwake } from '../lib/timing.js'
 import { log } from '../lib/log.js'
 import { NON_CUSTOMER_TYPES } from '../lib/leadTypes.js'
 
-const BATCH_SIZE = 30
+// Due enrollments handled per cycle. Everything a cycle needs is read in a handful of requests and the queue
+// rows are written together, so this can be large without the request count growing with it.
+const BATCH_SIZE = parseInt(process.env.CAMPAIGN_BATCH_SIZE ?? '500')
+const IN_CHUNK = 100          // ids per .in() filter (keeps the request URL short)
+const INSERT_CHUNK = 200
+
+const chunked = (items, size) => {
+  const out = []
+  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size))
+  return out
+}
 
 async function pauseCampaign(supabase, campaignId, reason) {
   await supabase.from('campaigns')
@@ -203,162 +213,212 @@ export async function runCampaignScheduler(supabase, { seed = true } = {}) {
   }
   if (!due?.length) return { queued: 0 }
 
-  let queued = 0
-  // Cache business-awake checks per cycle so a batch spanning many
-  // enrollments for the same business only looks it up once.
-  const awakeCache = new Map()
-  // Cache campaign rows and their connected-session check per cycle too —
-  // a batch is frequently dozens of enrollments for the same one or two
-  // campaigns, and these were previously refetched per enrollment.
-  const campaignCache = new Map()
-  const sessionCache = new Map()
-  for (const enrollment of due) {
-    try {
-      let campaign = campaignCache.get(enrollment.campaign_id)
-      if (campaign === undefined) {
-        const { data } = await supabase
-          .from('campaigns')
-          .select('id, business_id, status, whatsapp_instance_name')
-          .eq('id', enrollment.campaign_id)
-          .single()
-        campaign = data ?? null
-        campaignCache.set(enrollment.campaign_id, campaign)
-      }
-      if (!campaign) {
-        log('warn', 'engine', 'campaign_scheduler.campaign_not_found', `Skipped enrollment ${enrollment.id}: campaign not found`, {
-          entity_id: enrollment.id, details: { campaignId: enrollment.campaign_id }
+  // ── Read everything this cycle needs, once ────────────────────────────────────────
+  // (previously ~6 requests per enrollment: campaign, business, session, step, contact, dedupe, conversation)
+  const campaignIds = [...new Set(due.map(e => e.campaign_id))]
+  const campaignsById = new Map()
+  for (const ids of chunked(campaignIds, IN_CHUNK)) {
+    const { data, error: campaignError } = await supabase
+      .from('campaigns')
+      .select('id, business_id, status, whatsapp_instance_name')
+      .in('id', ids)
+    if (campaignError) {
+      log('error', 'engine', 'campaign_scheduler.campaign_lookup_failed', `Campaign lookup failed: ${campaignError.message}`, { details: { error: campaignError.message } })
+      return { queued: 0, error: campaignError.message }
+    }
+    for (const row of data ?? []) campaignsById.set(row.id, row)
+  }
+  for (const id of campaignIds) {
+    if (!campaignsById.has(id)) {
+      log('warn', 'engine', 'campaign_scheduler.campaign_not_found', `Skipped enrollments: campaign ${id} not found`, { details: { campaignId: id } })
+    }
+  }
+
+  const activeCampaigns = [...campaignsById.values()].filter(c => c.status === 'active')
+  if (!activeCampaigns.length) return { queued: 0 }
+  const businessIds = [...new Set(activeCampaigns.map(c => c.business_id))]
+
+  // Sleep mode — a business in quiet hours (or on an inactive day) just has its due items left alone this cycle.
+  const awakeByBusiness = new Map()
+  for (const ids of chunked(businessIds, IN_CHUNK)) {
+    const { data } = await supabase
+      .from('businesses')
+      .select('business_id, timezone, followup_quiet_start, followup_quiet_end, followup_active_days')
+      .in('business_id', ids)
+    for (const business of data ?? []) awakeByBusiness.set(business.business_id, isBusinessAwake(business))
+  }
+  const isAwake = (businessId) => awakeByBusiness.get(businessId) ?? true
+
+  // whatsapp_sessions is the source of truth — no live Evolution ping, nothing pauses or fails the campaign over it.
+  const connected = new Set()
+  if (activeCampaigns.some(c => c.whatsapp_instance_name)) {
+    for (const ids of chunked(businessIds, IN_CHUNK)) {
+      const { data } = await supabase
+        .from('whatsapp_sessions')
+        .select('business_id, instance_name')
+        .in('business_id', ids)
+        .eq('status', 'connected')
+      for (const row of data ?? []) connected.add(`${row.business_id}|${row.instance_name}`)
+    }
+  }
+
+  const eligible = due.filter((enrollment) => {
+    const campaign = campaignsById.get(enrollment.campaign_id)
+    if (!campaign || campaign.status !== 'active') return false
+    if (!isAwake(campaign.business_id)) return false
+    if (campaign.whatsapp_instance_name && !connected.has(`${campaign.business_id}|${campaign.whatsapp_instance_name}`)) return false
+    return true
+  })
+  if (!eligible.length) return { queued: 0 }
+
+  const stepsByKey = new Map()
+  for (const ids of chunked([...new Set(eligible.map(e => e.campaign_id))], IN_CHUNK)) {
+    const { data, error: stepError } = await supabase
+      .from('campaign_steps')
+      .select('campaign_id, step_number, content, media, delay_hours')
+      .in('campaign_id', ids)
+    if (stepError) {
+      log('error', 'engine', 'campaign_scheduler.step_lookup_failed', `Step lookup failed: ${stepError.message}`, { details: { error: stepError.message } })
+      return { queued: 0, error: stepError.message }
+    }
+    for (const step of data ?? []) stepsByKey.set(`${step.campaign_id}|${step.step_number}`, step)
+  }
+
+  // Which enrollments have no further step (finished) and which still have one to send.
+  const finishedEnrollments = []
+  const withStep = []
+  for (const enrollment of eligible) {
+    const nextStepNumber = (enrollment.current_step ?? 0) + 1
+    const step = stepsByKey.get(`${enrollment.campaign_id}|${nextStepNumber}`)
+    if (!step) finishedEnrollments.push({ enrollment, nextStepNumber })
+    else withStep.push({ enrollment, step })
+  }
+
+  if (finishedEnrollments.length) {
+    const finishedCampaigns = new Map()
+    for (const { enrollment, nextStepNumber } of finishedEnrollments) {
+      finishedCampaigns.set(enrollment.campaign_id, nextStepNumber - 1)
+    }
+    for (const ids of chunked(finishedEnrollments.map(f => f.enrollment.id), IN_CHUNK)) {
+      await supabase.from('campaign_enrollments').update({ status: 'completed' }).in('id', ids)
+    }
+    for (const [campaignId, finalStep] of finishedCampaigns) {
+      log('info', 'engine', 'campaign_scheduler.enrollment_completed', `Completed enrollments for campaign ${campaignId}: no step after ${finalStep}`, {
+        entity_id: campaignId, details: { campaignId, finalStep, enrollments: finishedEnrollments.filter(f => f.enrollment.campaign_id === campaignId).length }
+      })
+      const { error: completionError } = await supabase.rpc('complete_campaign_if_finished', { target_campaign_id: campaignId })
+      if (completionError) {
+        log('error', 'engine', 'campaign_scheduler.completion_check_failed', `Campaign completion check failed for ${campaignId}: ${completionError.message}`, {
+          entity_id: campaignId, details: { error: completionError.message }
         })
-        continue
       }
-      if (campaign.status !== 'active') {
-        continue
-      }
+    }
+  }
+  if (!withStep.length) return { queued: 0 }
 
-      // Sleep mode — a business in quiet hours (or on an inactive day)
-      // just has its due items left alone this cycle, no per-item writes.
-      if (!awakeCache.has(campaign.business_id)) {
-        const { data: business } = await supabase
-          .from('businesses')
-          .select('timezone, followup_quiet_start, followup_quiet_end, followup_active_days')
-          .eq('business_id', campaign.business_id)
-          .maybeSingle()
-        awakeCache.set(campaign.business_id, business ? isBusinessAwake(business) : true)
-      }
-      if (!awakeCache.get(campaign.business_id)) continue
+  const leadIds = [...new Set(withStep.map(({ enrollment }) => enrollment.lead_id))]
+  const contactsById = await getContactsByIds(supabase, leadIds)
 
-      // whatsapp_sessions is the source of truth — no live Evolution
-      // ping, and nothing here pauses or fails the campaign over it.
-      if (campaign.whatsapp_instance_name) {
-        let hasConnectedSession = sessionCache.get(campaign.id)
-        if (hasConnectedSession === undefined) {
-          const { data: connectedSession } = await supabase
-            .from('whatsapp_sessions')
-            .select('instance_name')
-            .eq('business_id', campaign.business_id)
-            .eq('instance_name', campaign.whatsapp_instance_name)
-            .eq('status', 'connected')
-            .maybeSingle()
-          hasConnectedSession = !!connectedSession
-          sessionCache.set(campaign.id, hasConnectedSession)
-        }
-        if (!hasConnectedSession) continue
-      }
-
-      const nextStepNumber = (enrollment.current_step ?? 0) + 1
-      const { data: step } = await supabase
-        .from('campaign_steps')
-        .select('step_number, content, media, delay_hours')
-        .eq('campaign_id', enrollment.campaign_id)
-        .eq('step_number', nextStepNumber)
-        .maybeSingle()
-
-      if (!step) {
-        // No more steps defined — campaign finished for this lead
-        log('info', 'engine', 'campaign_scheduler.enrollment_completed', `Completed enrollment ${enrollment.id}: no step ${nextStepNumber}`, {
-          entity_id: enrollment.id, details: { campaignId: enrollment.campaign_id, finalStep: nextStepNumber - 1 }
-        })
-        await supabase.from('campaign_enrollments').update({ status: 'completed' }).eq('id', enrollment.id)
-        const { error: completionError } = await supabase.rpc('complete_campaign_if_finished', {
-          target_campaign_id: enrollment.campaign_id
-        })
-        if (completionError) {
-          log('error', 'engine', 'campaign_scheduler.completion_check_failed', `Campaign completion check failed for ${enrollment.campaign_id}: ${completionError.message}`, {
-            entity_id: enrollment.campaign_id, details: { error: completionError.message }
-          })
-        }
-        continue
-      }
-
-      const contact = await getContact(supabase, enrollment.lead_id)
-      if (!contact) {
-        log('warn', 'engine', 'campaign_scheduler.contact_not_found', `Skipped enrollment ${enrollment.id}: contact ${enrollment.lead_id} not found`, {
-          entity_id: enrollment.id, details: { leadId: enrollment.lead_id }
-        })
-        continue
-      }
-
-      // Known not to be on WhatsApp: nothing will ever go, so close their spot instead of leaving it stuck.
-      if (contact.wa_exists === false) {
-        await supabase.from('campaign_enrollments').update({ status: 'exited' }).eq('id', enrollment.id)
-        continue
-      }
-
-      // Dedupe — guards against a slow poll cycle overlapping the next one
-      // and double-queuing the same step.
-      const { data: existing } = await supabase
+  // Dedupe — guards against a slow cycle overlapping the next one and double-queuing the same step.
+  const existingQueue = new Set()
+  const stepCampaignIds = [...new Set(withStep.map(({ enrollment }) => enrollment.campaign_id))]
+  for (const ids of chunked(leadIds, IN_CHUNK)) {
+    for (const campaignChunk of chunked(stepCampaignIds, IN_CHUNK)) {
+      const { data, error: existingError } = await supabase
         .from('follow_up_queue')
-        .select('id')
-        .eq('campaign_id', enrollment.campaign_id)
-        .eq('contact_id', enrollment.lead_id)
-        .eq('campaign_step', step.step_number)
+        .select('campaign_id, contact_id, campaign_step')
+        .in('contact_id', ids)
+        .in('campaign_id', campaignChunk)
         .in('status', ['pending', 'ready_to_send', 'sending', 'sent', 'failed'])
-        .maybeSingle()
-      if (existing) {
-        log('debug', 'engine', 'campaign_scheduler.dedupe_skip', `Skipped enrollment ${enrollment.id}: queue item already exists for step ${step.step_number}`, {
-          entity_id: enrollment.id, details: { step: step.step_number }
-        })
-        continue
+      if (existingError) {
+        log('error', 'engine', 'campaign_scheduler.dedupe_lookup_failed', `Queue dedupe lookup failed: ${existingError.message}`, { details: { error: existingError.message } })
+        return { queued: 0, error: existingError.message }
       }
+      for (const row of data ?? []) existingQueue.add(`${row.campaign_id}|${row.contact_id}|${row.campaign_step}`)
+    }
+  }
 
-      const conv = await getConversation(supabase, enrollment.lead_id, campaign.business_id)
+  const conversations = await getConversationsByContactIds(supabase, leadIds)
 
-      const { data: queueItem, error: queueError } = await supabase.from('follow_up_queue').insert({
-        business_id: campaign.business_id,
-        contact_id: enrollment.lead_id,
-        conversation_id: conv?.id ?? null,
-        campaign_id: enrollment.campaign_id,
-        campaign_step: step.step_number,
-        sequence_step: step.step_number,
-        touchpoint_type: 'campaign',
-        klt_phase: 'know',
-        final_message: resolveMergeFields(step.content, contact),
-        media: resolveMediaMergeFields(step.media, contact),
-        assigned_instance_name: campaign.whatsapp_instance_name,
-        approval_status: 'approved',
-        status: 'pending',
-        scheduled_at: now
-      }).select('id').single()
+  // ── Decide per enrollment (in memory) ──────────────────────────────────────────
+  const exitedIds = []
+  const toQueue = []   // { enrollment, row }
+  for (const { enrollment, step } of withStep) {
+    const campaign = campaignsById.get(enrollment.campaign_id)
+    const contact = contactsById.get(enrollment.lead_id)
+    if (!contact) {
+      log('warn', 'engine', 'campaign_scheduler.contact_not_found', `Skipped enrollment ${enrollment.id}: contact ${enrollment.lead_id} not found`, {
+        entity_id: enrollment.id, details: { leadId: enrollment.lead_id }
+      })
+      continue
+    }
+    // Known not to be on WhatsApp: nothing will ever go, so close their spot instead of leaving it stuck.
+    if (contact.wa_exists === false) { exitedIds.push(enrollment.id); continue }
+    if (existingQueue.has(`${enrollment.campaign_id}|${enrollment.lead_id}|${step.step_number}`)) {
+      log('debug', 'engine', 'campaign_scheduler.dedupe_skip', `Skipped enrollment ${enrollment.id}: queue item already exists for step ${step.step_number}`, {
+        entity_id: enrollment.id, details: { step: step.step_number }
+      })
+      continue
+    }
+    try {
+      const conv = conversations.get(`${campaign.business_id}|${enrollment.lead_id}`)
+      toQueue.push({
+        enrollment,
+        row: {
+          business_id: campaign.business_id,
+          contact_id: enrollment.lead_id,
+          conversation_id: conv?.id ?? null,
+          campaign_id: enrollment.campaign_id,
+          campaign_step: step.step_number,
+          sequence_step: step.step_number,
+          touchpoint_type: 'campaign',
+          klt_phase: 'know',
+          final_message: resolveMergeFields(step.content, contact),
+          media: resolveMediaMergeFields(step.media, contact),
+          assigned_instance_name: campaign.whatsapp_instance_name,
+          approval_status: 'approved',
+          status: 'pending',
+          scheduled_at: now
+        }
+      })
+    } catch (e) {
+      log('error', 'engine', 'campaign_scheduler.error', `Error for enrollment ${enrollment.id}: ${e.message}`, {
+        entity_id: enrollment.id, details: { error: { name: e.name, message: e.message } }
+      })
+    }
+  }
 
+  for (const ids of chunked(exitedIds, IN_CHUNK)) {
+    await supabase.from('campaign_enrollments').update({ status: 'exited' }).in('id', ids)
+  }
+
+  // ── Write: all queue rows together; a rejected batch is retried row by row so one bad row cannot block the rest ──
+  let queued = 0
+  const activated = []
+  for (const part of chunked(toQueue, INSERT_CHUNK)) {
+    const { error: bulkError } = await supabase.from('follow_up_queue').insert(part.map(p => p.row))
+    if (!bulkError) {
+      queued += part.length
+      for (const { enrollment } of part) if (enrollment.status === 'pending') activated.push(enrollment.id)
+      continue
+    }
+    log('warn', 'engine', 'campaign_scheduler.bulk_insert_retry', `Bulk queue insert of ${part.length} rows failed (${bulkError.message}); retrying row by row`, {
+      details: { error: bulkError.message, code: bulkError.code, rows: part.length }
+    })
+    for (const { enrollment, row } of part) {
+      const { error: queueError } = await supabase.from('follow_up_queue').insert(row)
       if (queueError) {
         log('error', 'engine', 'campaign_scheduler.queue_insert_failed', `Queue insert failed for enrollment ${enrollment.id}: ${queueError.message}`, {
           entity_id: enrollment.id, details: { error: queueError.message }
         })
         continue
       }
-
       queued++
-      log('debug', 'engine', 'campaign_scheduler.queue_item_created', `Queue item created ${queueItem.id} for enrollment ${enrollment.id} step ${step.step_number}`, {
-        entity_id: enrollment.id, details: { queueItemId: queueItem.id, step: step.step_number }
-      })
-
-      if (enrollment.status === 'pending') {
-        await supabase.from('campaign_enrollments').update({ status: 'active' }).eq('id', enrollment.id)
-      }
-    } catch (e) {
-      log('error', 'engine', 'campaign_scheduler.error', `Error for enrollment ${enrollment.id}: ${e.message}`, {
-        entity_id: enrollment.id, details: { error: { name: e.name, message: e.message } }
-      })
+      if (enrollment.status === 'pending') activated.push(enrollment.id)
     }
+  }
+  for (const ids of chunked(activated, IN_CHUNK)) {
+    await supabase.from('campaign_enrollments').update({ status: 'active' }).in('id', ids)
   }
 
   if (queued) log('info', 'engine', 'campaign_scheduler.cycle_completed', `Cycle completed: queued ${queued}/${due.length}`, { details: { queued, total: due.length } })

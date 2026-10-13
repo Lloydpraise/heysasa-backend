@@ -1,4 +1,5 @@
 // Ported 1:1 from db.ts — same queries, same field lists. No logic changes.
+import { log } from './log.js'
 
 // ── Business ──────────────────────────────────────────────────
 export async function getBusiness(s, businessId) {
@@ -18,8 +19,7 @@ export async function getBusiness(s, businessId) {
 }
 
 // ── Contact ───────────────────────────────────────────────────
-export async function getContact(s, contactId) {
-  const { data } = await s.from('contacts').select(`
+export const CONTACT_SELECT = `
     id, name, phone, social_id, country_code, business_id, do_not_contact, follow_up_opted_in,
     lead_state, optimal_contact_hour, follow_up_sequence_id,
     current_sequence_step, follow_up_count, consent_message_sent_at,
@@ -27,8 +27,23 @@ export async function getContact(s, contactId) {
     lifetime_followups_sent, followup_zone, product_interests,
     wa_exists, wa_checked_at,
     lead_type, is_ad_lead, ad_id, original_ad_id, ad_headline, ad_body, ad_platform, ad_source_url
-  `).eq('id', contactId).single()
+  `
+
+export async function getContact(s, contactId) {
+  const { data } = await s.from('contacts').select(CONTACT_SELECT).eq('id', contactId).single()
   return data
+}
+
+// Many contacts in a few requests (same columns as getContact). Returns Map(id -> contact).
+export async function getContactsByIds(s, ids, chunkSize = 200) {
+  const out = new Map()
+  const unique = [...new Set(ids)]
+  for (let i = 0; i < unique.length; i += chunkSize) {
+    const { data, error } = await s.from('contacts').select(CONTACT_SELECT).in('id', unique.slice(i, i + chunkSize))
+    if (error) throw new Error(`Contact lookup failed: ${error.message}`)
+    for (const row of data ?? []) out.set(row.id, row)
+  }
+  return out
 }
 
 // ── Persona Pack ──────────────────────────────────────────────
@@ -39,12 +54,38 @@ export async function getPersonaPack(s, businessId) {
 }
 
 // ── Conversation ──────────────────────────────────────────────
-export async function getConversation(s, contactId, businessId) {
-  const { data } = await s.from('conversations').select(`
-    id, lead_state, lead_quality, lead_stage_ecom, lead_stage_service,
+// NOTE: lead_state lives on contacts, not conversations. Selecting it here made this query fail with
+// "column conversations.lead_state does not exist" for every call, and because the error used to be
+// ignored it silently returned null (so conversation_id was never attached to queued follow-ups,
+// opt-in classification never ran, the stage check and hot-lead alert never worked).
+export const CONVERSATION_SELECT = `
+    id, lead_quality, lead_stage_ecom, lead_stage_service,
     active_agent, last_user_message_at, ai_enabled, customer_intent
-  `).eq('business_id', businessId).eq('contact_id', contactId).maybeSingle()
+  `
+
+export async function getConversation(s, contactId, businessId) {
+  const { data, error } = await s.from('conversations').select(CONVERSATION_SELECT)
+    .eq('business_id', businessId).eq('contact_id', contactId).maybeSingle()
+  if (error) {
+    log('error', 'engine', 'db.get_conversation_failed', `getConversation failed for contact ${contactId}: ${error.message}`, {
+      business_id: businessId, contact_id: contactId, details: { error: error.message, code: error.code }
+    })
+    return null
+  }
   return data
+}
+
+// Conversations for many contacts of one business in a few requests. Returns Map(contact_id -> conversation).
+export async function getConversationsByContactIds(s, contactIds, chunkSize = 200) {
+  const out = new Map()
+  const unique = [...new Set(contactIds)]
+  for (let i = 0; i < unique.length; i += chunkSize) {
+    const { data, error } = await s.from('conversations').select(`${CONVERSATION_SELECT}, contact_id, business_id`)
+      .in('contact_id', unique.slice(i, i + chunkSize))
+    if (error) throw new Error(`Conversation lookup failed: ${error.message}`)
+    for (const row of data ?? []) out.set(`${row.business_id}|${row.contact_id}`, row)
+  }
+  return out
 }
 
 // ── Messages ──────────────────────────────────────────────────

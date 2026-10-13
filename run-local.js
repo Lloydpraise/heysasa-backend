@@ -28,6 +28,8 @@ import { getAiPromptConfig } from './src/services/aiPromptConfig.js';
 import { runProductDiscovery, AlreadyRunningError } from './src/services/productDiscoveryRunner.js';
 import { formatCatalogForPrompt, groundNlpProducts, imageKeyFor } from './src/productDiscovery.js';
 import { billAiUsage } from './src/services/aiBilling.js';
+import { createMessageStore, createPatchBuffer, bulkWrite, bulkDelete } from './src/services/batchIo.js';
+import { createDbGuard } from './src/services/dbGuard.js';
 
 dotenv.config();
 
@@ -60,6 +62,9 @@ const FORCE = requestedAnalysisConfig.force === true || process.env.FORCE_REANAL
 
 const MAX_TRANSCRIPT_MSGS = 100;
 const PAGE_SIZE = 1000;
+// Contacts are processed in batches: messages for the whole batch are read together and the
+// results are written back together. 500 contacts = a handful of requests instead of thousands.
+const BATCH_SIZE = Math.max(50, Number(process.env.ANALYSER_BATCH_SIZE) || 500);
 const CONTACT_DELAY_MIN_MS = 200;
 const CONTACT_DELAY_MAX_MS = 500;
 
@@ -86,8 +91,12 @@ if (!SUPABASE_URL || !SUPABASE_KEY || !OPENAI_KEY) {
     process.exit(1);
 }
 
+// Every Supabase call goes through the guard: per-minute usage summary, de-duplicated error
+// logging (visible in the debug console), a request-rate cap and a circuit breaker.
+const dbGuard = createDbGuard({ label: 'analyser', onLog: (level, event, message) => emit(level, event, message) });
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {
-    auth: { persistSession: false }
+    auth: { persistSession: false },
+    global: { fetch: dbGuard.fetch },
 });
 
 const log  = (tag, msg) => emit('info', tag, msg);
@@ -249,7 +258,7 @@ async function progress(phase, done, total, { force = false } = {}) {
     }
     if (!progressWritesEnabled || !RUN_ID) return;
     const now = Date.now();
-    if (!force && !finished && now - lastProgressWrite < 4000) return;
+    if (!force && !finished && now - lastProgressWrite < 15000) return;
     lastProgressWrite = now;
     try {
         const { error } = await supabase.from('enrichment_runs').update({
@@ -323,16 +332,66 @@ async function resolveActiveInstance() {
 // ─── Direct Database Message Loader ───────────────────────────────────────────
 // Full-history hydration: do not cap recent messages. Ad attribution depends on
 // the first inbound message in the thread, even when the chat has hundreds of rows.
+// Messages are read in bulk: each stage calls messageStore.preload(<batch of contact ids>) and
+// this then answers from memory. A contact that was not preloaded is fetched on its own.
+const messageStore = createMessageStore({ supabase, businessId: () => BUSINESS_ID });
+
 async function fetchContactMessages(contactId) {
-    let messagesQuery = supabase
-        .from('messages')
-        .select('id, direction, type, content, status, raw_payload, created_at')
-        .eq('contact_id', contactId)
-        .eq('business_id', BUSINESS_ID)
-        .order('created_at', { ascending: true });
-    const { data, error } = await messagesQuery;
-    if (error) throw new Error(`Fetch messages failed: ${error.message}`);
-    return data || [];
+    return messageStore.get(contactId);
+}
+
+// ─── Batched writes ───────────────────────────────────────────────────────────
+// Stages queue their results here and flushWrites() sends them ~500 rows at a time.
+let currentStage = 'Batch';
+let writeFailureCount = 0;
+const onWriteFailure = (entityType) => async (id, message) => {
+    writeFailureCount++;
+    await logItemError(currentStage, entityType, id ?? 'batch', `bulk write failed: ${message}`);
+};
+const contactBuffer = createPatchBuffer({ supabase, table: 'contacts', keyColumn: 'id', chunkSize: BATCH_SIZE, onRowError: onWriteFailure('contact'), onNotice: (m) => warn('Batch', m) });
+const conversationByContactBuffer = createPatchBuffer({ supabase, table: 'conversations', keyColumn: 'contact_id', chunkSize: BATCH_SIZE, onRowError: onWriteFailure('conversation'), onNotice: (m) => warn('Batch', m) });
+const conversationByIdBuffer = createPatchBuffer({ supabase, table: 'conversations', keyColumn: 'id', chunkSize: BATCH_SIZE, onRowError: onWriteFailure('conversation'), onNotice: (m) => warn('Batch', m) });
+const pendingClearContactIds = new Set();
+const pendingEnrichmentRows = [];
+const pendingSentimentRows = [];
+const pendingAdAttributions = [];
+
+function beginStage(name) {
+    currentStage = name;
+    writeFailureCount = 0;
+}
+
+async function flushWrites() {
+    if (pendingClearContactIds.size) {
+        const ids = [...pendingClearContactIds];
+        pendingClearContactIds.clear();
+        await bulkDelete({ supabase, table: 'conversation_enrichment', column: 'contact_id', ids, onRowError: onWriteFailure('contact') });
+        await bulkDelete({ supabase, table: 'sentiment_snapshots', column: 'contact_id', ids, onRowError: onWriteFailure('contact') });
+    }
+    if (pendingEnrichmentRows.length) {
+        const rows = pendingEnrichmentRows.splice(0);
+        await bulkWrite({ supabase, table: 'conversation_enrichment', rows, mode: 'upsert', onConflict: 'conversation_id', dedupeKey: (r) => r.conversation_id, chunkSize: BATCH_SIZE, onRowError: onWriteFailure('conversation'), onNotice: (m) => warn('Batch', m) });
+    }
+    if (pendingSentimentRows.length) {
+        const rows = pendingSentimentRows.splice(0);
+        await bulkWrite({ supabase, table: 'sentiment_snapshots', rows, mode: 'insert', chunkSize: BATCH_SIZE, onRowError: onWriteFailure('conversation'), onNotice: (m) => warn('Batch', m) });
+    }
+    if (pendingAdAttributions.length) {
+        const rows = pendingAdAttributions.splice(0);
+        await bulkWrite({ supabase, table: 'ad_attributions', rows, mode: 'upsert', onConflict: 'business_id,ad_id', dedupeKey: (r) => `${r.business_id}|${r.ad_id}`, chunkSize: BATCH_SIZE, onRowError: onWriteFailure('ad'), onNotice: (m) => warn('Batch', m) });
+    }
+    await contactBuffer.flush();
+    await conversationByContactBuffer.flush();
+    await conversationByIdBuffer.flush();
+}
+
+// Called at the top of each loop iteration: at every batch boundary, send the previous batch's
+// writes and read the next batch's messages in one go.
+async function startBatchIfDue(index, items, idOf, needsMessages = () => true) {
+    if (index % BATCH_SIZE !== 0) return;
+    await flushWrites();
+    const slice = items.slice(index, index + BATCH_SIZE).filter(needsMessages).map(idOf);
+    await messageStore.preload(slice);
 }
 
 function applyContactScope(query, column = 'id') {
@@ -494,6 +553,7 @@ function extractAdReferral(rawPayload) {
 
 async function runAdAttributionExtraction() {
     log('AdAttribution', 'Running deterministic ad-signal extraction...');
+    beginStage('AdAttribution');
     let matched = 0, noMatch = 0, noAdId = 0, sampledShapeLogged = false;
 
     let contactsQuery = applyContactScope(supabase
@@ -513,7 +573,8 @@ async function runAdAttributionExtraction() {
 
     let adDone = 0;
     const guard = new FailureGuard('Ad attribution');
-    for (const contact of contacts) {
+    for (const [adIndex, contact] of contacts.entries()) {
+        await startBatchIfDue(adIndex, contacts, (c) => c.id);
         await progress('ads', ++adDone, contacts.length);
         try {
             const messages = await fetchContactMessages(contact.id);
@@ -535,7 +596,7 @@ async function runAdAttributionExtraction() {
                 continue;
             }
 
-            await supabase.from('contacts').update({
+            contactBuffer.add(contact.id, {
                 is_ad_lead: true,
                 ad_id: ad.ad_id,
                 ad_platform: ad.ad_platform,
@@ -543,10 +604,10 @@ async function runAdAttributionExtraction() {
                 ad_body: ad.ad_body,
                 ad_thumbnail_url: ad.ad_thumbnail_url,
                 ad_attributed_at: new Date().toISOString()
-            }).eq('id', contact.id);
+            });
 
             if (ad.ad_id) {
-                const { error: adUpsertError } = await supabase.from('ad_attributions').upsert({
+                pendingAdAttributions.push({
                     business_id: contact.business_id,
                     ad_id: ad.ad_id,
                     ad_platform: ad.ad_platform,
@@ -557,8 +618,7 @@ async function runAdAttributionExtraction() {
                     ad_source_url: ad.ad_source_url,
                     ad_media_type: ad.ad_media_type,
                     updated_at: new Date().toISOString()
-                }, { onConflict: 'business_id,ad_id' });
-                if (adUpsertError) throw new Error(`ad_attributions upsert failed: ${adUpsertError.message}`);
+                });
                 matched++;
             } else {
                 noAdId++;
@@ -569,8 +629,9 @@ async function runAdAttributionExtraction() {
             await logItemError('AdAttribution', 'contact', contact.id, e.message);
             guard.fail(e.message);
         }
-        await sleepBetweenContacts();
     }
+    await flushWrites();
+    if (writeFailureCount) warn('AdAttribution', `${writeFailureCount} row(s) could not be written; see enrichment_errors.`);
     log('AdAttribution', `✓ ${matched} matched with ad_id, ${noAdId} matched without ad_id, ${noMatch} no referral found.`);
 }
 
@@ -723,16 +784,10 @@ async function assertMigrationApplied() {
 
 // A contact that is not a customer must leave no analysis behind: not on the
 // contact, the conversation, the enrichment rows or the sentiment history.
-async function clearAnalysisFor(contactId, businessId) {
-    const { error: enrichError } = await supabase.from('conversation_enrichment').delete().eq('contact_id', contactId);
-    if (enrichError) throw new Error(`conversation_enrichment cleanup failed: ${enrichError.message}`);
-    const { error: sentimentError } = await supabase.from('sentiment_snapshots').delete().eq('contact_id', contactId);
-    if (sentimentError) throw new Error(`sentiment_snapshots cleanup failed: ${sentimentError.message}`);
-    const { error: convError } = await supabase.from('conversations')
-        .update({ is_business_chat: false, lead_quality: null, customer_intent: null, psychology: null, vibe_check: null, context_summary: null })
-        .eq('contact_id', contactId)
-        .eq('business_id', businessId);
-    if (convError) throw new Error(`conversation cleanup failed: ${convError.message}`);
+// Queued, not written: the deletes and the conversation reset go out with the rest of the batch.
+function clearAnalysisFor(contactId) {
+    pendingClearContactIds.add(contactId);
+    conversationByContactBuffer.add(contactId, { is_business_chat: false, lead_quality: null, customer_intent: null, psychology: null, vibe_check: null, context_summary: null });
 }
 
 const NON_CUSTOMER_CONTACT_RESET = {
@@ -752,6 +807,7 @@ function classificationExcerpt(messages) {
 
 async function runClassificationPass() {
     log('Classify', 'Starting personal/business separation pass...');
+    beginStage('Classify');
     const counts = { business: 0, personal: 0, junk: 0, vendor: 0, staff: 0, unknown: 0, skipped: 0, errored: 0 };
 
     let bizRow = null;
@@ -780,9 +836,17 @@ async function runClassificationPass() {
     }
     log('Classify', `${contacts.length} contacts to consider.`);
 
+    // Contacts that will be skipped without reading their chat are not worth loading messages for.
+    const classifyNeedsMessages = (c) => {
+        const protectedManual = c.lead_type_source === 'manual' || (c.lead_type === 'personal' && !c.lead_type_source);
+        if (protectedManual) return false;
+        const done = !!c.lead_type_classified_at && c.classifier_version === CLASSIFIER_VERSION;
+        return !(done && !FORCE && c.lead_type !== 'unknown');
+    };
     let reviewLogged = 0, classifyDone = 0;
     const guard = new FailureGuard('Classify');
-    for (const contact of contacts) {
+    for (const [classifyIndex, contact] of contacts.entries()) {
+        await startBatchIfDue(classifyIndex, contacts, (c) => c.id, classifyNeedsMessages);
         await progress('classify', ++classifyDone, contacts.length);
         try {
             // A person's manual choice, or a personal label set before source tracking existed, is never overridden.
@@ -842,23 +906,16 @@ async function runClassificationPass() {
             // Anything that is not a confirmed customer chat carries no lead scores.
             if (decision.leadType !== 'business') Object.assign(update, NON_CUSTOMER_CONTACT_RESET);
 
-            const { error: contactError } = await supabase.from('contacts').update(update).eq('id', contact.id);
-            if (contactError) throw new Error(`contact classification write failed: ${contactError.message}`);
+            contactBuffer.add(contact.id, update);
 
             if (decision.leadType === 'business') {
-                const { error: convError } = await supabase.from('conversations')
-                    .update({ is_business_chat: true })
-                    .eq('contact_id', contact.id)
-                    .eq('business_id', contact.business_id);
-                if (convError) throw new Error(`conversation flag write failed: ${convError.message}`);
+                conversationByContactBuffer.add(contact.id, { is_business_chat: true });
             } else {
                 // Old analysis of a chat now known not to be a customer chat must not leak into anything downstream.
                 // 'unknown' keeps its flag as null so nothing treats it as confirmed either way.
-                await clearAnalysisFor(contact.id, contact.business_id);
+                clearAnalysisFor(contact.id);
                 if (decision.leadType === 'unknown') {
-                    const { error: unknownError } = await supabase.from('conversations')
-                        .update({ is_business_chat: null }).eq('contact_id', contact.id).eq('business_id', contact.business_id);
-                    if (unknownError) throw new Error(`conversation flag write failed: ${unknownError.message}`);
+                    conversationByContactBuffer.add(contact.id, { is_business_chat: null });
                 }
             }
 
@@ -876,6 +933,8 @@ async function runClassificationPass() {
         }
         await sleepBetweenContacts();
     }
+    await flushWrites();
+    counts.errored += writeFailureCount;
     logCacheStats('Classify');
     log('Classify', `✓ customers ${counts.business}, vendors ${counts.vendor}, staff ${counts.staff}, personal ${counts.personal}, junk ${counts.junk}, unknown ${counts.unknown} (needs review), skipped ${counts.skipped}, errored ${counts.errored}.`);
     return counts;
@@ -884,6 +943,7 @@ async function runClassificationPass() {
 // ─── Step 2: Structural Enrichment Pass ───────────────────────────────────────
 async function runStructuralEnrichment() {
     log('Structural', 'Starting structural calculation pass...');
+    beginStage('Structural');
     let enriched = 0, errored = 0;
 
     // Confirmed business contacts only. Personal, junk and unknown are never scored.
@@ -910,7 +970,8 @@ async function runStructuralEnrichment() {
 
     let structuralDone = 0;
     const guard = new FailureGuard('Structural');
-    for (const contact of contacts) {
+    for (const [structuralIndex, contact] of contacts.entries()) {
+        await startBatchIfDue(structuralIndex, contacts, (c) => c.id);
         await progress('structural', ++structuralDone, contacts.length);
         try {
             const messages = await fetchContactMessages(contact.id);
@@ -950,7 +1011,7 @@ async function runStructuralEnrichment() {
                 daysSinceLastInbound: lastInbound ? daysSince : null
             });
 
-            const { error: updateError } = await supabase.from('contacts').update({
+            contactBuffer.add(contact.id, {
                 lead_state:              newLeadState,
                 read_receipt:            readReceipt,
                 sent_voice_note:         mediaFlags.sent_voice_note,
@@ -963,9 +1024,7 @@ async function runStructuralEnrichment() {
                 lead_quality:            leadQuality,
                 follow_up_urgency:       followUpUrgency,
                 structural_enriched_at:  new Date().toISOString()
-            }).eq('id', contact.id);
-
-            if (updateError) throw new Error(updateError.message);
+            });
             enriched++;
             guard.ok();
         } catch (e) {
@@ -974,8 +1033,10 @@ async function runStructuralEnrichment() {
             await logItemError('Structural', 'contact', contact.id, e.message);
             guard.fail(e.message);
         }
-        await sleepBetweenContacts();
     }
+    await flushWrites();
+    errored += writeFailureCount;
+    enriched = Math.max(0, enriched - writeFailureCount);
     log('Structural', `✓ ${enriched} contacts updated, ${errored} errored.`);
     return { enriched, errored };
 }
@@ -1025,6 +1086,29 @@ async function runNLPExtraction(transcript, businessContext, productsCatalog, st
     }
 }
 
+// One read per business (instead of one per conversation): source_ref -> [product_id].
+const imageMentionIndexes = new Map();
+async function getImageMentionIndex(businessId) {
+    if (!imageMentionIndexes.has(businessId)) {
+        imageMentionIndexes.set(businessId, (async () => {
+            const rows = await fetchAllPages((from, to) => supabase.from('product_mentions')
+                .select('source_ref, product_id')
+                .eq('business_id', businessId)
+                .eq('kind', 'image')
+                .order('source_ref', { ascending: true })
+                .order('product_id', { ascending: true })
+                .range(from, to));
+            const index = new Map();
+            for (const row of rows) {
+                if (!index.has(row.source_ref)) index.set(row.source_ref, []);
+                index.get(row.source_ref).push(row.product_id);
+            }
+            return index;
+        })());
+    }
+    return imageMentionIndexes.get(businessId);
+}
+
 async function loadConversationImageProducts(businessId, messages, catalog) {
     const imageKeys = [...new Set(messages
         .filter(m => !isInbound(m) && m.type === 'image')
@@ -1032,16 +1116,17 @@ async function loadConversationImageProducts(businessId, messages, catalog) {
         .filter(Boolean))];
     if (!imageKeys.length) return [];
 
-    const { data, error } = await supabase.from('product_mentions')
-        .select('product_id')
-        .eq('business_id', businessId)
-        .eq('kind', 'image')
-        .in('source_ref', imageKeys);
-    if (error) throw new Error(`Image product lookup failed: ${error.message}`);
+    let index;
+    try {
+        index = await getImageMentionIndex(businessId);
+    } catch (error) {
+        throw new Error(`Image product lookup failed: ${error.message}`);
+    }
 
     const seen = new Set();
-    return (data || [])
-        .map(row => String(row.product_id))
+    return imageKeys
+        .flatMap(key => index.get(key) || [])
+        .map(productId => String(productId))
         .filter(id => {
             if (!catalog.has(id) || seen.has(id)) return false;
             seen.add(id);
@@ -1050,15 +1135,21 @@ async function loadConversationImageProducts(businessId, messages, catalog) {
         .map(id => ({ id, ...catalog.get(id) }));
 }
 
-async function applyNLPResults(businessId, contactId, conversationId, rawNlp, callRunId, promptTokens, completionTokens, signals, text, catalog = new Map(), conversationImageProductIds = new Set()) {
+async function applyNLPResults(businessId, contactId, conversationId, rawNlp, callRunId, promptTokens, completionTokens, signals, text, catalog = new Map(), conversationImageProductIds = new Set(), contactRow = null) {
     if (!rawNlp) return { flags: [] };
 
-    const { data: existingContact, error: existingError } = await supabase
-        .from('contacts')
-        .select('product_interests, lead_type, lead_state, intent_score')
-        .eq('id', contactId)
-        .single();
-    if (existingError) throw new Error(`contact lookup failed: ${existingError.message}`);
+    // The conversations query already carried these columns for the whole batch; only fall back to a
+    // single-row lookup if they are missing.
+    let existingContact = contactRow;
+    if (!existingContact || existingContact.lead_state === undefined || existingContact.intent_score === undefined || existingContact.product_interests === undefined) {
+        const { data, error: existingError } = await supabase
+            .from('contacts')
+            .select('product_interests, lead_type, lead_state, intent_score')
+            .eq('id', contactId)
+            .single();
+        if (existingError) throw new Error(`contact lookup failed: ${existingError.message}`);
+        existingContact = data;
+    }
 
     // The separation step owns this decision; analysis never writes to non-business contacts.
     if (existingContact.lead_type !== 'business') {
@@ -1085,7 +1176,7 @@ async function applyNLPResults(businessId, contactId, conversationId, rawNlp, ca
     // staff / personal), the contact leaves the pipeline instead of being scored.
     if (nlp.relationship_check !== 'customer') {
         const demotedTo = nlp.relationship_check;
-        const { error: demoteError } = await supabase.from('contacts').update({
+        contactBuffer.add(contactId, {
             lead_type: demotedTo,
             lead_type_source: 'nlp',
             lead_type_reason: `Analysis found the other person is ${demotedTo}: "${nlp.relationship_evidence}"`.slice(0, 300),
@@ -1093,9 +1184,8 @@ async function applyNLPResults(businessId, contactId, conversationId, rawNlp, ca
             lead_type_classified_at: new Date().toISOString(),
             classifier_version: CLASSIFIER_VERSION,
             ...NON_CUSTOMER_CONTACT_RESET,
-        }).eq('id', contactId);
-        if (demoteError) throw new Error(`contact demotion failed: ${demoteError.message}`);
-        await clearAnalysisFor(contactId, businessId);
+        });
+        clearAnalysisFor(contactId);
         warn('NLP', `Contact ${contactId} moved out of the pipeline as ${demotedTo}: ${nlp.relationship_evidence}`);
         return { flags: [...flags, 'reclassified_out_of_pipeline'] };
     }
@@ -1117,7 +1207,7 @@ async function applyNLPResults(businessId, contactId, conversationId, rawNlp, ca
         daysSinceLastInbound: signals.days_since_last_inbound
     });
 
-    const { error: enrichmentError } = await supabase.from('conversation_enrichment').upsert({
+    pendingEnrichmentRows.push({
         conversation_id:        conversationId,
         contact_id:             contactId,
         conv_stage:             nlp.conv_stage             || null,
@@ -1130,17 +1220,15 @@ async function applyNLPResults(businessId, contactId, conversationId, rawNlp, ca
         product_tags:           nlp.product_tags           || [],
         matched_products:       nlp.matched_products       || [],
         last_enriched_at:       new Date().toISOString(),
-    }, { onConflict: 'conversation_id' });
-    if (enrichmentError) throw new Error(`conversation_enrichment write failed: ${enrichmentError.message}`);
+    });
 
     if (nlp.sentiment_score !== null && nlp.sentiment_score !== undefined) {
-        const { error: sentimentError } = await supabase.from('sentiment_snapshots').insert({
+        pendingSentimentRows.push({
             business_id: businessId,
             contact_id: contactId,
             conversation_id: conversationId,
             sentiment_score: nlp.sentiment_score,
         });
-        if (sentimentError) throw new Error(`sentiment_snapshots write failed: ${sentimentError.message}`);
     }
 
     const convUpdate = { lead_quality: leadQuality };
@@ -1148,8 +1236,7 @@ async function applyNLPResults(businessId, contactId, conversationId, rawNlp, ca
     if (nlp.customer_intent) convUpdate.customer_intent = nlp.customer_intent;
     if (nlp.psychology)      convUpdate.psychology      = nlp.psychology;
     if (nlp.vibe_check)      convUpdate.vibe_check      = nlp.vibe_check;
-    const { error: conversationError } = await supabase.from('conversations').update(convUpdate).eq('id', conversationId);
-    if (conversationError) throw new Error(`conversation write failed: ${conversationError.message}`);
+    conversationByIdBuffer.add(conversationId, convUpdate);
 
     const matchedNames = (nlp.matched_products || []).map(p => p?.product_name).filter(Boolean);
     const mergedInterests = [...new Set([
@@ -1170,8 +1257,7 @@ async function applyNLPResults(businessId, contactId, conversationId, rawNlp, ca
     if (nlp.lead_summary) contactUpdate.lead_summary = nlp.lead_summary;
     if (mergedInterests.length > 0) contactUpdate.product_interests = mergedInterests;
 
-    const { error: contactError } = await supabase.from('contacts').update(contactUpdate).eq('id', contactId);
-    if (contactError) throw new Error(`contact write failed: ${contactError.message}`);
+    contactBuffer.add(contactId, contactUpdate);
 
     return { flags };
 }
@@ -1215,6 +1301,7 @@ async function runProductDiscoveryPhase() {
 
 async function runNLPPass() {
     log('NLP', 'Starting AI extraction pass...');
+    beginStage('NLP');
     let enrichedCount = 0, errored = 0, skipped = 0;
     const flagCounts = {};
 
@@ -1223,7 +1310,7 @@ async function runNLPPass() {
         .from('conversations')
         .select(`
             id, business_id, contact_id,
-            contacts!inner ( id, lead_type, nlp_enriched_at, analysis_version )
+            contacts!inner ( id, lead_type, lead_state, intent_score, product_interests, nlp_enriched_at, analysis_version )
         `), 'contact_id')
         .eq('contacts.lead_type', 'business')
         .order('id');
@@ -1257,7 +1344,8 @@ async function runNLPPass() {
 
     let nlpDone = 0;
     const guard = new FailureGuard('NLP');
-    for (const conv of conversations) {
+    for (const [nlpIndex, conv] of conversations.entries()) {
+        await startBatchIfDue(nlpIndex, conversations, (c) => c.contact_id, (c) => !!c.business_id && !!c.contact_id);
         await progress('nlp', ++nlpDone, conversations.length);
         try {
             if (!conv.business_id || !conv.contact_id) {
@@ -1378,7 +1466,8 @@ async function runNLPPass() {
                 businessId, conv.contact_id, conv.id, result.nlp,
                 callRunId, result.promptTokens, result.completionTokens,
                 structuralSignals, text, productCatalog.map,
-                new Set(conversationImageProducts.map(p => p.id))
+                new Set(conversationImageProducts.map(p => p.id)),
+                contact
             );
             for (const f of applied.flags) flagCounts[f] = (flagCounts[f] || 0) + 1;
             enrichedCount++;
@@ -1392,6 +1481,9 @@ async function runNLPPass() {
         }
         await sleepBetweenContacts();
     }
+    await flushWrites();
+    errored += writeFailureCount;
+    enrichedCount = Math.max(0, enrichedCount - writeFailureCount);
     const flagSummary = Object.entries(flagCounts).map(([k, v]) => `${k}=${v}`).join(', ') || 'none';
     logCacheStats('NLP');
     log('NLP', `✓ ${enrichedCount} enriched, ${errored} errored, ${skipped} skipped. Guard flags: ${flagSummary}.`);
@@ -1438,19 +1530,13 @@ async function recomputeAdAttributionRollups() {
         if (c.lead_state === 'won') g.conversion_count++;
     }
 
-    let updated = 0;
-    for (const rollup of groups.values()) {
-        try {
-            const { error } = await supabase.from('ad_attributions').upsert({
-                ...rollup,
-                updated_at: new Date().toISOString()
-            }, { onConflict: 'business_id,ad_id' });
-            if (error) throw new Error(error.message);
-            updated++;
-        } catch (e) {
-            await logItemError('AdAttribution', 'ad_rollup', `${rollup.business_id}:${rollup.ad_id}`, e.message);
-        }
-    }
+    beginStage('AdAttribution');
+    const rollupRows = [...groups.values()].map(rollup => ({ ...rollup, updated_at: new Date().toISOString() }));
+    const { written: updated } = await bulkWrite({
+        supabase, table: 'ad_attributions', rows: rollupRows, mode: 'upsert', onConflict: 'business_id,ad_id',
+        dedupeKey: (r) => `${r.business_id}|${r.ad_id}`, chunkSize: BATCH_SIZE,
+        onRowError: onWriteFailure('ad_rollup'), onNotice: (m) => warn('Batch', m),
+    });
     log('AdAttribution', `✓ Rolled up counts for ${updated} ads.`);
 }
 

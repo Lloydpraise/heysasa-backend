@@ -7,8 +7,15 @@ import { runActivityPatterns } from './activityPatterns.js'
 import { runLeadTemperatureReview } from './leadTemperatureReview.js'
 import { runAutoListSync } from './autoListSync.js'
 import { log } from '../lib/log.js'
+import { isAnalysisActive, onAnalysisFinished, deferUntilAnalysisEnds } from '../lib/analysisGate.js'
 
 const RETRY_MS = 60_000
+// Realtime events can arrive many times a second (the analyser rewrites contacts in bulk, every send updates
+// follow_up_queue). Event-driven runs of a job are therefore limited to one per gap, with one trailing run so
+// the last change is never missed. Timers and startup runs are not throttled.
+const EVENT_GAP_MS = parseInt(process.env.ENGINE_EVENT_GAP_MS ?? '5000')
+const CONTACT_EVENT_GAP_MS = parseInt(process.env.ENGINE_CONTACT_EVENT_GAP_MS ?? '15000')
+const CONTACT_QUIET_MS = 10_000
 const QUIET_MS = 150
 // Customer profile + auto-list syncs are heavy Postgres functions (sync_auto_lists averages ~3s).
 // Debounce them hard so a burst of inbound messages triggers one run, not hundreds.
@@ -60,6 +67,35 @@ function afterQuiet(key, callback, delay = QUIET_MS) {
     safely(key, callback)
   }, delay)
   timers.set(key, { at: Date.now() + delay, timer })
+}
+
+const lastEventRun = new Map()
+const trailingEvent = new Map()
+
+function mergeEventArgs(a, b) {
+  return a.length && b.length ? [{ ...a[0], ...b[0], seed: a[0]?.seed === true || b[0]?.seed === true }] : (b.length ? b : a)
+}
+
+// Leading + trailing throttle in front of invoke(): the first event runs now, further events inside the gap
+// collapse into ONE run when the gap ends (seed flags are OR-ed together, like invoke() does for pending runs).
+function invokeThrottled(name, fn, args = [], gapMs = EVENT_GAP_MS) {
+  const wait = (lastEventRun.get(name) ?? 0) + gapMs - Date.now()
+  if (wait <= 0 && !trailingEvent.has(name)) {
+    lastEventRun.set(name, Date.now())
+    return invoke(name, fn, args)
+  }
+  const waiting = trailingEvent.get(name)
+  if (waiting) {
+    waiting.args = mergeEventArgs(waiting.args, args)
+    return
+  }
+  const entry = { args, timer: null }
+  entry.timer = setTimeout(() => {
+    trailingEvent.delete(name)
+    lastEventRun.set(name, Date.now())
+    safely(`throttled:${name}`, () => invoke(name, fn, entry.args))
+  }, Math.max(0, wait))
+  trailingEvent.set(name, entry)
 }
 
 function invoke(name, fn, args = []) {
@@ -216,6 +252,30 @@ function onStageRequest(payload) {
   }, true)
 }
 
+// Everything a burst of contact changes would have triggered, run once.
+function runContactCatchUp() {
+  void invoke('Scheduler', runScheduler)
+  void invoke('CampaignScheduler', runCampaignScheduler, [{ seed: true }])
+  void invoke('LeadTemperatureReview', runLeadTemperatureReview)
+  void invoke('CustomerProfiles', runCustomerProfileSync)
+  void invoke('AutoListSync', runAutoListSync)
+  void armDueWork().catch((e) => log('error', 'engine', 'engine.due_schedule_failed', e.message))
+}
+onAnalysisFinished(runContactCatchUp)
+
+async function onContactChange(payload) {
+  if (await isAnalysisActive()) {
+    deferUntilAnalysisEnds()
+    return
+  }
+  if (payload.new?.id) {
+    afterQuiet('LeadTemperatureReview', () => void invoke('LeadTemperatureReview', runLeadTemperatureReview), CONTACT_QUIET_MS)
+    invokeThrottled('CampaignScheduler', runCampaignScheduler, [{ seed: false }], CONTACT_EVENT_GAP_MS)
+  }
+  afterQuiet('CustomerProfiles', () => void invoke('CustomerProfiles', runCustomerProfileSync), HEAVY_QUIET_MS)
+  afterQuiet('AutoListSync', () => void invoke('AutoListSync', runAutoListSync), HEAVY_QUIET_MS)
+}
+
 function subscribe() {
   const channel = supabase.channel('follow-up-scheduler-events')
   const watch = (table, callback, event = '*') => {
@@ -223,28 +283,22 @@ function subscribe() {
   }
 
   watch('follow_up_queue', (payload) => {
-    void invoke('Scheduler', runScheduler)
+    invokeThrottled('Scheduler', runScheduler)
     if (payload.eventType === 'UPDATE' && payload.new?.status === 'sent' && payload.new?.next_step_processed === false) {
       void invoke('Reconciliation', runPostSendReconciliation)
     }
   })
-  watch('campaign_enrollments', () => void invoke('CampaignScheduler', runCampaignScheduler, [{ seed: false }]))
-  watch('campaigns', () => void invoke('CampaignScheduler', runCampaignScheduler, [{ seed: true }]))
-  watch('campaign_steps', () => void invoke('CampaignScheduler', runCampaignScheduler, [{ seed: true }]))
+  watch('campaign_enrollments', () => invokeThrottled('CampaignScheduler', runCampaignScheduler, [{ seed: false }]))
+  // Campaign edits come from a person clicking in the dashboard: first one runs immediately, bursts collapse.
+  watch('campaigns', () => invokeThrottled('CampaignScheduler', runCampaignScheduler, [{ seed: true }], 1000))
+  watch('campaign_steps', () => invokeThrottled('CampaignScheduler', runCampaignScheduler, [{ seed: true }], 1000))
   watch('list_members', () => {
-    void invoke('CampaignScheduler', runCampaignScheduler, [{ seed: true }])
+    invokeThrottled('CampaignScheduler', runCampaignScheduler, [{ seed: true }])
     afterQuiet('AutoListSync', () => void invoke('AutoListSync', runAutoListSync), HEAVY_QUIET_MS)
   })
-  watch('businesses', () => void invoke('CampaignScheduler', runCampaignScheduler, [{ seed: false }]))
-  watch('whatsapp_sessions', () => void invoke('CampaignScheduler', runCampaignScheduler, [{ seed: false }]))
-  watch('contacts', (payload) => {
-    if (payload.new?.id) {
-      afterQuiet('LeadTemperatureReview', () => void invoke('LeadTemperatureReview', runLeadTemperatureReview))
-      void invoke('CampaignScheduler', runCampaignScheduler, [{ seed: false }])
-    }
-    afterQuiet('CustomerProfiles', () => void invoke('CustomerProfiles', runCustomerProfileSync), HEAVY_QUIET_MS)
-    afterQuiet('AutoListSync', () => void invoke('AutoListSync', runAutoListSync), HEAVY_QUIET_MS)
-  })
+  watch('businesses', () => invokeThrottled('CampaignScheduler', runCampaignScheduler, [{ seed: false }]))
+  watch('whatsapp_sessions', () => invokeThrottled('CampaignScheduler', runCampaignScheduler, [{ seed: false }]))
+  watch('contacts', (payload) => { void onContactChange(payload) })
   watch('conversations', (payload) => {
     onStageRequest(payload)
     afterQuiet('AutoListSync', () => void invoke('AutoListSync', runAutoListSync), HEAVY_QUIET_MS)
