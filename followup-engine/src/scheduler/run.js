@@ -8,6 +8,7 @@ import { runLeadTemperatureReview } from './leadTemperatureReview.js'
 import { runAutoListSync } from './autoListSync.js'
 import { log } from '../lib/log.js'
 import { runAdIntake } from '../followupAi/adIntake.js'
+import { createSwitchWatch } from '../followupAi/switchWatch.js'
 import { ensureDefaultSkills } from '../followupAi/skills.js'
 import { isAnalysisActive, onAnalysisFinished, deferUntilAnalysisEnds } from '../lib/analysisGate.js'
 
@@ -305,7 +306,12 @@ function subscribe() {
     const row = payload.new
     if (row && (row.status === 'pending' || row.regenerate_requested_at)) afterQuiet('AdIntake', () => void invoke('AdIntake', runAdIntake), 2_000)
   })
-  watch('businesses', () => invokeThrottled('CampaignScheduler', runCampaignScheduler, [{ seed: false }]))
+  // The owner switching the Follow-up AI on starts the ad intake right away, so plans for the ads already found get written now.
+  const followupAiSwitch = createSwitchWatch()
+  watch('businesses', (payload) => {
+    invokeThrottled('CampaignScheduler', runCampaignScheduler, [{ seed: false }])
+    if (followupAiSwitch.switchedOn(payload.new)) afterQuiet('AdIntake', () => void invoke('AdIntake', runAdIntake), 2_000)
+  })
   watch('whatsapp_sessions', () => invokeThrottled('CampaignScheduler', runCampaignScheduler, [{ seed: false }]))
   watch('contacts', (payload) => { void onContactChange(payload) })
   watch('conversations', (payload) => {

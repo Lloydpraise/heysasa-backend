@@ -36,6 +36,8 @@ import { getPublicStats } from './services/publicStatsService.js';
 import { checkOpenAIAvailability, getOpenAIAvailabilityState } from './services/openAiGate.js';
 import personaRoutes from './personaRoutes.js';
 import setupRoutes, { resumeSetups } from './setup/setupRoutes.js';
+import homeRoutes from './setup/homeRoutes.js';
+import { buildReadyNotifier } from './setup/readyNotifierRuntime.js';
 import productRoutes from './productRoutes.js';
 import followupSettingsRoutes from './followupSettingsRoutes.js';
 import { createAssistantRouterForApp } from './businessAi/index.js';
@@ -644,6 +646,7 @@ app.get('/analysis/status', async (req, res, next) => {
 
 app.use(personaRoutes);
 app.use(setupRoutes);
+app.use(homeRoutes);
 app.use(productRoutes);
 app.use(followupSettingsRoutes);
 // Ask HeySasa, the business assistant (conversations, notes, preferences). Streams over Server-Sent Events.
@@ -912,6 +915,7 @@ app.listen(PORT, () => {
     console.log(`heysasa backend listening on port ${PORT}`);
     // A restart kills any setup that was running: pick those back up.
     resumeSetups().catch((error) => console.error('resumeSetups failed:', error.message));
+    buildReadyNotifier().start();   // sends the one-time "set up is done" WhatsApp when first approvals exist
 });
 
 process.once('SIGINT', stopProcesses);

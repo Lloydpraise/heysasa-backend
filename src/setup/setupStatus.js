@@ -46,7 +46,7 @@ export function plainMessage(setup) {
     }
 }
 
-// counts: { chats, customers, filtered_out, analysed, products }
+// counts: { chats, customers, filtered_out, analysed, ready_to_buy, products }
 export function shapeSetupStatus({ setup, run = null, counts = {} }) {
     const homeReady = isHomeReady(setup);
     return {
@@ -62,6 +62,7 @@ export function shapeSetupStatus({ setup, run = null, counts = {} }) {
             customers: Number(counts.customers || 0),
             filtered_out: Number(counts.filtered_out || 0),
             analysed: Number(counts.analysed || 0),
+            ready_to_buy: Number(counts.ready_to_buy || 0),
             products: Number(counts.products || 0),
         },
         answers: setup?.answers || {},

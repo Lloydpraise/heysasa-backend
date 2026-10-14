@@ -8,8 +8,8 @@ const MAX_IDS = 20_000;
 
 // Where "newest chat first" lives is not the same in every database yet, so try the likely columns in turn.
 const RECENCY_CANDIDATES = [
+    { table: 'contacts', order: 'last_inbound_at', pick: 'id' },   // the Leads page reads last_inbound_at from contacts
     { table: 'conversations', order: 'last_inbound_at', pick: 'contact_id' },
-    { table: 'contacts', order: 'last_inbound_at', pick: 'id' },
     { table: 'conversations', order: 'last_message_at', pick: 'contact_id' },
     { table: 'contacts', order: 'id', pick: 'id' },   // always works: newest-created first
 ];

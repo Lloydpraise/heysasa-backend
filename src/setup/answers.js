@@ -21,6 +21,10 @@ export function validateAnswers(body) {
         if (!Array.isArray(body.handoff) || body.handoff.some((r) => !HANDOFF_REASONS.includes(r))) return { error: 'invalid_handoff' };
         out.handoff = [...new Set(body.handoff)];
     }
+    if (body?.finished !== undefined) {   // the owner has finished (or skipped) the setup screens: Home switches to daily mode
+        if (typeof body.finished !== 'boolean') return { error: 'invalid_finished' };
+        out.finished = body.finished;
+    }
     if (body?.products !== undefined) {
         const clean = (list) => (Array.isArray(list) ? list : []).filter((v) => (typeof v === 'string' && v.trim()) || Number.isSafeInteger(v));
         const approve = clean(body.products?.approve), dismiss = clean(body.products?.dismiss);
