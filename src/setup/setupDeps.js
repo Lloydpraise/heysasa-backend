@@ -2,6 +2,7 @@
 // (the same ones the admin console uses) for the analyser, persona pack and product discovery.
 import { supabase } from '../config/supabase.js';
 import { logEvent } from '../services/debugConsole.js';
+import { decideStarterCredit, starterAmountFromEnv } from './starterCredit.js';
 
 const PAGE = 1000;
 const MAX_IDS = 20_000;
@@ -79,6 +80,26 @@ export function buildSetupDeps() {
                 .eq('business_id', businessId).in('run_type', ['full_pass', 'contact_pass']).gte('started_at', sinceIso)
                 .order('started_at', { ascending: false }).limit(1);
             return data?.[0] || null;
+        },
+
+        // One-time starter balance, only when SETUP_STARTER_CREDIT_USD is set. Returns the decision (never throws on "no").
+        async grantStarterCredit(businessId) {
+            const amountUsd = starterAmountFromEnv();
+            if (!amountUsd) return { grant: false, reason: 'off' };
+            const [setup, business, balance] = await Promise.all([
+                this.store.get(businessId),
+                supabase.from('businesses').select('business_type').eq('business_id', businessId).maybeSingle(),
+                supabase.from('business_balances').select('balance_usd').eq('business_id', businessId).maybeSingle(),
+            ]);
+            const decision = decideStarterCredit({
+                amountUsd, alreadyGiven: Boolean(setup?.starter_credit_at),
+                balanceUsd: balance.data ? Number(balance.data.balance_usd) : null, businessType: business.data?.business_type,
+            });
+            if (!decision.grant) return decision;
+            const { error } = await supabase.rpc('admin_credit_wallet', { p_business_id: businessId, p_currency: 'USD', p_amount: amountUsd, p_note: 'Starter credit' });
+            if (error) throw new Error(`starter credit failed: ${error.message}`);
+            await this.store.upsert(businessId, { starter_credit_at: new Date().toISOString() });
+            return decision;
         },
 
         launch: call,

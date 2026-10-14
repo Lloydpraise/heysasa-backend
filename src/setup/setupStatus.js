@@ -66,6 +66,7 @@ export function shapeSetupStatus({ setup, run = null, counts = {} }) {
             products: Number(counts.products || 0),
         },
         answers: setup?.answers || {},
+        timings: setup?.timings || {},
         error: setup?.status === 'failed' ? (setup.error || 'setup_failed') : null,
         started_at: setup?.started_at || null,
         home_ready_at: setup?.home_ready_at || null,

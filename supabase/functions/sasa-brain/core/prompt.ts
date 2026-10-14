@@ -54,10 +54,12 @@ function renderPersona(pack: Persona): string {
 export function buildInstructions(args: {
   businessName: string; currency: string | null; persona: Persona;
   categories: Array<{ name: string; count: number }>; skillMenu: Array<Pick<Skill, 'key' | 'title' | 'when_to_use'>>;
+  ownerRules?: string;   // opening hours and hand-off rules the owner set during setup (see ownerRules.ts)
 }): string {
   const parts = [CORE_RULES, `BUSINESS\nName: ${args.businessName}${args.currency ? `\nCurrency: ${args.currency}` : ''}`];
   const persona = renderPersona(args.persona);
   if (persona) parts.push(`PERSONA AND PLAYBOOK\n${persona}`);
+  if (args.ownerRules) parts.push(args.ownerRules);
   if (args.categories.length) parts.push(`WHAT THE BUSINESS SELLS (categories, with number of items)\n${args.categories.map((c) => `${c.name} (${c.count})`).join(', ')}\nUse search_products to find the actual items.`);
   const menu = [...args.skillMenu].sort((a, b) => a.key.localeCompare(b.key));
   parts.push(menu.length

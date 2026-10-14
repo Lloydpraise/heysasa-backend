@@ -7,6 +7,7 @@
 // The Playground (simulate) skips the cache entirely, so an owner who edits a skill and tests it sees the edit at once.
 
 import type { TurnContext, TurnInput } from './turn.ts';
+import { renderOwnerRules } from './ownerRules.ts';
 import type { CustomerFile, HistoryMessage, Skill } from './prompt.ts';
 import type { Flow } from './flows.ts';
 import type { ToolRow } from './tools.ts';
@@ -19,9 +20,9 @@ const clamp = (n: unknown, min: number, max: number, fallback: number) => {
 
 export function readSettings(raw: Record<string, unknown> | null | undefined) {
   const s = raw ?? {};
-  // 'medium' is the default (what gpt-6-luna is tuned for). A business can ask for 'low' (faster, cheaper) or 'high'
-  // in chat_ai_settings.effort.
-  const effort = ['low', 'medium', 'high'].includes(String(s.effort)) ? String(s.effort) : 'medium';
+  // 'low' is the default: the chat AI follows short rules and skills, and reasoning time is the biggest part of a
+  // reply's delay and cost. A business can still ask for 'medium' or 'high' in chat_ai_settings.effort.
+  const effort = ['low', 'medium', 'high'].includes(String(s.effort)) ? String(s.effort) : 'low';
   return {
     effort,
     settleMs: clamp(s.settle_ms, 0, 15_000, 3_000),
@@ -180,8 +181,9 @@ export async function loadContext(db: any, input: TurnInput, cache?: ContextCach
   const [core, categories, chat] = await Promise.all([getCore(db, businessId, c), getCategories(db, businessId, c), loadVolatile(db, input)]);
 
   return {
-    business: { name: core.business.name || 'the business', currency: core.business.currency || null, model: core.business.chat_ai_model || 'gpt-6-luna' },
+    business: { name: core.business.name || 'the business', currency: core.business.currency || null, model: core.business.chat_ai_model || 'gpt-5-mini' },
     settings: readSettings(core.business.chat_ai_settings),
+    ownerRules: renderOwnerRules(core.business.chat_ai_settings),
     persona: core.personaPack,
     categories,
     skills: core.skills,

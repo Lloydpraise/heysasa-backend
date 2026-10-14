@@ -3,6 +3,7 @@ import { runScheduler } from './scheduler.js'
 import { runCampaignScheduler } from './campaignScheduler.js'
 import { runPostSendReconciliation } from './reconciliation.js'
 import { runStageClassifier, STAGE_REVIEW_DEBOUNCE_MS } from './stageClassifier.js'
+import { runStageRequests } from './stageRequests.js'
 import { runActivityPatterns } from './activityPatterns.js'
 import { runLeadTemperatureReview } from './leadTemperatureReview.js'
 import { runAutoListSync } from './autoListSync.js'
@@ -312,6 +313,13 @@ function subscribe() {
     invokeThrottled('CampaignScheduler', runCampaignScheduler, [{ seed: false }])
     if (followupAiSwitch.switchedOn(payload.new)) afterQuiet('AdIntake', () => void invoke('AdIntake', runAdIntake), 2_000)
   })
+  // An AI asked to move a lead's stage (chat AI tool). Checked, billed and audited by runStageRequests.
+  watch('lead_stage_requests', (payload) => {
+    if (payload.eventType === 'INSERT') afterQuiet('StageRequests', () => void invoke('StageRequests', runStageRequests), 3_000)
+  })
+  // Safety net in case a realtime event is missed: nothing stays pending for long.
+  const stageRequestsTimer = setInterval(() => void invoke('StageRequests', runStageRequests), 5 * 60_000)
+  stageRequestsTimer.unref?.()
   watch('whatsapp_sessions', () => invokeThrottled('CampaignScheduler', runCampaignScheduler, [{ seed: false }]))
   watch('contacts', (payload) => { void onContactChange(payload) })
   watch('conversations', (payload) => {
@@ -336,6 +344,7 @@ function subscribe() {
       void invoke('CampaignScheduler', runCampaignScheduler, [{ seed: true }])
       void invoke('Reconciliation', runPostSendReconciliation)
       void invoke('StageClassifier', runStageClassifier)
+      void invoke('StageRequests', runStageRequests)
       void invoke('LeadTemperatureReview', runLeadTemperatureReview)
       void invoke('ActivityPatterns', runActivityPatterns)
       void invoke('CustomerProfiles', runCustomerProfileSync)

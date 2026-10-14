@@ -75,16 +75,24 @@ export function createOrchestrator(deps, options = {}) {
         const { store } = deps;
         const resumeFrom = existing && ['running', 'home_ready', 'finishing', 'failed'].includes(existing.status)
             ? Number(existing.bundles_done || 0) : 0;
+        // Where the time goes, so we know which stage to speed up. Kept in business_setup.timings and shown by GET /setup/status.
+        const began = deps.now();
+        const timings = resumeFrom > 0 ? { ...(existing?.timings || {}) } : { bundles: [] };
+        timings.bundles = timings.bundles || [];
         await store.upsert(businessId, {
             status: resumeFrom > 0 ? 'home_ready' : 'waiting_history', error: null, thin: false,
             started_at: existing?.started_at || iso(deps.now()),
         });
 
         if (resumeFrom === 0) {
+            // Optional one-time starter balance (off unless SETUP_STARTER_CREDIT_USD is set). It never stops setup.
+            await background('starter_credit', async () => { const r = await deps.grantStarterCredit?.(businessId); if (r?.grant) log('info', 'setup.starter_credit_granted', { businessId, amountUsd: r.amountUsd }); });
+            const waitedFrom = deps.now();
             const { count } = await waitForHistory(businessId);
+            timings.history_wait_ms = deps.now() - waitedFrom;
             if (count === 0) {   // a new number with no chats: nothing to analyse, Home switches to "get your first leads in"
                 await store.upsert(businessId, {
-                    status: 'done', thin: true, home_ready_at: iso(deps.now()), finished_at: iso(deps.now()),
+                    status: 'done', thin: true, home_ready_at: iso(deps.now()), finished_at: iso(deps.now()), timings,
                 });
                 return;
             }
@@ -100,22 +108,26 @@ export function createOrchestrator(deps, options = {}) {
         for (let i = resumeFrom; i < bundles.length; i++) {
             const first = i === 0;
             const body = { businessId, contactIds: bundles[i], ...(first ? { discoverProducts: true, productsTextOnly: true } : {}) };
+            const bundleStart = deps.now();
             const result = await runBundle(businessId, body);
-            if (!result.ok) { await store.upsert(businessId, { status: 'failed', error: result.error }); return; }
+            timings.bundles[i] = { size: bundles[i].length, ms: deps.now() - bundleStart, ok: result.ok, discovery_text_only: first || undefined };
+            if (!result.ok) { await store.upsert(businessId, { status: 'failed', error: result.error, timings }); return; }
 
             if (first) {
-                await store.upsert(businessId, { bundles_done: 1, status: 'home_ready', home_ready_at: iso(deps.now()) });
+                timings.home_ready_ms = deps.now() - began;
+                await store.upsert(businessId, { bundles_done: 1, status: 'home_ready', home_ready_at: iso(deps.now()), timings });
                 // Not waited for: the owner already has value. Persona = the brand voice, images = the rest of the products.
                 void background('persona', () => deps.kickPersona(businessId, { force: false }));
                 void background('product_images', () => deps.kickProductImages(businessId));
             } else {
-                await store.upsert(businessId, { bundles_done: i + 1 });
+                await store.upsert(businessId, { bundles_done: i + 1, timings });
             }
         }
 
         await store.upsert(businessId, { status: 'finishing' });
         if (bundles.length > 1) void background('persona_refresh', () => deps.kickPersona(businessId, { force: true }));
-        await store.upsert(businessId, { status: 'done', finished_at: iso(deps.now()) });
+        timings.total_ms = deps.now() - began;
+        await store.upsert(businessId, { status: 'done', finished_at: iso(deps.now()), timings });
     }
 
     // Returns { started, reason?, done? }. `done` resolves when the whole setup has finished (tests use it).

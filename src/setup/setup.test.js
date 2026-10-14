@@ -152,3 +152,46 @@ test('answers: good input passes, bad input is named', () => {
     assert.equal(validateAnswers({ products: { approve: [1], dismiss: [1] } }).error, 'product_in_both_lists');
     assert.deepEqual(validateAnswers({}).value, {});
 });
+
+import { decideStarterCredit, starterAmountFromEnv } from './starterCredit.js';
+test('starter credit: off by default, capped, once, only for an empty wallet', () => {
+    assert.equal(starterAmountFromEnv({}), 0);
+    assert.equal(starterAmountFromEnv({ SETUP_STARTER_CREDIT_USD: '1.5' }), 1.5);
+    assert.equal(starterAmountFromEnv({ SETUP_STARTER_CREDIT_USD: '9999' }), 50);
+    assert.equal(starterAmountFromEnv({ SETUP_STARTER_CREDIT_USD: 'x' }), 0);
+    const base = { amountUsd: 1, alreadyGiven: false, balanceUsd: 0, businessType: 'retail' };
+    assert.deepEqual(decideStarterCredit(base), { grant: true, reason: 'new_owner', amountUsd: 1 });
+    assert.equal(decideStarterCredit({ ...base, amountUsd: 0 }).reason, 'off');
+    assert.equal(decideStarterCredit({ ...base, alreadyGiven: true }).reason, 'already_given');
+    assert.equal(decideStarterCredit({ ...base, balanceUsd: 3 }).reason, 'has_balance');
+    assert.equal(decideStarterCredit({ ...base, balanceUsd: null }).reason, 'no_wallet');
+    assert.equal(decideStarterCredit({ ...base, businessType: 'heysasa' }).reason, 'free_business');
+});
+
+test('orchestrator: records where the time goes, and asks for the starter credit once at the start', async () => {
+    const { deps, rows } = world({ contacts: 700 });
+    const credited = [];
+    deps.grantStarterCredit = async (id) => { credited.push(id); return { grant: true, amountUsd: 1 }; };
+    const o = createOrchestrator(deps, { pollMs: 1000, quietMs: 3000, runPollMs: 1000 });
+    await (await o.start('biz')).done;
+    const t = rows.get('biz').timings;
+    assert.deepEqual(credited, ['biz']);
+    assert.equal(t.bundles.length, 3);
+    assert.deepEqual(t.bundles.map((b) => b.size), [100, 500, 100]);
+    assert.ok(t.bundles.every((b) => b.ok && b.ms > 0));
+    assert.equal(t.bundles[0].discovery_text_only, true);
+    assert.ok(t.history_wait_ms >= 0 && t.home_ready_ms > 0 && t.total_ms >= t.home_ready_ms);
+});
+
+test('orchestrator: a failing starter credit never stops setup', async () => {
+    const { deps, rows } = world({ contacts: 50 });
+    deps.grantStarterCredit = async () => { throw new Error('wallet down'); };
+    const o = createOrchestrator(deps, { pollMs: 1000, quietMs: 3000 });
+    await (await o.start('biz')).done;
+    assert.equal(rows.get('biz').status, 'done');
+});
+
+test('status passes the timings through', () => {
+    assert.deepEqual(shapeSetupStatus({ setup: { status: 'done', timings: { total_ms: 5 } } }).timings, { total_ms: 5 });
+    assert.deepEqual(shapeSetupStatus({ setup: null }).timings, {});
+});
