@@ -17,7 +17,7 @@ const seed = () => ({
 
 function boot(script) {
   const db = fakeDb(seed());
-  const store = fakeStore();
+  const store = fakeStore({ now: () => NOW });
   const notes = createNotes({ store, embed: fakeEmbed });
   const agent = createAgent({ supabase: db, store, canAfford: async () => true, now: () => NOW, env: { PORT: '1' } });
   const callModel = scriptedModel(script);
@@ -97,11 +97,12 @@ async function bootHttp() {
     return { status: res.status, json: await res.json() };
   };
   const propose = async (name, args) => (await t.agent.engine.propose(t.agent.makeCtx({ businessId: 'b1', userId: 'u1', token: 'tok' }), t.agent.registry.byName.get(name), args)).action;
-  return { ...t, call, propose, close: () => server.close() };
+  return { ...t, call, propose, close: () => { server.closeAllConnections?.(); server.close(); } };
 }
 
-test('HTTP: pending list, approve, approve again, undo, activity log', async () => {
+test('HTTP: pending list, approve, approve again, undo, activity log', async (tc) => {
   const t = await bootHttp();
+  tc.after(() => t.close());
   const a = await t.propose('create_list', { name: 'Via HTTP', lead_ids: [1] });
   const pending = await t.call('/actions/pending');
   assert.equal(pending.json.actions.length, 1);
@@ -122,22 +123,22 @@ test('HTTP: pending list, approve, approve again, undo, activity log', async () 
   const undone = await t.call(`/actions/${a.id}/undo`, { method: 'POST' });
   assert.equal(undone.json.action.status, 'undone');
   assert.equal(t.db.tables.lists.length, 0);
-  t.close();
 });
 
-test('HTTP: another business gets 404, a bad id gets 400, reject works', async () => {
+test('HTTP: another business gets 404, a bad id gets 400, reject works', async (tc) => {
   const t = await bootHttp();
+  tc.after(() => t.close());
   const a = await t.propose('create_list', { name: 'Private', lead_ids: [1] });
   assert.equal((await t.call(`/actions/${a.id}/approve`, { method: 'POST', body: {}, business: 'b2' })).status, 404);
   assert.equal((await t.call('/actions/nope/approve', { method: 'POST', body: {} })).status, 400);
   const rej = await t.call(`/actions/${a.id}/reject`, { method: 'POST' });
   assert.equal(rej.json.action.status, 'rejected');
   assert.equal((await t.call(`/actions/${a.id}/approve`, { method: 'POST', body: {} })).status, 409);
-  t.close();
 });
 
-test('HTTP: always allow can be chosen on approve and managed, but never for critical actions', async () => {
+test('HTTP: always allow can be chosen on approve and managed, but never for critical actions', async (tc) => {
   const t = await bootHttp();
+  tc.after(() => t.close());
   const a = await t.propose('create_list', { name: 'First', lead_ids: [1] });
   await t.call(`/actions/${a.id}/approve`, { method: 'POST', body: { always_allow: true } });
   const prefs = await t.call('/action-prefs');
@@ -148,5 +149,4 @@ test('HTTP: always allow can be chosen on approve and managed, but never for cri
   const crit = await t.call('/action-prefs', { method: 'PUT', body: { type: 'launch_campaign', always_allow: true } });
   assert.equal(crit.status, 400);
   assert.equal((await t.call('/action-prefs', { method: 'PUT', body: { type: 'create_list', always_allow: false } })).json.always_allow, false);
-  t.close();
 });

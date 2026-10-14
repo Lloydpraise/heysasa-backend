@@ -5,22 +5,22 @@ import { ToolError } from './agent/helpers.js';
 
 export const TOOL_DEFS = [
   {
-    type: 'function', name: 'load_skill',
+    type: 'function', strict: false, name: 'load_skill',
     description: 'Load a skill from the skill menu when its situation matches and it is not loaded yet. Returns its instructions.',
     parameters: { type: 'object', properties: { key: { type: 'string', description: 'The skill key from the skill menu.' } }, required: ['key'], additionalProperties: false },
   },
   {
-    type: 'function', name: 'search_products',
+    type: 'function', strict: false, name: 'search_products',
     description: "Search this business's product catalog by meaning. Use it before writing copy that names a product, price or category. Returns up to 5 items with real prices.",
     parameters: { type: 'object', properties: { query: { type: 'string', description: 'What to look for, e.g. "braids" or "wireless earbuds".' } }, required: ['query'], additionalProperties: false },
   },
   {
-    type: 'function', name: 'recall_notes',
+    type: 'function', strict: false, name: 'recall_notes',
     description: 'Search everything saved about this business and owner (past decisions, preferences, facts, earlier conversations) by meaning. Use it when the request touches something not already in front of you.',
     parameters: { type: 'object', properties: { query: { type: 'string', description: 'What you want to remember, in plain words.' } }, required: ['query'], additionalProperties: false },
   },
   {
-    type: 'function', name: 'save_note',
+    type: 'function', strict: false, name: 'save_note',
     description: 'Save one durable fact about the business or how the owner likes things done, so they never have to repeat it. One fact per note, plain words. Never save guesses, passwords, payment details or customers\' personal details.',
     parameters: {
       type: 'object',

@@ -36,7 +36,7 @@ const get_followup_approvals = {
 
 const approve_followups = {
   name: 'approve_followups', area: 'followups', kind: 'propose', risk: 'critical',
-  description: 'Approve follow-up messages so they are sent to customers. Pass the ids from get_followup_approvals (up to 50). To change the wording of one first, include it in edits. Sends real messages, so it always waits for the owner\'s OK. Never approve a message the owner has not been shown.',
+  description: 'Approve follow-up messages so they are sent to customers. Pass the ids from get_followup_approvals (up to 50). To change the wording of one first, include it in edits. Sends real messages, so it always waits for the owner\'s OK. Never approve a message the owner has not been shown (the card lists every one of them).',
   parameters: {
     type: 'object',
     properties: {
@@ -59,8 +59,8 @@ const approve_followups = {
       params: { item_ids: rows.map((r) => r.id), edits: Object.fromEntries(edits) },
       preview: {
         headline: `${plural(rows.length, 'message')} will be sent to customers`,
-        messages: rows.slice(0, 6).map((r, i) => ({ n: i + 1, when: `To ${names.get(String(r.contact_id)) || 'Unknown'}${edits.has(r.id) ? ' (reworded)' : ''}`, text: edits.get(r.id) || r.draft_message || '' })),
-        more: Math.max(0, rows.length - 6), warning: 'These go out to real customers.',
+        messages: rows.slice(0, MAX_BATCH).map((r, i) => ({ n: i + 1, when: `To ${names.get(String(r.contact_id)) || 'Unknown'}${edits.has(r.id) ? ' (reworded)' : ''}`, text: edits.get(r.id) || r.draft_message || '' })),
+        more: Math.max(0, rows.length - MAX_BATCH), warning: 'These go out to real customers. Every message is shown above.',
       },
     };
   },

@@ -32,7 +32,14 @@ const get_persona = {
       if (!(section in pack) || PROTECTED.has(section)) throw new ToolError(`There is no editable "${section}" section. Sections: ${Object.keys(pack).filter((k) => !PROTECTED.has(k)).join(', ')}.`);
       return { ready: true, version: cur.version, section, content: pack[section] };
     }
-    return { ready: true, version: cur.version, sections: Object.keys(pack).filter((k) => !PROTECTED.has(k)).map((k) => ({ name: k, looks_like: show(pack[k], 220) })) };
+    // The voice itself is read in full here, so campaign copy can sound like the owner without a second call.
+    const names = Object.keys(pack).filter((k) => !PROTECTED.has(k));
+    return {
+      ready: true, version: cur.version,
+      voice: 'persona' in pack ? show(pack.persona, 2000) : undefined,
+      sections: names.filter((k) => k !== 'persona').map((k) => ({ name: k, looks_like: show(pack[k], 300) })),
+      note: 'Ask for one section by name to read it in full.',
+    };
   },
 };
 

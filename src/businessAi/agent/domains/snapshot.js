@@ -1,5 +1,5 @@
 // The business at a glance, and the setup steps that get an owner to value fastest.
-import { fetchAll, must, plural, round1 } from '../helpers.js';
+import { fetchAll, isCustomerLead, isWaiting, must, plural, round1 } from '../helpers.js';
 import { loadLeads } from './leads.js';
 
 export const SETUP_ORDER = ['whatsapp', 'chats_loaded', 'chats_studied', 'persona', 'products', 'followups', 'auto_lists', 'auto_campaigns', 'chat_ai'];
@@ -39,7 +39,7 @@ const get_business_snapshot = {
     const ruleRows = must(rules, 'rules') ?? [];
     const autoRows = must(autos, 'auto campaigns') ?? [];
     const campRows = must(campaigns, 'campaigns') ?? [];
-    const real = leads.filter((l) => l.lead_type !== 'personal');
+    const real = leads.filter(isCustomerLead);
     const studied = count(real, (l) => Boolean(l.context_summary || l.customer_intent));
     const approved = count(products, (p) => p.status === 'approved');
     const done = {
@@ -59,7 +59,7 @@ const get_business_snapshot = {
     return {
       business: { name: b.name, currency: b.currency || 'KES', industry: b.industry || null },
       whatsapp_connected: done.whatsapp,
-      leads: { total: real.length, studied, waiting_for_reply: count(real, (l) => l.awaiting_business_reply === true || Number(l.unread_count) > 0), won: count(real, (l) => l.lead_state === 'won') },
+      leads: { total: real.length, studied, waiting_for_reply: count(real, isWaiting), won: count(real, (l) => l.lead_state === 'won') },
       lists: lists.length, campaigns: { total: campRows.length, running: count(campRows, (c) => c.status === 'active') },
       products: { approved, waiting_for_review: count(products, (p) => p.status === 'discovered') },
       messages_waiting_for_your_ok: pending.length,

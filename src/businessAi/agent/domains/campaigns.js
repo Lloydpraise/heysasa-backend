@@ -131,6 +131,24 @@ const get_campaign = {
   },
 };
 
+const get_campaign_people = {
+  name: 'get_campaign_people', area: 'campaigns', kind: 'read', status: 'Looking at who is in it…',
+  description: 'Who is in one campaign: how many are still going, finished or left, how many replied, and a few names with how far each has got.',
+  parameters: { type: 'object', properties: { campaign_id: { type: 'string' }, status: { type: 'string', enum: ['active', 'pending', 'completed', 'exited'], description: 'Only people with this status.' } }, required: ['campaign_id'], additionalProperties: false },
+  async run(ctx, { campaign_id: id, status }) {
+    const campaign = await ownCampaign(ctx, id);
+    const rows = await fetchAll((from, to) => ctx.db.from('campaign_enrollments').select('lead_id, status, current_step, last_reply_at, next_send_at').eq('campaign_id', id).range(from, to), { max: 20000 });
+    const counts = rows.reduce((a, r) => ({ ...a, [r.status]: (a[r.status] ?? 0) + 1 }), {});
+    const shown = rows.filter((r) => !status || r.status === status).slice(0, 12);
+    const people = shown.length ? must(await ctx.db.from('contacts').select('id, name').eq('business_id', ctx.businessId).in('id', shown.map((r) => r.lead_id)), 'contacts') ?? [] : [];
+    const names = new Map(people.map((p) => [String(p.id), p.name || 'Unknown']));
+    return {
+      campaign: campaign.name, campaign_status: campaign.status, people_total: rows.length, by_status: counts, replied: rows.filter((r) => r.last_reply_at).length,
+      people: shown.map((r) => ({ id: r.lead_id, name: names.get(String(r.lead_id)) || 'Unknown', status: r.status, messages_sent: r.current_step ?? 0, replied: Boolean(r.last_reply_at), next_message_at: r.next_send_at || undefined })),
+    };
+  },
+};
+
 const get_auto_campaigns = {
   name: 'get_auto_campaigns', area: 'campaigns', kind: 'read', status: 'Checking your auto campaigns…',
   description: 'The ready-made campaigns, one per auto list (hot, cold, abandoned cart, repeat buyers…): the playbook, the messages, whether they are running, and how many people are ready.',
@@ -250,18 +268,20 @@ const launch_campaign = {
 };
 
 // ── pause / resume ──────────────────────────────────────────────────────────
-function statusTool({ name, from, to, risk, title, verb, description }) {
+function statusTool({ name, from, to, risk, title, verb, description, guard = null }) {
   return {
     name, area: 'campaigns', kind: 'propose', risk, status: 'Getting that ready…', description,
     parameters: { type: 'object', properties: { campaign_id: { type: 'string' } }, required: ['campaign_id'], additionalProperties: false },
     async plan(ctx, { campaign_id: id }) {
       const c = await ownCampaign(ctx, id);
       if (c.status !== from) throw new ToolError(`"${c.name}" is ${c.status}, so it cannot be ${verb}.`);
+      if (guard) await guard(ctx, c);
       return { title: `${title} "${c.name}"`, params: { campaign_id: c.id }, preview: { headline: `${title} "${c.name}"`, lines: [to === 'paused' ? 'No more messages will go out until it is resumed.' : 'Messages will start going out again.'] } };
     },
     async execute(ctx, params) {
       const c = await ownCampaign(ctx, params.campaign_id);
       if (c.status !== from) throw new ToolError(`"${c.name}" is now ${c.status}, so I changed nothing.`);
+      if (guard) await guard(ctx, c);
       must(await ctx.db.from('campaigns').update({ status: to }).eq('business_id', ctx.businessId).eq('id', c.id), 'set campaign status');
       return { summary: `${to === 'paused' ? 'Paused' : 'Resumed'} "${c.name}".`, result: { campaign_id: c.id }, before: { status: from } };
     },
@@ -273,7 +293,16 @@ function statusTool({ name, from, to, risk, title, verb, description }) {
 }
 
 const pause_campaign = statusTool({ name: 'pause_campaign', from: 'active', to: 'paused', risk: 'normal', title: 'Pause', verb: 'paused', description: 'Stop a running campaign from sending more messages. Safe: it can be resumed.' });
-const resume_campaign = statusTool({ name: 'resume_campaign', from: 'paused', to: 'active', risk: 'critical', title: 'Resume', verb: 'resumed', description: 'Start a paused campaign sending again. Always waits for the owner\'s OK.' });
+// A person can only be in one running campaign, so check before resuming (the database would refuse with a vague error).
+async function resumeGuard(ctx, c) {
+  const mine = await fetchAll((from, to) => ctx.db.from('campaign_enrollments').select('lead_id').eq('campaign_id', c.id).in('status', ['pending', 'active']).range(from, to));
+  if (!mine.length) return;
+  const busy = await busyLeadSet(ctx, c.id);
+  const clash = mine.filter((e) => busy.has(String(e.lead_id))).length;
+  if (clash) throw new ToolError(`${plural(clash, 'person', 'people')} in "${c.name}" are now in another running campaign, so it cannot be resumed yet. Pause that other campaign first, or start a new campaign for the rest.`);
+}
+
+const resume_campaign = statusTool({ name: 'resume_campaign', from: 'paused', to: 'active', risk: 'critical', title: 'Resume', verb: 'resumed', guard: resumeGuard, description: 'Start a paused campaign sending again. Checks nobody in it is now in another running campaign. Always waits for the owner\'s OK.' });
 
 // ── edit ────────────────────────────────────────────────────────────────────
 async function writeSteps(ctx, campaignId, steps) {
@@ -445,4 +474,4 @@ const set_auto_campaign = {
   },
 };
 
-export default [list_campaigns, get_campaign, get_auto_campaigns, launch_campaign, pause_campaign, resume_campaign, edit_campaign, activate_auto_campaign, set_auto_campaign];
+export default [list_campaigns, get_campaign, get_campaign_people, get_auto_campaigns, launch_campaign, pause_campaign, resume_campaign, edit_campaign, activate_auto_campaign, set_auto_campaign];

@@ -14,6 +14,27 @@ export const asText = (v) => (typeof v === 'string' ? v.trim() : '');
 export const daysSince = (iso, now = new Date()) => (iso ? Math.max(0, (now.getTime() - new Date(iso).getTime()) / 86_400_000) : null);
 export const round1 = (n) => Math.round(Number(n) * 10) / 10;
 
+// Chats that are not customers (kept in line with followup-engine/src/lib/leadTypes.js).
+export const NON_CUSTOMER_TYPES = new Set(['personal', 'vendor', 'staff', 'junk']);
+export const isCustomerLead = (lead) => !NON_CUSTOMER_TYPES.has(lead?.lead_type);
+// The customer wrote last and nobody answered. `awaiting_reply` is the real column (contacts); the other two are kept for older views.
+export const isWaiting = (lead) => lead?.awaiting_reply === true || lead?.awaiting_business_reply === true || Number(lead?.unread_count) > 0;
+
+// messages.content is JSON ({text}, {caption, media_url}, {title, price, product_id}...). Turns it into plain text.
+export function messageText(content, max = 400) {
+  let v = content;
+  if (typeof v === 'string') { try { const parsed = JSON.parse(v); if (parsed && typeof parsed === 'object') v = parsed; } catch { /* plain text */ } }
+  if (v === null || v === undefined) return '';
+  if (typeof v === 'string') return clip(v, max);
+  if (typeof v !== 'object') return clip(String(v), max);
+  const text = v.text || v.caption || '';
+  if (text) return clip(String(text), max);
+  if (v.title) return clip(`[product: ${v.title}${v.price ? `, ${v.price}` : ''}]`, max);
+  if (v.type) return `[${String(v.type).slice(0, 20)}${v.file_name ? `: ${clip(v.file_name, 60)}` : ''}]`;
+  if (v.file_name) return `[file: ${clip(v.file_name, 60)}]`;
+  return '[media]';
+}
+
 // A database error is a bug as far as the owner is concerned: throw it as a plain Error (the runner hides the detail).
 export function must(result, what) {
   if (result?.error) throw new Error(`${what}: ${result.error.message}`);

@@ -21,7 +21,7 @@ export const ACTION_LABELS = {
   approve_followups: 'Approve follow-up messages', reject_followups: 'Skip follow-up messages',
   update_leads: 'Change the state of leads', mark_as_bought: 'Record a sale', run_analysis: 'Study your chats',
   set_followup_settings: 'Change follow-up settings', set_business_info: 'Change business details', set_chat_ai: 'Change the chat AI switch or limits',
-  update_persona: 'Change how your AI talks', save_flow: 'Add or change a chat flow', edit_chat_skill: 'Change a chat AI skill',
+  update_persona: 'Change how your AI talks', save_flow: 'Add or change a chat flow', create_chat_skill: 'Add a chat AI skill', edit_chat_skill: 'Change a chat AI skill',
   change_products: 'Approve, dismiss or hide products', edit_product: 'Change a product\'s price or details', run_product_discovery: 'Look for products in your chats',
 };
 
@@ -48,7 +48,8 @@ export function buildRegistry() {
   return {
     tools, byName,
     // What the model sees. Same order every time.
-    modelTools: () => tools.map((t) => ({ type: 'function', name: t.name, description: t.description, parameters: t.parameters })),
+    // strict:false because most tools have optional fields; with strict on, the model must fill every one of them.
+    modelTools: () => tools.map((t) => ({ type: 'function', name: t.name, description: t.description, parameters: t.parameters, strict: false })),
     statusFor: (name) => byName.get(name)?.status ?? null,
     // For the owner's "always allow" screen: only things that can ever be auto-allowed.
     allowable: () => tools.filter((t) => t.kind === 'propose').map((t) => ({ type: t.name, label: ACTION_LABELS[t.name], area: t.area, area_label: AREA_LABELS[t.area] ?? t.area, critical: t.risk === 'critical' })),

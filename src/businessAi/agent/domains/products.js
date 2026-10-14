@@ -68,8 +68,8 @@ const change_products = {
 const EDITABLE = { price: 'Price', old_price: 'Old price', stock_quantity: 'Stock', description_short: 'Short description', category: 'Category' };
 
 const edit_product = {
-  name: 'edit_product', area: 'products', kind: 'propose', risk: 'normal',
-  description: 'Change one product\'s price, old price, stock, short description or category. Only use numbers the owner gave you. Prices matter: the AI quotes them to customers.',
+  name: 'edit_product', area: 'products', kind: 'propose', risk: 'critical',
+  description: 'Change one product\'s price, old price, stock, short description or category. Only use numbers the owner gave you. Prices matter: the AI quotes them to customers, so this always waits for the owner\'s OK.',
   parameters: { type: 'object', properties: { product_id: { type: ['string', 'number'] }, price: { type: 'number' }, old_price: { type: ['number', 'null'] }, stock_quantity: { type: 'integer', minimum: 0 }, description_short: { type: 'string' }, category: { type: 'string' } }, required: ['product_id'], additionalProperties: false },
   status: 'Getting that ready…',
   async plan(ctx, args) {
