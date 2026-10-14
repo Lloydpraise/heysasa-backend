@@ -54,6 +54,7 @@ export type TurnDeps = {
 // Estimates only, in US dollars per million tokens. Edit when prices change; unknown models are left blank.
 const PRICES: Record<string, { input: number; cached: number; output: number }> = {
   'gpt-5-mini': { input: 0.25, cached: 0.025, output: 2.0 },
+  'gpt-6-luna': { input: 0.10, cached: 0.01, output: 0.50 },
 };
 const MAX_RERUNS = 2;
 
@@ -181,7 +182,7 @@ export async function runTurn(deps: TurnDeps, input: TurnInput): Promise<TurnOut
 type Io = { send: (items: SendItem[]) => Promise<SendResult>; queue?: (items: SendItem[]) => Promise<QueueResult> };
 
 // Only reasoning models accept a reasoning setting; a non-reasoning model (a faster option some businesses may pick) would reject it.
-const isReasoningModel = (model: string) => /^(gpt-5|o\d)/.test(model);
+const isReasoningModel = (model: string) => /^(gpt-[5-9]|o\d)/.test(model);
 
 // Customers often send two or three short messages in a row. Waiting until they have been quiet for `settleMs` lets one
 // answer cover all of them. The wait only covers what is left of that quiet time (the message has usually been travelling

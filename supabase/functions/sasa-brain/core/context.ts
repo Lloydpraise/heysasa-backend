@@ -19,9 +19,9 @@ const clamp = (n: unknown, min: number, max: number, fallback: number) => {
 
 export function readSettings(raw: Record<string, unknown> | null | undefined) {
   const s = raw ?? {};
-  // 'low' is the default: the chat AI follows short rules and skills, and reasoning time is the biggest part of a
-  // reply's delay and cost. A business can still ask for 'medium' or 'high' in chat_ai_settings.effort.
-  const effort = ['low', 'medium', 'high'].includes(String(s.effort)) ? String(s.effort) : 'low';
+  // 'medium' is the default (what gpt-6-luna is tuned for). A business can ask for 'low' (faster, cheaper) or 'high'
+  // in chat_ai_settings.effort.
+  const effort = ['low', 'medium', 'high'].includes(String(s.effort)) ? String(s.effort) : 'medium';
   return {
     effort,
     settleMs: clamp(s.settle_ms, 0, 15_000, 3_000),
@@ -180,7 +180,7 @@ export async function loadContext(db: any, input: TurnInput, cache?: ContextCach
   const [core, categories, chat] = await Promise.all([getCore(db, businessId, c), getCategories(db, businessId, c), loadVolatile(db, input)]);
 
   return {
-    business: { name: core.business.name || 'the business', currency: core.business.currency || null, model: core.business.chat_ai_model || 'gpt-5-mini' },
+    business: { name: core.business.name || 'the business', currency: core.business.currency || null, model: core.business.chat_ai_model || 'gpt-6-luna' },
     settings: readSettings(core.business.chat_ai_settings),
     persona: core.personaPack,
     categories,
