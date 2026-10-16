@@ -400,10 +400,12 @@ Return ONLY JSON:
  "message": "for rewrite, and optionally for reorder: the new WhatsApp message in the business voice, one clear ask, under 350 characters. Otherwise empty.",
  "step_number": "for reorder only: the number of the remaining step that should go next",
  "delay_hours": "for reschedule only: hours to wait",
- "stop_kind": "for stop only: opt_out | handoff | exit"
+ "stop_kind": "for stop only: opt_out | handoff | exit",
+ "stage": "optional, leave empty most of the time: the stage the customer has really reached, only when their OWN words in the timeline show it (they chose a product, asked how to pay, agreed to the price). Online shops: discovery, browsing, selection, intent, checkout, awaiting_payment. Services: discovery, qualified, proposal, negotiation, committed. Never paid, fulfilled or completed: those come from real payments or the owner.",
+ "stage_reason": "required when stage is set: why, in a few plain words the owner can read"
 }
 
-Never talk over a person or the Chat AI who is actively chatting with the customer. Never invent prices, offers or facts. Follow your skills.`
+Never talk over a person or the Chat AI who is actively chatting with the customer. Never invent prices, offers or facts. Never mention a stage change to the customer. Follow your skills.`
   },
   followup_ai_writer: {
     bot_name: 'Follow-up AI: message writer', system: 'Follow-up AI', prompt: `You are the Follow-up AI of a WhatsApp business. Write ONE follow-up message to one customer, in the business's own voice, for the purpose you are given.

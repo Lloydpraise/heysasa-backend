@@ -16,6 +16,7 @@ import { computeNextSend } from './scheduling.js'
 import { advanceAiEnrollment } from './advance.js'
 import { remainingSteps, reorderNext } from './stepPlan.js'
 import { logTurn } from './turns.js'
+import { requestStageChange } from './stageAsk.js'
 
 const AI_RETRY_MS = 10 * 60_000
 const STEP_COLUMNS = 'step_number, content, media, delay_hours, klt_phase, touchpoint_type'
@@ -91,8 +92,10 @@ export async function processAiManagedItem(supabase, h, { item, contact, busines
   await logTurn(supabase, {
     businessId: item.business_id, contactId: contact.id, campaignId: item.campaign_id, queueId: item.id, kind: 'director',
     decision: decision.action, reason: decision.reason ?? need.why, stepNumber: planned.step_number,
-    details: { called: need.needed, why: need.why, chosenStep: decision.stepNumber, downgraded: decision.downgraded === true },
+    details: { called: need.needed, why: need.why, chosenStep: decision.stepNumber, downgraded: decision.downgraded === true, stageAsk: decision.stageAsk?.stage ?? null },
   })
+  // The director saw the customer move on: ask for the stage change. Checked, billed and audited by the stage worker.
+  if (decision.stageAsk) await requestStageChange(supabase, { businessId: item.business_id, contact, conv, ask: decision.stageAsk })
   const lastInboundAt = conv?.last_user_message_at ?? null
 
   if (decision.action === 'reschedule') {
@@ -155,7 +158,8 @@ export async function processAiScheduledItem(supabase, h, { item, contact, busin
     const result = await runDirector(supabase, { business, contact, pack, conv, ctx, skills: skills.filter(s => (s.used_by ?? []).includes('director')), planned, remaining: [], why: need.why })
     if (!result.ok) return h.stallItem('ai_unavailable', AI_RETRY_MS)
     const d = result.decision
-    await logTurn(supabase, { businessId: item.business_id, contactId: contact.id, queueId: item.id, kind: 'director', decision: d.action, reason: d.reason, details: { standalone: true, why: need.why } })
+    await logTurn(supabase, { businessId: item.business_id, contactId: contact.id, queueId: item.id, kind: 'director', decision: d.action, reason: d.reason, details: { standalone: true, why: need.why, stageAsk: d.stageAsk?.stage ?? null } })
+    if (d.stageAsk) await requestStageChange(supabase, { businessId: item.business_id, contact, conv, ask: d.stageAsk })
     if (d.action === 'reschedule') {
       const plan = await computeNextSend(supabase, { business, contact, delayHours: d.delayHours ?? 24, lastInboundAt: conv?.last_user_message_at ?? null })
       await h.updateQueueItem({ scheduled_at: plan.at.toISOString(), skip_reason: 'director_rescheduled' })

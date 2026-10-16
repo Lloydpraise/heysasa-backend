@@ -119,6 +119,11 @@ export function createOrchestrator(deps, options = {}) {
                 // Not waited for: the owner already has value. Persona = the brand voice, images = the rest of the products.
                 void background('persona', () => deps.kickPersona(businessId, { force: false }));
                 void background('product_images', () => deps.kickProductImages(businessId));
+                // The chat AI's starting skills, copied from the shared library. Free, and never overwrites the owner's own.
+                void background('chat_skills', async () => {
+                    const r = await deps.seedChatAiSkills?.(businessId);
+                    if (r?.added) log('info', 'setup.chat_skills_added', { businessId, added: r.added });
+                });
             } else {
                 await store.upsert(businessId, { bundles_done: i + 1, timings });
             }

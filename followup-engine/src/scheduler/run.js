@@ -10,6 +10,7 @@ import { runAutoListSync } from './autoListSync.js'
 import { log } from '../lib/log.js'
 import { runAdIntake } from '../followupAi/adIntake.js'
 import { createSwitchWatch } from '../followupAi/switchWatch.js'
+import { createSetupWatch } from '../followupAi/setupWatch.js'
 import { ensureDefaultSkills } from '../followupAi/skills.js'
 import { isAnalysisActive, onAnalysisFinished, deferUntilAnalysisEnds } from '../lib/analysisGate.js'
 
@@ -313,7 +314,13 @@ function subscribe() {
     invokeThrottled('CampaignScheduler', runCampaignScheduler, [{ seed: false }])
     if (followupAiSwitch.switchedOn(payload.new)) afterQuiet('AdIntake', () => void invoke('AdIntake', runAdIntake), 2_000)
   })
-  // An AI asked to move a lead's stage (chat AI tool). Checked, billed and audited by runStageRequests.
+  // Setup reaching "Home is ready" or "done" starts the ad intake too, so a business that switched follow-ups on while
+  // its chats were still being checked gets its plans the moment the leads are sorted, not at the next check.
+  const setupMoments = createSetupWatch()
+  watch('business_setup', (payload) => {
+    if (setupMoments.reachedMoment(payload.new)) afterQuiet('AdIntake', () => void invoke('AdIntake', runAdIntake), 2_000)
+  })
+  // An AI asked to move a lead's stage (chat AI tool, or the Follow-up AI's director). Checked, billed and audited by runStageRequests.
   watch('lead_stage_requests', (payload) => {
     if (payload.eventType === 'INSERT') afterQuiet('StageRequests', () => void invoke('StageRequests', runStageRequests), 3_000)
   })

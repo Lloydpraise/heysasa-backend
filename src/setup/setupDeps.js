@@ -3,6 +3,7 @@
 import { supabase } from '../config/supabase.js';
 import { logEvent } from '../services/debugConsole.js';
 import { decideStarterCredit, starterAmountFromEnv } from './starterCredit.js';
+import { seedChatAiSkills } from './chatAiSkills.js';
 
 const PAGE = 1000;
 const MAX_IDS = 20_000;
@@ -101,6 +102,8 @@ export function buildSetupDeps() {
             await this.store.upsert(businessId, { starter_credit_at: new Date().toISOString() });
             return decision;
         },
+
+        seedChatAiSkills: (businessId) => seedChatAiSkills(supabase, businessId),
 
         launch: call,
         async kickPersona(businessId, { force }) { await call('/debug/persona/generate', { businessId, force: Boolean(force) }); },

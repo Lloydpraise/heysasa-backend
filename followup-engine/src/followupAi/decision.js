@@ -1,9 +1,18 @@
 // What the pre-send director decided, checked and normalised. Pure.
+import { readStageAsk } from './stageAsk.js'
 
 const ACTIONS = new Set(['send', 'rewrite', 'reorder', 'reschedule', 'skip', 'stop'])
 const clean = (v) => String(v ?? '').trim()
 
-export function normalizeDecision(raw, { remaining = [], currentStep = null } = {}) {
+// The decision, plus `stageAsk` ({ stage, reason }) when the director also saw the customer move to a new stage.
+// A decision that fell back to "send" because it was unreadable never carries a stage ask.
+export function normalizeDecision(raw, ctx = {}) {
+  const decision = normalizeAction(raw, ctx)
+  const ask = decision.downgraded ? null : readStageAsk(raw)
+  return ask ? { ...decision, stageAsk: ask } : decision
+}
+
+function normalizeAction(raw, { remaining = [], currentStep = null } = {}) {
   const fallback = (reason) => ({ action: 'send', reason, message: null, stepNumber: currentStep, delayHours: null, stopKind: null, downgraded: true })
   if (!raw || typeof raw !== 'object') return fallback('director_unreadable')
 
