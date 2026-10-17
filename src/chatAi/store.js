@@ -19,15 +19,17 @@ export function createStore(supabase) {
     },
 
     async loadChat(conversationId, contactId) {
-      const [convo, contact, owner] = await Promise.all([
+      const [convo, contact, owner, aiReply] = await Promise.all([
         supabase.from('conversations').select('id, ai_enabled, handover_flag, handover_resolved_at, is_business_chat').eq('id', conversationId).maybeSingle(),
-        supabase.from('contacts').select('id, lead_type, contact_role').eq('id', contactId).maybeSingle(),
+        supabase.from('contacts').select('id, lead_type, contact_role, is_ad_lead, ad_id, intent_score, lead_state').eq('id', contactId).maybeSingle(),
         // Only genuine owner messages count. Messages the AI or the follow-up engine sent carry their own agent_role.
         supabase.from('messages').select('created_at').eq('conversation_id', conversationId).eq('direction', 'out').eq('agent_role', 'human')
           .order('created_at', { ascending: false }).limit(1).maybeSingle(),
+        // Has the AI already answered in this chat? Then the audience choice no longer applies to it (see audience.js).
+        supabase.from('chat_ai_turns').select('id').eq('conversation_id', conversationId).eq('mode', 'live').in('status', ['replied', 'handoff']).limit(1).maybeSingle(),
       ]);
-      for (const r of [convo, contact, owner]) if (r.error) throw r.error;
-      return { conversation: convo.data, contact: contact.data, lastOwnerMessageAt: owner.data?.created_at || null };
+      for (const r of [convo, contact, owner, aiReply]) if (r.error) throw r.error;
+      return { conversation: convo.data, contact: contact.data, lastOwnerMessageAt: owner.data?.created_at || null, aiHasReplied: Boolean(aiReply.data) };
     },
 
     // Chat AI is billed per use, so it pauses when the wallet is empty (HeySasa's own business is never charged).

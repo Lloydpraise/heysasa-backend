@@ -2,6 +2,8 @@
 // The AI is only ever called when every gate passes. The AI cannot talk its way past them,
 // because they run before it exists.
 
+import { audienceOf, audienceAllows } from './audience.js';
+
 export const STALE_MESSAGE_MINUTES = 10;
 const BLOCKED_LEAD_TYPES = new Set(['personal', 'vendor', 'staff', 'junk']);
 const BLOCKED_CONTACT_ROLES = new Set(['vendor', 'staff', 'owner']);
@@ -19,6 +21,7 @@ export const SKIP_MESSAGES = {
   handed_off: 'This chat was handed off to the owner.',
   personal_chat: 'This looks like a personal chat, not a customer.',
   not_a_customer: 'This contact is a vendor, staff member or junk, not a customer.',
+  outside_audience: 'This lead is not in the group the owner chose for the chat AI.',
   owner_active: 'The owner replied recently, so the AI stays quiet.',
   chat_busy: 'The AI is already working on this chat.',
   cap_reached: 'The daily chat limit is used up.',
@@ -49,7 +52,7 @@ export function evaluateMessageGates({ message, business, now = new Date() }) {
 }
 
 // Checks that need the conversation, contact and the owner's recent activity.
-export function evaluateChatGates({ conversation, contact, lastOwnerMessageAt, business, now = new Date() }) {
+export function evaluateChatGates({ conversation, contact, lastOwnerMessageAt, aiHasReplied = false, business, now = new Date() }) {
   if (!conversation) return { allow: false, reason: 'chat_paused' };
   if (conversation.ai_enabled === false) return { allow: false, reason: 'chat_paused' };
   if (conversation.handover_flag === true && !conversation.handover_resolved_at) return { allow: false, reason: 'handed_off' };
@@ -60,6 +63,7 @@ export function evaluateChatGates({ conversation, contact, lastOwnerMessageAt, b
   if (BLOCKED_LEAD_TYPES.has(leadType) && leadType !== 'personal') return { allow: false, reason: 'not_a_customer' };
   if (leadType === 'personal') return { allow: false, reason: 'personal_chat' };
   if (BLOCKED_CONTACT_ROLES.has(role)) return { allow: false, reason: 'not_a_customer' };
+  if (!audienceAllows(audienceOf(business?.chat_ai_settings), contact, { aiHasReplied })) return { allow: false, reason: 'outside_audience' };
 
   const pauseMinutes = Number(business?.chat_ai_human_pause_minutes ?? 60);
   const ownerAt = asDate(lastOwnerMessageAt);

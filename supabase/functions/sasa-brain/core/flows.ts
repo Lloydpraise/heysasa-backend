@@ -2,7 +2,7 @@
 
 export type Flow = {
   id: string; name: string; enabled: boolean; priority: number;
-  trigger: { ad_ids?: string[]; list_ids?: string[] } | null;
+  trigger: { ad_ids?: string[]; list_ids?: string[]; any_ad?: boolean } | null;
   goal: string | null; instructions: string; skill_keys: string[]; created_at?: string;
 };
 
@@ -16,8 +16,11 @@ export function flowMatches(flow: Flow, subject: FlowSubject): boolean {
   const trigger = flow.trigger ?? {};
   const ads = (trigger.ad_ids ?? []).map(String);
   const lists = (trigger.list_ids ?? []).map(String);
-  if (ads.length === 0 && lists.length === 0) return false; // a flow with no criteria never matches by accident
-  const hasAd = subject.adIds.filter(Boolean).some((id) => ads.includes(String(id)));
+  const anyAd = trigger.any_ad === true; // "any lead that came from an ad": the flow setup makes for every business
+  if (ads.length === 0 && lists.length === 0 && !anyAd) return false; // a flow with no criteria never matches by accident
+  const fromAd = subject.adIds.filter(Boolean);
+  if (anyAd && fromAd.length > 0) return true;
+  const hasAd = fromAd.some((id) => ads.includes(String(id)));
   const hasList = subject.listIds.some((id) => lists.includes(String(id)));
   return hasAd || hasList;
 }

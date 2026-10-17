@@ -32,10 +32,11 @@ const hourCache = new Map()       // business_id -> { count, at }
 const activeLanes = new Set()     // business ids whose lane is running right now
 let lastSweepAt = 0
 
-// How long "typing..." shows before a message appears: longer text, longer typing. Capped at 5 seconds.
+// How long "typing..." shows before a message appears: longer text, longer typing. Short on purpose, because a customer who
+// just wrote in should see an answer within a few seconds. Capped at 2 seconds.
 export function typingDelayMs(text, rand = Math.random) {
-  const length = Math.min(String(text ?? '').length, 160)
-  return Math.min(5000, Math.round(700 + length * 30 + rand() * 600))
+  const length = Math.min(String(text ?? '').length, 120)
+  return Math.min(2000, Math.round(400 + length * 10 + rand() * 300))
 }
 
 export function messageKind(item) {

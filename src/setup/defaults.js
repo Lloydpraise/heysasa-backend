@@ -1,3 +1,5 @@
+import { describeAudience, DEFAULT_AUDIENCE } from '../chatAi/audience.js';
+
 // Recommended settings for the two switches, and the same settings in plain words for the "See the settings" panel.
 // Pure: no database. The keys match the follow-up settings the app already saves (followupSettingsRoutes.js).
 
@@ -13,7 +15,7 @@ export const RECOMMENDED = {
         quiet_start: 21, quiet_end: 8,
         active_days: [1, 2, 3, 4, 5, 6],
     },
-    chat: { daily_cap: 30 },
+    chat: { daily_cap: 30, audience: DEFAULT_AUDIENCE },
 };
 
 export const FOLLOWUP_COLUMNS = {
@@ -83,9 +85,10 @@ export function describeFollowups(p) {
     ];
 }
 
-export function describeChat(cap) {
+export function describeChat(cap, audience = ['all']) {
     return [
         { key: 'chat_cap', label: 'Chats per day', value: String(cap), plain: `HeySasa can start and answer up to ${cap} customer chats a day.`, edit: { type: 'number', field: 'daily_cap', current: cap, min: 1, max: 1000 } },
+        { key: 'chat_audience', label: 'Who HeySasa answers', value: describeAudience(audience), plain: `HeySasa answers ${describeAudience(audience)}. Everyone else you answer yourself.`, edit: null },
         { key: 'chat_pause', label: 'When you join a chat', value: 'HeySasa steps back', plain: 'If you reply to a customer yourself, HeySasa pauses in that chat so you do not talk over each other.', edit: null },
     ];
 }

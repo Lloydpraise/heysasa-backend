@@ -22,6 +22,7 @@ import {
 import { debugLog } from './debugConsole.js';
 import { deleteSessionRecord } from './evolutionConnections.js';
 import { scheduleDisconnectNotice } from './disconnectNotice.js';
+import { triggerChatAi } from '../chatAi/index.js';
 
 async function notifyFollowupEngineActivity(contactId, conversationId, campaignStepEventId, inbound) {
     const token = process.env.DEBUG_TOKEN;
@@ -236,6 +237,14 @@ export async function processLiveMessage(messages, businessId) {
                 debugLog('error', 'Message Insert', 'Failed to store incoming message', { businessId, keyId, error: msgError });
             } else if (type !== 'reaction') {
                 void notifyFollowupEngineActivity(contactId, conversationId, campaignStepEventId, !isFromMe);
+                // Wake the chat AI for a customer message. Its gates (switch, audience, hours, cap, balance) decide whether it
+                // answers; with the switch off it does nothing. Fire-and-forget: it must never slow or break the webhook.
+                if (!isFromMe) {
+                    triggerChatAi({
+                        businessId, conversationId, contactId,
+                        message: { keyId, text, type, isFromMe: false, isGroupOrBroadcast: false, sentAt: timestamp ? new Date(timestamp * 1000).toISOString() : new Date().toISOString() },
+                    });
+                }
             }
 
         } catch (error) {

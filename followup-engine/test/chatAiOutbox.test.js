@@ -68,7 +68,7 @@ test('a queued reply is sent through the same Evolution sender, saved as chat_ai
   assert.equal(r.sent, 1)
   assert.deepEqual([sends[0].instance, sends[0].number], ['heysasa_b1', '254712345678'])
   assert.equal(sends[0].content.text, 'Hello')
-  assert.ok(sends[0].content.delay >= 700, 'typing time is set')
+  assert.ok(sends[0].content.delay >= 400, 'typing time is set')
   assert.deepEqual([state.chat_ai_outbox[0].status, state.chat_ai_outbox[0].whatsapp_message_id], ['sent', 'W1'])
   assert.deepEqual([state.messages[0].agent_role, state.messages[0].role, state.messages[0].direction, state.messages[0].whatsapp_message_id], ['chat_ai', 'ai', 'out', 'W1'])
 })
@@ -90,7 +90,7 @@ test('a chat\'s messages go out in order and close together; a different custome
   const r = await processChatAiOutbox(deps)
   assert.equal(r.sent, 3, 'one pass sends the whole chat')
   assert.deepEqual(sends.map((x) => x.content.text), ['photo caption', 'the reply', 'someone else'])
-  assert.deepEqual(sleeps, [600, 2000], 'short gap inside a chat, the usual gap before another customer')
+  assert.deepEqual(sleeps, [600, 800], 'short gap inside a chat, the usual gap before another customer')
   assert.deepEqual(state.chat_ai_outbox.map((o) => o.status), ['sent', 'sent', 'sent'])
 })
 
@@ -200,5 +200,6 @@ test('a message the brain already cancelled is not sent, and a stuck "sending" r
 
 test('typing time grows with the message length and never exceeds five seconds', () => {
   assert.ok(typingDelayMs('ok', () => 0) < typingDelayMs('x'.repeat(120), () => 0))
-  assert.equal(typingDelayMs('x'.repeat(5000), () => 1), 5000)
+  assert.equal(typingDelayMs('x'.repeat(5000), () => 1), 1900)
+  assert.ok(typingDelayMs('x'.repeat(5000), () => 1) <= 2000, 'typing never holds a reply back for more than 2 seconds')
 })

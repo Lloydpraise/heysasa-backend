@@ -40,8 +40,8 @@ export const ANTIBAN_WINDOW_MS = 60 * 60_000   // sliding window size for the ho
 // ── Chat AI lane (replies to customers who wrote to the business first) ──
 // Same WhatsApp connection and send code as follow-ups, but its own pacing and its own counter
 // (chat_ai_outbox). A reply to a customer who just wrote in can't wait 20-65 seconds like a campaign message.
-export const CHAT_AI_MIN_GAP_MS = parseInt(process.env.CHAT_AI_MIN_GAP_MS ?? '2000')            // floor gap between chat AI sends per business, when the next message is for a DIFFERENT customer
-export const CHAT_AI_GAP_JITTER_MS = parseInt(process.env.CHAT_AI_GAP_JITTER_MS ?? '2500')      // random extra on top of the floor
+export const CHAT_AI_MIN_GAP_MS = parseInt(process.env.CHAT_AI_MIN_GAP_MS ?? '800')            // floor gap between chat AI sends per business, when the next message is for a DIFFERENT customer
+export const CHAT_AI_GAP_JITTER_MS = parseInt(process.env.CHAT_AI_GAP_JITTER_MS ?? '700')      // random extra on top of the floor
 // Messages in the SAME chat (product photos, then the written reply) go out close together, the way a person sends them.
 // The typing time set on each message still applies on top of this, so they do not arrive in a single burst.
 export const CHAT_AI_SAME_CHAT_GAP_MS = parseInt(process.env.CHAT_AI_SAME_CHAT_GAP_MS ?? '600')

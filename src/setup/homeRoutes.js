@@ -10,6 +10,7 @@ import { normalizeOutboundMedia } from '../../followup-engine/src/lib/media.js';
 import { resolveBusinessId } from './auth.js';
 import { buildSetupDeps } from './setupDeps.js';
 import { groupApprovals } from './homeApprovals.js';
+import { cleanAudience } from '../chatAi/audience.js';
 import { applySwitches, hasBalance, loadBalance } from './switches.js';
 import { RECOMMENDED, followupPrefsFor, prefsFromColumns, describeFollowups, describeChat, FOLLOWUP_COLUMNS } from './defaults.js';
 
@@ -22,7 +23,7 @@ router.get('/setup/defaults', async (req, res, next) => {
     try {
         const businessId = await resolveBusinessId(req, res);
         if (!businessId) return;
-        const columns = ['business_type', 'followup_ai_enabled', 'chat_ai_enabled', 'chat_ai_daily_cap', 'persona_pack_status', 'subscription_active', ...Object.values(FOLLOWUP_COLUMNS)].join(', ');
+        const columns = ['business_type', 'followup_ai_enabled', 'chat_ai_enabled', 'chat_ai_daily_cap', 'chat_ai_settings', 'persona_pack_status', 'subscription_active', ...Object.values(FOLLOWUP_COLUMNS)].join(', ');
         const { data: business } = await supabase.from('businesses').select(columns).eq('business_id', businessId).maybeSingle();
         if (!business) return res.status(404).json({ ok: false, error: 'business_not_found' });
         const setup = await store.get(businessId);
@@ -30,12 +31,14 @@ router.get('/setup/defaults', async (req, res, next) => {
         const followupsOn = business.followup_ai_enabled === true;
         const prefs = followupsOn ? prefsFromColumns(business) : followupPrefsFor(setup?.answers || {});
         const chatCap = business.chat_ai_enabled && business.chat_ai_daily_cap > 0 ? business.chat_ai_daily_cap : RECOMMENDED.chat.daily_cap;
+        const savedAudience = cleanAudience(business.chat_ai_settings?.audience);
+        const chatAudience = savedAudience || (business.chat_ai_enabled === true ? ['all'] : RECOMMENDED.chat.audience);
         return res.json({
             ok: true,
             subscription_active: business.subscription_active !== false,
             wallet: { has_balance: hasBalance(business, await loadBalance(supabase, businessId)) },
             followups: { on: followupsOn, prefs, lines: describeFollowups(prefs) },
-            chat: { on: business.chat_ai_enabled === true, daily_cap: chatCap, lines: describeChat(chatCap), persona_ready: business.persona_pack_status === 'ready' },
+            chat: { on: business.chat_ai_enabled === true, daily_cap: chatCap, audience: chatAudience, lines: describeChat(chatCap, chatAudience), persona_ready: business.persona_pack_status === 'ready' },
         });
     } catch (error) { return next(error); }
 });
