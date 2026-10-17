@@ -6,12 +6,17 @@ import { evaluateMessageGates, evaluateChatGates, SKIP_MESSAGES } from './gates.
 
 // Only reasons the owner would want to know about get a row in chat_ai_turns. Everything else is routine.
 const LOGGED_SKIPS = new Set(['cap_reached']);
+// Skips that are normal for every message (chat off, your own messages, groups) are not written to the debug console, or it would fill with noise.
+const QUIET_SKIPS = new Set(['switch_off', 'from_me', 'group_or_broadcast']);
 const MAX_EXTRA_RUNS = 2;
 
 export function createOrchestrator({ store, brain = null, log = () => {}, now = () => new Date() }) {
   return async function handleInboundMessage(input) {
     const { businessId, conversationId, contactId, message } = input;
-    const skip = (reason, extra = {}) => ({ status: 'skipped', reason, detail: SKIP_MESSAGES[reason], ...extra });
+    const skip = (reason, extra = {}) => {
+      if (!QUIET_SKIPS.has(reason)) log(reason === 'no_balance' || reason === 'cap_reached' ? 'warn' : 'info', 'Chat AI', `Chat AI did not answer: ${SKIP_MESSAGES[reason] || reason}`, { businessId, conversationId, reason, messageId: message?.keyId || null, ...extra });
+      return { status: 'skipped', reason, detail: SKIP_MESSAGES[reason], ...extra };
+    };
 
     const business = await store.loadBusiness(businessId);
     const first = evaluateMessageGates({ message, business, now: now() });

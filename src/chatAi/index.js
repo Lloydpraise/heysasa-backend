@@ -11,7 +11,7 @@ const SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABAS
 // (the default) this never calls it.
 const handle = createOrchestrator({
   store: createStore(supabase),
-  brain: createBrainCaller({ url: SUPABASE_URL, serviceKey: SERVICE_KEY }),
+  brain: createBrainCaller({ url: SUPABASE_URL, serviceKey: SERVICE_KEY, log: debugLog }),
   log: debugLog,
 });
 

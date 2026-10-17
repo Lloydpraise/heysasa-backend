@@ -64,6 +64,7 @@ function areaFromStep(step) {
     if (s.includes('webhook')) return 'webhook';
     if (s.includes('evolution') || s.includes('instance') || s.includes('connection') || s.includes('resync')) return 'connection';
     if (s.includes('follow-up engine') || s.includes('followup engine')) return 'engine';
+    if (s.includes('chat ai')) return 'chat_ai';
     if (s.includes('analysis')) return 'analysis';
     if (s.includes('business')) return 'system';
     return 'system';
