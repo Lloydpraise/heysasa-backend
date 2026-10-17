@@ -14,11 +14,14 @@ import { buildDeps } from './core/deps.ts';
 import { createContextCache } from './core/context.ts';
 
 const allowedOrigins = new Set([
-  'http://localhost:5173',
   'https://heysasa.co.ke',
 ]);
+// The site and its sub-domains, and the local dev server on any port. A token is still needed for everything.
+const originAllowed = (origin: string | null) => Boolean(origin) && (
+  allowedOrigins.has(origin as string) || /^https:\/\/([a-z0-9-]+\.)*heysasa\.co\.ke$/i.test(origin as string) || /^http:\/\/(localhost|127\.0\.0\.1):\d+$/.test(origin as string)
+);
 const corsHeaders = (origin: string | null) => ({
-  ...(origin && allowedOrigins.has(origin) ? { 'Access-Control-Allow-Origin': origin } : {}),
+  ...(origin && originAllowed(origin) ? { 'Access-Control-Allow-Origin': origin } : {}),
   'Access-Control-Allow-Headers': 'authorization, apikey, x-client-info, content-type',
   'Access-Control-Allow-Methods': 'POST, OPTIONS',
   'Vary': 'Origin',
@@ -30,10 +33,16 @@ const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
 const contextCache = createContextCache();
 
 Deno.serve(async (req) => {
-  const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), {
-    status,
-    headers: { ...corsHeaders(req.headers.get('origin')), 'Content-Type': 'application/json' },
-  });
+  // One line for EVERY request, before anything can refuse it. If this line is missing in the function logs, the request never arrived.
+  const origin = req.headers.get('origin');
+  console.log(JSON.stringify({ event: 'sasa-brain.request', build: BUILD, method: req.method, origin, origin_allowed: originAllowed(origin), has_auth: Boolean(req.headers.get('authorization')) }));
+  const json = (body: unknown, status = 200) => {
+    if (status >= 400) console.warn(JSON.stringify({ event: 'sasa-brain.refused', status, error: (body as { error?: string })?.error ?? null }));
+    return new Response(JSON.stringify(body), {
+      status,
+      headers: { ...corsHeaders(req.headers.get('origin')), 'Content-Type': 'application/json' },
+    });
+  };
   if (req.method === 'OPTIONS') return new Response('ok', { headers: corsHeaders(req.headers.get('origin')) });
   if (req.method !== 'POST') return json({ error: 'POST only' }, 405);
 

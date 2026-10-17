@@ -242,7 +242,7 @@ export async function processLiveMessage(messages, businessId) {
                 if (!isFromMe) {
                     triggerChatAi({
                         businessId, conversationId, contactId,
-                        message: { keyId, text, type, isFromMe: false, isGroupOrBroadcast: false, sentAt: timestamp ? new Date(timestamp * 1000).toISOString() : new Date().toISOString() },
+                        message: { keyId, jid, text, type, isFromMe: false, isGroupOrBroadcast: false, sentAt: timestamp ? new Date(timestamp * 1000).toISOString() : new Date().toISOString() },
                     });
                 }
             }

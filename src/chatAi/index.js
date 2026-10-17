@@ -3,6 +3,7 @@ import { debugLog } from '../services/debugConsole.js';
 import { createStore } from './store.js';
 import { createOrchestrator } from './orchestrator.js';
 import { createBrainCaller } from './brainClient.js';
+import { createTyping } from './typing.js';
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_KEY;
@@ -12,6 +13,7 @@ const SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABAS
 const handle = createOrchestrator({
   store: createStore(supabase),
   brain: createBrainCaller({ url: SUPABASE_URL, serviceKey: SERVICE_KEY, log: debugLog }),
+  typing: createTyping({ supabase, log: debugLog }),
   log: debugLog,
 });
 

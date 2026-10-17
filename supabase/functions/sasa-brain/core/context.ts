@@ -25,7 +25,7 @@ export function readSettings(raw: Record<string, unknown> | null | undefined) {
   const effort = ['low', 'medium', 'high'].includes(String(s.effort)) ? String(s.effort) : 'low';
   return {
     effort,
-    settleMs: clamp(s.settle_ms, 0, 15_000, 1_200),   // short wait for a burst of messages; was 3 s, which alone used most of the 5 s reply budget
+    settleMs: clamp(s.settle_ms, 0, 15_000, 0),   // no waiting for a burst: the AI starts at once. A business can still ask for a wait with settle_ms.
     holdingAfterMs: clamp(s.holding_after_ms, 0, 60_000, 9_000),
     maxRounds: clamp(s.max_rounds, 2, 10, 6),
     holdingModel: typeof s.holding_model === 'string' && s.holding_model ? s.holding_model : 'gpt-4.1-mini',

@@ -10,7 +10,10 @@ const LOGGED_SKIPS = new Set(['cap_reached']);
 const QUIET_SKIPS = new Set(['switch_off', 'from_me', 'group_or_broadcast']);
 const MAX_EXTRA_RUNS = 2;
 
-export function createOrchestrator({ store, brain = null, log = () => {}, now = () => new Date() }) {
+// Typing is a nicety: whatever it does, even throwing or rejecting, must never reach the reply or crash the process.
+const quietly = (fn) => { try { Promise.resolve(fn()).catch(() => {}); } catch { /* ignored on purpose */ } };
+
+export function createOrchestrator({ store, brain = null, typing = null, log = () => {}, now = () => new Date() }) {
   return async function handleInboundMessage(input) {
     const { businessId, conversationId, contactId, message } = input;
     const skip = (reason, extra = {}) => {
@@ -54,7 +57,10 @@ export function createOrchestrator({ store, brain = null, log = () => {}, now = 
       let outcome;
       for (let run = 0; ; run++) {
         const startedAt = now().toISOString();
+        // The customer sees typing while the AI works. Fire and forget: it must never slow or break the reply.
+        quietly(() => typing?.start(businessId, current.jid || message.jid));
         outcome = await brain({ businessId, conversationId, contactId, message: current, business, ...chat, slot, mode: 'live' });
+        if (!outcome?.replied) quietly(() => typing?.stop(businessId, current.jid || message.jid));   // nothing was sent: clear the typing indicator
         if (run >= MAX_EXTRA_RUNS) break;
         const waiting = await store.unansweredInboundSince(conversationId, startedAt);
         if (!waiting) break;
@@ -62,6 +68,7 @@ export function createOrchestrator({ store, brain = null, log = () => {}, now = 
       }
       return { status: 'handled', ...outcome };
     } catch (error) {
+      quietly(() => typing?.stop(businessId, message.jid));
       await store.logTurn({
         business_id: businessId, conversation_id: conversationId, contact_id: contactId,
         trigger_message_id: message.keyId || null, mode: 'live', status: 'error', error: String(error.message || error).slice(0, 500),

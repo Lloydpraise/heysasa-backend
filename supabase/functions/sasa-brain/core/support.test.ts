@@ -109,7 +109,7 @@ test('history labels the owner and automatic follow-ups, and shows photos and vo
 });
 
 test('settings have safe defaults and limits', () => {
-  assert.deepEqual(readSettings(null), { effort: 'low', settleMs: 3000, holdingAfterMs: 9000, maxRounds: 6, holdingModel: 'gpt-4.1-mini' });
+  assert.deepEqual(readSettings(null), { effort: 'low', settleMs: 0, holdingAfterMs: 9000, maxRounds: 6, holdingModel: 'gpt-4.1-mini' });
   const s = readSettings({ effort: 'banana', settle_ms: 999999, holding_after_ms: 0, max_rounds: 1 });
   assert.deepEqual([s.effort, s.settleMs, s.holdingAfterMs, s.maxRounds], ['low', 15000, 0, 2]);
   assert.equal(readSettings({ effort: 'high' }).effort, 'high', 'a business can still ask for more thinking');
