@@ -101,6 +101,8 @@ Deno.serve(async (req) => {
       usage: outcome.usage, error: outcome.error ?? null, ms: Date.now() - startedAt, build: BUILD,
       // The tool trail and the model's reasoning summary: what the Playground shows beside the reply.
       steps: input.simulate ? outcome.steps : undefined, thoughts: input.simulate ? outcome.thoughts : undefined,
+      // What the Playground shows: photos and images that would have gone out, and who a handoff would alert.
+      outbox: input.simulate ? outcome.outbox ?? [] : undefined, handoff_alert: input.simulate ? outcome.handoff_alert ?? null : undefined,
     });
   } catch (error) {
     console.error(JSON.stringify({ event: 'sasa-brain.error', ...tag, error: String((error as Error)?.message ?? error), stack: String((error as Error)?.stack ?? '').slice(0, 800), ms: Date.now() - startedAt }));

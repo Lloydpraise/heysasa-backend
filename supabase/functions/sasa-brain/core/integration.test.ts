@@ -15,6 +15,20 @@ function fakeDb(tables: Record<string, Row[]>, rpcs: Record<string, (args: any) 
   let idCounter = 0;
   return {
     tables,
+    // Stand-in for Supabase realtime: when the brain subscribes, the "sender" (if it is up) marks queued rows sent, like the follow-up engine would.
+    senderUp: true,
+    channel() {
+      const ch: any = {
+        on: () => ch,
+        subscribe(cb: (s: string) => void) {
+          if ((this as any).self.senderUp) { let n = 0; for (const r of tables.chat_ai_outbox ?? []) if (r.status === 'queued') { r.status = 'sent'; r.whatsapp_message_id = `S${++n}`; } }
+          setTimeout(() => cb('SUBSCRIBED'), 0);
+        },
+      };
+      ch.self = this;
+      return ch;
+    },
+    removeChannel: async () => {},
     rpc: async (fn: string, args: any) => ({ data: rpcs[fn] ? rpcs[fn](args) : null, error: rpcs[fn] ? null : { message: `no rpc ${fn}` } }),
     from(table: string) {
       if (!tables[table]) throw new Error(`unknown table ${table}`);
@@ -90,10 +104,13 @@ function world() {
     chat_ai_outbox: [],
     chat_ai_turns: [],
     business_balances: [{ business_id: 'b1', balance_usd: 5 }],
+    knowledge_sources: [],
+    handoff_events: [],
   };
   const billed: any[] = [];
   const db = fakeDb(tables, {
     bill_ai_usage: (a: any) => { billed.push(a); return { base_usd: 0.001, billed_usd: 0.008 }; },
+    match_knowledge_chunks: (a: any) => (a.p_business_id === 'b1' && a.p_bot === 'chat' ? [{ source_id: 'k1', title: 'Refund SOP', page: 2, content: 'Refunds are paid within 3 days after the item is returned.' }] : []),
     match_products_v8: (a: any) => (a.filter_business_id === 'b1' ? [{ id: 'p1', title: 'Volume Lash Set', price: 3500, category: 'Lashes', description_short: 'Fluffy', images: ['https://img.test/p1.jpg'], stock_quantity: 0, product_type: 'service' }] : []),
   });
   // Stand-in sender: whenever the brain waits, mark queued outbox rows as sent, like the follow-up engine would.
@@ -190,10 +207,14 @@ test('if the sender is down the AI is told the customer saw nothing and the turn
   const fetchFn = (async (_u: string, init: any) => { JSON.parse(init.body); return ok(script.shift()); }) as unknown as typeof fetch;
   let clock = 0;
   const sleep = async () => { clock += 20_000; };
+  (db as any).senderUp = false;   // nobody picks the message up
   const input = { business_id: 'b1', conversation_id: 'c1', contact_id: 7, trigger_message_id: 'W1' };
   const deps = buildDeps({ db, openaiKey: 'k', fetch: fetchFn, sleep }, input);
   const realNow = Date.now;
+  const realSetTimeout = globalThis.setTimeout;
   Date.now = () => realNow() + clock;
+  // the delivery wait is 45 s; shrink it so the test does not take 45 s
+  (globalThis as any).setTimeout = (fn: any, ms?: number, ...rest: any[]) => realSetTimeout(fn, ms && ms >= 20_000 ? 5 : ms, ...rest);
   try {
     const out = await runTurn(deps, input);
     assert.equal(out.status, 'error');
@@ -201,6 +222,7 @@ test('if the sender is down the AI is told the customer saw nothing and the turn
     assert.equal(tables.chat_ai_outbox[0].status, 'failed', 'a message nobody sent is cancelled so it cannot go out late');
   } finally {
     Date.now = realNow;
+    globalThis.setTimeout = realSetTimeout;
   }
 });
 
@@ -216,4 +238,124 @@ test('a simulation sends nothing and writes nothing to the customer, but logs a 
   assert.equal(tables.contacts[0].notes, null);
   assert.equal(tables.conversations[0].chat_ai_flow_id, null);
   assert.equal(tables.chat_ai_turns[0].mode, 'simulation');
+});
+
+const FILE_TOOLS = [
+  { name: 'file_search', business_id: null, enabled: true, description: 'search files', parameters: {}, kind: 'builtin', target: 'file_search', phase: 'lookup' },
+  { name: 'send_knowledge_image', business_id: null, enabled: true, description: 'send an image', parameters: {}, kind: 'builtin', target: 'send_knowledge_image', phase: 'send' },
+];
+
+test('files: the AI sees its file menu and file_search, searches by meaning, and answers from the result', async () => {
+  const { tables, db, sleep } = world();
+  tables.chat_ai_tools.push(...FILE_TOOLS);
+  tables.knowledge_sources.push(
+    { id: 'k1', business_id: 'b1', title: 'Refund SOP', use_case: 'Use for refund and return questions', file_type: 'pdf', used_by: 'chat', is_active: true, status: 'ready', created_at: '1' },
+    { id: 'k2', business_id: 'b1', title: 'Follow-up script', use_case: 'x', file_type: 'pdf', used_by: 'followup', is_active: true, status: 'ready', created_at: '2' },
+    { id: 'k3', business_id: 'b1', title: 'Still reading', use_case: 'x', file_type: 'pdf', used_by: 'both', is_active: true, status: 'processing', created_at: '3' },
+  );
+  const bodies: any[] = [];
+  const script = [
+    { id: 'r1', usage, output: [call(1, 'file_search', { query: 'how fast are refunds' })] },
+    { id: 'r2', usage, output: [message('Refunds are paid within 3 days after the item comes back.')] },
+  ];
+  const fetchFn = (async (url: string, init: any) => {
+    if (String(url).endsWith('/embeddings')) return ok({ data: [{ embedding: [0.1, 0.2] }] });
+    bodies.push(JSON.parse(init.body));
+    return ok(script.shift());
+  }) as unknown as typeof fetch;
+  const input = { business_id: 'b1', conversation_id: 'c1', contact_id: 7, trigger_message_id: 'W1' };
+  const out = await runTurn(buildDeps({ db, openaiKey: 'k', fetch: fetchFn, sleep }, input), input);
+  assert.equal(out.status, 'replied', String(out.error));
+  const names = bodies[0].tools.map((t: any) => t.name);
+  assert.ok(names.includes('file_search'));
+  assert.ok(!names.includes('send_knowledge_image'), 'no image files, so no image tool');
+  assert.match(bodies[0].instructions, /BUSINESS FILES/);
+  assert.match(bodies[0].instructions, /Refund SOP \[id k1, pdf\]: Use for refund and return questions/);
+  assert.doesNotMatch(bodies[0].instructions, /Follow-up script|Still reading/, 'only active, finished files meant for the chat AI');
+  assert.match(bodies[1].input[0].output, /within 3 days/);
+});
+
+test('files: with no files the file tools are not offered', async () => {
+  const { tables, db, sleep } = world();
+  tables.chat_ai_tools.push(...FILE_TOOLS);
+  const bodies: any[] = [];
+  const script = [{ id: 'r1', usage, output: [message('Classic or volume?')] }];
+  const fetchFn = (async (_u: string, init: any) => { bodies.push(JSON.parse(init.body)); return ok(script.shift()); }) as unknown as typeof fetch;
+  const input = { business_id: 'b1', conversation_id: 'c1', contact_id: 7, trigger_message_id: 'W1' };
+  await runTurn(buildDeps({ db, openaiKey: 'k', fetch: fetchFn, sleep }, input), input);
+  assert.ok(!bodies[0].tools.some((t: any) => t.name === 'file_search' || t.name === 'send_knowledge_image'));
+  assert.doesNotMatch(bodies[0].instructions, /BUSINESS FILES/);
+});
+
+test('handoff: a case rule decides who is told, at least as urgently as the rule says, and the alert is queued for the backend', async () => {
+  const { tables, db, sleep } = world();
+  Object.assign(tables.businesses[0], {
+    owner_phone: '0711000111',
+    chat_ai_settings: {
+      settle_ms: 0, holding_after_ms: 0,
+      handoff: { recipients: [{ id: 'w', name: 'Wanjiru', phone: '0722 333 444' }], rules: [{ id: 'refund', label: 'Refund or complaint', when: 'wants a refund', to: ['w', 'owner'], urgency: 'high' }], default_to: ['owner'] },
+    },
+  });
+  tables.contacts[0].phone = '254799888777';
+  const bodies: any[] = [];
+  const script = [
+    { id: 'r1', usage, output: [call(1, 'handoff', { reason: 'wants a refund', urgency: 'normal', summary: 'Amina wants her money back.', rule_id: 'refund' })] },
+    { id: 'r2', usage, output: [message('I have passed this on, they will pick up from here.')] },
+  ];
+  const fetchFn = (async (_u: string, init: any) => { bodies.push(JSON.parse(init.body)); return ok(script.shift()); }) as unknown as typeof fetch;
+  const input = { business_id: 'b1', conversation_id: 'c1', contact_id: 7, trigger_message_id: 'W1' };
+  const out = await runTurn(buildDeps({ db, openaiKey: 'k', fetch: fetchFn, sleep }, input), input);
+  assert.equal(out.status, 'handoff', String(out.error));
+  assert.match(bodies[0].instructions, /HANDOFF CASES/);
+  assert.match(bodies[0].instructions, /rule_id "refund" \(Wanjiru and the owner will be told, urgent\)/);
+  const event = tables.handoff_events[0];
+  assert.deepEqual(event.recipients, [{ name: 'Wanjiru', phone: '254722333444' }, { name: 'Owner', phone: '254711000111' }]);
+  assert.deepEqual([event.rule_id, event.urgency, event.notify_status, event.contact_phone, event.contact_name, event.source], ['refund', 'high', 'pending', '254799888777', 'Amina', 'ai']);
+  assert.equal(tables.conversations[0].handover_urgency, 'high');
+});
+
+test('handoff: with no rules the owner is told, and with the alert switched off nothing is queued to send', async () => {
+  for (const alert of [true, false]) {
+    const { tables, db, sleep } = world();
+    Object.assign(tables.businesses[0], { owner_phone: '0711000111', chat_ai_settings: { settle_ms: 0, holding_after_ms: 0, handoff: { alert_whatsapp: alert } } });
+    const script = [
+      { id: 'r1', usage, output: [call(1, 'handoff', { reason: 'asks for a call', urgency: 'normal', summary: 'Wants a call.' })] },
+      { id: 'r2', usage, output: [message('The owner will pick up from here.')] },
+    ];
+    const fetchFn = (async (_u: string, init: any) => { JSON.parse(init.body); return ok(script.shift()); }) as unknown as typeof fetch;
+    const input = { business_id: 'b1', conversation_id: 'c1', contact_id: 7, trigger_message_id: 'W1' };
+    await runTurn(buildDeps({ db, openaiKey: 'k', fetch: fetchFn, sleep }, input), input);
+    const event = tables.handoff_events[0];
+    assert.equal(tables.conversations[0].handover_flag, true, 'Home still shows the handoff');
+    assert.deepEqual(event.recipients, alert ? [{ name: 'Owner', phone: '254711000111' }] : []);
+    assert.equal(event.notify_status, alert ? 'pending' : 'skipped');
+  }
+});
+
+test('playground: a simulation returns the photos and images that would have gone out, and who a handoff would alert', async () => {
+  const { tables, db, sleep } = world();
+  tables.chat_ai_tools.push(...FILE_TOOLS);
+  tables.knowledge_sources.push({ id: 'k9', business_id: 'b1', title: 'Price list', use_case: 'Send when asked for prices', file_type: 'image', used_by: 'both', is_active: true, status: 'ready', storage_path: 'b1/pricelist.png', created_at: '1' });
+  (db as any).storage = { from: () => ({ createSignedUrl: async (path: string) => ({ data: { signedUrl: `https://signed.test/${path}` } }) }) };
+  const script = [
+    { id: 'r1', usage, output: [call(1, 'search_products', { query: 'volume set' })] },
+    { id: 'r2', usage, output: [call(2, 'send_products', { product_ids: ['p1'] })] },
+    { id: 'r3', usage, output: [call(3, 'send_knowledge_image', { source_id: 'k9', caption: 'Our prices' })] },
+    { id: 'r4', usage, output: [call(4, 'handoff', { reason: 'asks for a call', urgency: 'normal', summary: 'x' })] },
+    { id: 'r5', usage, output: [message('Here are the prices. The owner will call.')] },
+  ];
+  const fetchFn = (async (url: string, init: any) => {
+    if (String(url).endsWith('/embeddings')) return ok({ data: [{ embedding: [0.1, 0.2] }] });
+    JSON.parse(init.body);
+    return ok(script.shift());
+  }) as unknown as typeof fetch;
+  tables.businesses[0].owner_phone = '0711000111';
+  const input = { business_id: 'b1', simulate: true, message: 'prices?', history: [{ role: 'user' as const, text: 'prices?' }] };
+  const out = await runTurn(buildDeps({ db, openaiKey: 'k', fetch: fetchFn, sleep }, input), input);
+  assert.ok(out.status === 'handoff' || out.status === 'replied', String(out.error));
+  assert.deepEqual(out.outbox!.map((o) => o.media?.url), ['https://img.test/p1.jpg', 'https://signed.test/b1/pricelist.png']);
+  assert.equal(out.outbox![1].media!.caption, 'Our prices');
+  assert.deepEqual(out.handoff_alert!.recipients, [{ name: 'Owner', phone: '254711000111' }]);
+  assert.equal(tables.chat_ai_outbox.length, 0);
+  assert.equal(tables.handoff_events.length, 0, 'a simulation never alerts anyone');
 });

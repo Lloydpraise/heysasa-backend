@@ -1,6 +1,7 @@
 // The built-in tools. Each handler gets the arguments the model chose and the state of the current turn.
 
 import type { ToolRow } from './tools.ts';
+import { resolveRecipients, type HandoffConfig } from './handoff.ts';
 
 export type ProductRow = {
   id: string; title: string; price: number | null; old_price?: number | null; category: string | null;
@@ -22,6 +23,11 @@ export type TurnState = {
   pending?: PendingSend[];         // product photos queued but not yet confirmed sent (see settlePending)
   handoff: { reason: string; urgency: string; summary: string } | null;
   corpus: string[];                // every legitimate fact the reply may use (feeds the price check)
+  knowledge: Array<{ id: string; title: string; file_type: string }>;   // files this chat may search (active, ready, for the chat AI)
+  handoffConfig: HandoffConfig | null;
+  ownerPhone: string | null;
+  outbox: SendItem[];              // simulation only: what would have been sent, so the Playground can show it
+  handoffAlert: { rule: { id: string; label: string } | null; recipients: Array<{ name: string; phone: string }>; whatsapp: boolean } | null;
 };
 
 export type Deps = {
@@ -61,6 +67,38 @@ export function formatPrice(price: number | null | undefined, currency: string |
 }
 
 const str = (v: unknown) => (typeof v === 'string' ? v.trim() : '');
+const URGENCY_RANK: Record<string, number> = { low: 0, normal: 1, high: 2 };
+
+// Records who must be told about a handoff. The backend reads these rows and sends the WhatsApp message from the
+// HeySasa number (an edge function cannot reach that WhatsApp line). Home reads the conversation itself, so it shows the
+// handoff whether or not this row could be saved. Never throws: a failed alert must not break the customer's reply.
+export async function queueHandoffAlert(
+  // deno-lint-ignore no-explicit-any
+  db: any,
+  state: Pick<TurnState, 'businessId' | 'contactId' | 'conversationId' | 'handoffConfig' | 'ownerPhone' | 'simulate' | 'handoffAlert'>,
+  h: { reason: string; urgency: string; summary: string; ruleId?: string | null; source: 'ai' | 'rule' },
+): Promise<{ urgency: string }> {
+  const config = state.handoffConfig;
+  const { recipients, rule } = config ? resolveRecipients(config, h.ruleId, state.ownerPhone)
+    : { recipients: resolveRecipients({ recipients: [], rules: [], default_to: ['owner'], alert_whatsapp: true }, null, state.ownerPhone).recipients, rule: null };
+  const urgency = rule && (URGENCY_RANK[rule.urgency] ?? 1) > (URGENCY_RANK[h.urgency] ?? 1) ? rule.urgency : h.urgency;
+  const whatsapp = config?.alert_whatsapp !== false;
+  state.handoffAlert = { rule: rule ? { id: rule.id, label: rule.label } : null, recipients, whatsapp };
+  if (state.simulate || !state.conversationId) return { urgency };
+  try {
+    let contact: { name?: string | null; phone?: string | null } | null = null;
+    if (state.contactId) contact = (await db.from('contacts').select('name, phone').eq('id', state.contactId).maybeSingle())?.data ?? null;
+    await db.from('handoff_events').insert({
+      business_id: state.businessId, conversation_id: state.conversationId, contact_id: state.contactId, contact_name: contact?.name ?? null,
+      contact_phone: normalizeDigits(contact?.phone), reason: h.reason, urgency, summary: h.summary, rule_id: rule?.id ?? null, rule_label: rule?.label ?? null,
+      source: h.source, recipients: whatsapp ? recipients : [], notify_status: whatsapp && recipients.length ? 'pending' : 'skipped',
+    });
+  } catch (error) {
+    console.error(`[handoff] could not queue the alert business=${state.businessId}: ${String((error as Error)?.message ?? error)}`);
+  }
+  return { urgency };
+}
+const normalizeDigits = (v: unknown) => String(v ?? '').replace(/\D+/g, '') || null;
 
 type Handler = (args: Record<string, unknown>, state: TurnState, deps: Deps) => Promise<unknown>;
 
@@ -105,6 +143,47 @@ export const builtinHandlers: Record<string, Handler> = {
     return { results };
   },
 
+  // Searches the business's uploaded files (procedures, price lists, policies...). The chunks are the only source of truth.
+  async file_search(args, state, deps) {
+    const query = str(args.query);
+    if (!query) return { error: 'query is required' };
+    if (!state.knowledge.length) return { results: [], message: 'This business has no files you can search.' };
+    const sourceId = str(args.source_id);
+    if (sourceId && !state.knowledge.some((k) => k.id === sourceId)) return { error: `No file with id "${sourceId}". Use an id from the BUSINESS FILES list.` };
+    const embedding = await deps.embed(query);
+    const { data, error } = await deps.db.rpc('match_knowledge_chunks', {
+      p_business_id: state.businessId, p_embedding: embedding, p_count: 5, p_threshold: 0.25, p_bot: 'chat', p_source_id: sourceId || null,
+    });
+    if (error) throw new Error(`file search failed: ${error.message}`);
+    // deno-lint-ignore no-explicit-any
+    const rows: any[] = data ?? [];
+    if (!rows.length) return { results: [], message: 'Nothing in the files matches. Do not guess. Say you will confirm, and hand off if it matters.' };
+    const results = rows.map((r) => ({
+      file: r.title ?? r.source_title ?? undefined, file_id: r.source_id, page: r.page ?? undefined, text: String(r.content ?? '').slice(0, 900),
+    }));
+    for (const r of results) state.corpus.push(r.text);
+    return { results };
+  },
+
+  async send_knowledge_image(args, state, deps) {
+    const id = str(args.source_id);
+    const listed = state.knowledge.find((k) => k.id === id);
+    if (!listed) return { error: `No file with id "${id}". Use an id from the BUSINESS FILES list.` };
+    if (listed.file_type !== 'image') return { error: 'Only files marked image can be sent. Describe what the file says instead.' };
+    const { data: row, error } = await deps.db.from('knowledge_sources').select('storage_path, title, mime_type')
+      .eq('id', id).eq('business_id', state.businessId).eq('is_active', true).maybeSingle();
+    if (error || !row?.storage_path) return { error: 'That file could not be found.' };
+    const signed = await deps.db.storage.from('business-knowledge').createSignedUrl(row.storage_path, 600);
+    const url = signed?.data?.signedUrl;
+    if (!url) return { error: 'The image could not be prepared. Do not claim the customer saw it.' };
+    const caption = str(args.caption).slice(0, 300) || row.title || '';
+    const items: SendItem[] = [{ media: { type: 'image', url, caption } }];
+    if (state.simulate) state.outbox.push(...items);
+    const result = await deps.send(items);
+    if (!result.ok && !result.results?.some((r) => r.ok)) return { sent: false, error: result.error || 'The image could not be sent. Do not claim the customer saw it.' };
+    return { sent: true, message: 'The customer can now see the image.' };
+  },
+
   async load_skill(args, state) {
     const key = str(args.key);
     const skill = state.skills.get(key);
@@ -146,6 +225,7 @@ export const builtinHandlers: Record<string, Handler> = {
       const photo = Array.isArray(p.images) ? p.images.find((u) => typeof u === 'string' && /^https?:\/\//.test(u)) : null;
       return photo ? { media: { type: 'image', url: photo, caption } } : { text: caption };
     });
+    if (state.simulate) state.outbox.push(...items);
     if (deps.queue) {
       // The photos go out while the AI writes its message. turn.ts waits for them before the message is sent, and tells
       // the AI if any failed, so it still never claims the customer saw something they did not.
@@ -169,10 +249,12 @@ export const builtinHandlers: Record<string, Handler> = {
     const reason = str(args.reason).slice(0, 200) || 'handoff';
     const urgency = ['low', 'normal', 'high'].includes(str(args.urgency)) ? str(args.urgency) : 'normal';
     const summary = str(args.summary).slice(0, 1500);
-    state.handoff = { reason, urgency, summary };
+    const ruleId = str(args.rule_id) || null;
+    const alert = await queueHandoffAlert(deps.db, state, { reason, urgency, summary, ruleId, source: 'ai' });
+    state.handoff = { reason, urgency: alert.urgency, summary };
     if (state.simulate || !state.conversationId) return { ok: true, simulated: state.simulate, instruction: 'Now send the customer one short message saying the owner will pick up. Do not promise a time.' };
     const { error } = await deps.db.from('conversations').update({
-      handover_flag: true, handover_reason: reason, handover_urgency: urgency, handover_summary: summary,
+      handover_flag: true, handover_reason: reason, handover_urgency: alert.urgency, handover_summary: summary,
       handover_at: new Date().toISOString(), handover_source: 'ai', handover_resolved_at: null,
     }).eq('id', state.conversationId);
     if (error) throw new Error(`could not record the handoff: ${error.message}`);

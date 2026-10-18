@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "node --watch src/index.js",
-    "test:assistant": "node --test src/businessAi/*.test.js src/businessAi/agent/*.test.js"
+    "test:assistant": "node --test src/businessAi/*.test.js src/businessAi/agent/*.test.js",
+    "test:knowledge": "node --test --test-force-exit src/knowledge/*.test.js src/handoff/*.test.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.49.1",
@@ -14,6 +15,8 @@
     "cors": "^2.8.6",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
+    "mammoth": "^1.8.0",
+    "pdf-parse": "^1.1.1",
     "ws": "^8.18.1"
   },
   "devDependencies": {

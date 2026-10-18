@@ -1,3 +1,4 @@
+import { loadFollowupKnowledge } from '../lib/knowledge.js'
 import { getMessages, getMaterialsForTouchpoint, getLastSentFollowups, getSequenceStep } from '../lib/db.js'
 import { callBot } from '../lib/ai.js'
 import { runQC } from '../lib/qc.js'
@@ -87,9 +88,13 @@ export async function generateFollowupDraft(supabase, item, contact, business, p
 
   const adBlock = formatAdContext(await getAdContext(supabase, contact))
 
+  // Files the owner uploaded for follow-ups (their procedures, price lists...), matched to where this lead is now.
+  const knowledge = await loadFollowupKnowledge(supabase, { businessId: item.business_id, queryText: [convSummary, `Stage: ${leadStage}`, promptHint].filter(Boolean).join('\n') })
+
   const userContent = [
     `PERSONA:\n${JSON.stringify(pack.persona ?? {})}`,
     `BUSINESS CONTEXT:\n${JSON.stringify(pack.business_context ?? {})}`,
+    knowledge.block,
     `OBJECTION PLAYBOOK:\n${JSON.stringify(pack.objection_playbook ?? [])}`,
     `CUSTOMER PROFILES:\n${JSON.stringify(pack.customer_profiles ?? [])}`,
     `CONVERSATION SUMMARY:\n${convSummary}`,

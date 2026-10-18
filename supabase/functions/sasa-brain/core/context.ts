@@ -8,9 +8,14 @@
 
 import type { TurnContext, TurnInput } from './turn.ts';
 import { renderOwnerRules } from './ownerRules.ts';
+import { readHandoffConfig, renderHandoffRules } from './handoff.ts';
 import type { CustomerFile, HistoryMessage, Skill } from './prompt.ts';
 import type { Flow } from './flows.ts';
 import type { ToolRow } from './tools.ts';
+
+// What the AI may search: the business's active, finished files that the chat AI is allowed to use.
+export type KnowledgeSource = { id: string; title: string; use_case: string; file_type: string };
+const KNOWLEDGE_TOOLS = ['file_search', 'send_knowledge_image'];
 
 const HISTORY_LIMIT = 30;
 const clamp = (n: unknown, min: number, max: number, fallback: number) => {
@@ -84,7 +89,7 @@ function ttl<T>(ms: number, now: () => number): Ttl<T> {
 
 type Core = {
   // deno-lint-ignore no-explicit-any
-  business: any; personaPack: Record<string, unknown> | null; skills: Skill[]; toolRows: ToolRow[]; flows: Flow[];
+  business: any; personaPack: Record<string, unknown> | null; skills: Skill[]; toolRows: ToolRow[]; flows: Flow[]; knowledge: KnowledgeSource[];
 };
 type Category = { name: string; count: number };
 
@@ -100,15 +105,21 @@ export function createContextCache(opts: { coreMs?: number; categoriesMs?: numbe
 
 // deno-lint-ignore no-explicit-any
 async function loadCore(db: any, businessId: string): Promise<Core> {
-  const [business, personaRows, skillRows, toolRows, flowRows] = await Promise.all([
-    db.from('businesses').select('name, currency, chat_ai_model, chat_ai_settings').eq('business_id', businessId).maybeSingle().then((r: never) => must(r, 'the business')),
+  const [business, personaRows, skillRows, toolRows, flowRows, knowledgeRows] = await Promise.all([
+    db.from('businesses').select('name, currency, chat_ai_model, chat_ai_settings, owner_phone, phone').eq('business_id', businessId).maybeSingle().then((r: never) => must(r, 'the business')),
     db.from('persona_packs').select('pack').eq('business_id', businessId).eq('is_active', true).order('version', { ascending: false }).limit(1).then((r: never) => must(r, 'the persona pack')),
     db.from('chat_ai_skills').select('key, title, when_to_use, instructions').eq('business_id', businessId).eq('enabled', true).then((r: never) => must(r, 'skills')),
     db.from('chat_ai_tools').select('name, business_id, description, parameters, kind, target, phase').eq('enabled', true).or(`business_id.is.null,business_id.eq.${businessId}`).then((r: never) => must(r, 'tools')),
     db.from('chat_flows').select('id, name, enabled, priority, trigger, goal, instructions, skill_keys, created_at').eq('business_id', businessId).eq('enabled', true).then((r: never) => must(r, 'flows')),
+    db.from('knowledge_sources').select('id, title, use_case, file_type').eq('business_id', businessId).eq('is_active', true).eq('status', 'ready').in('used_by', ['chat', 'both']).order('created_at', { ascending: true }).limit(40).then((r: never) => must(r, 'knowledge')),
   ]);
   if (!business) throw new Error('business not found');
-  return { business, personaPack: personaRows?.[0]?.pack ?? null, skills: (skillRows ?? []) as Skill[], toolRows: (toolRows ?? []) as ToolRow[], flows: (flowRows ?? []) as Flow[] };
+  const knowledge = (knowledgeRows ?? []) as KnowledgeSource[];
+  // A business with no files never sees the two file tools, so the AI is not tempted to search nothing.
+  const tools = ((toolRows ?? []) as ToolRow[]).filter((t) => knowledge.length > 0 || !KNOWLEDGE_TOOLS.includes(t.name));
+  // The picture-sending tool is only useful when at least one file is an image.
+  const visibleTools = knowledge.some((k) => k.file_type === 'image') ? tools : tools.filter((t) => t.name !== 'send_knowledge_image');
+  return { business, personaPack: personaRows?.[0]?.pack ?? null, skills: (skillRows ?? []) as Skill[], toolRows: visibleTools, flows: (flowRows ?? []) as Flow[], knowledge };
 }
 
 // deno-lint-ignore no-explicit-any
@@ -183,7 +194,10 @@ export async function loadContext(db: any, input: TurnInput, cache?: ContextCach
   return {
     business: { name: core.business.name || 'the business', currency: core.business.currency || null, model: core.business.chat_ai_model || 'gpt-5-mini' },
     settings: readSettings(core.business.chat_ai_settings),
-    ownerRules: renderOwnerRules(core.business.chat_ai_settings),
+    ownerRules: [renderOwnerRules(core.business.chat_ai_settings), renderHandoffRules(readHandoffConfig(core.business.chat_ai_settings?.handoff))].filter(Boolean).join('\n\n'),
+    knowledge: core.knowledge,
+    handoffConfig: readHandoffConfig(core.business.chat_ai_settings?.handoff),
+    ownerPhone: core.business.owner_phone || core.business.phone || null,
     persona: core.personaPack,
     categories,
     skills: core.skills,

@@ -140,7 +140,7 @@ test('embeddings return the vector and fail loudly when OpenAI sends none', asyn
 // ── built-in handlers and the dynamic registry ──
 const state = (over: Partial<TurnState> = {}): TurnState => ({
   businessId: 'b1', contactId: 7, conversationId: 'c1', currency: 'KES', simulate: false, seenProducts: new Map(), skills: new Map(), skillsLoaded: new Set(),
-  productsSent: [], handoff: null, corpus: [], ...over,
+  productsSent: [], handoff: null, corpus: [], knowledge: [], handoffConfig: null, ownerPhone: null, outbox: [], handoffAlert: null, ...over,
 });
 
 test('product search returns only what the database returns, with price text, and remembers the ids for sending', async () => {

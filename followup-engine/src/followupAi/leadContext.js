@@ -4,6 +4,7 @@
 import { getMessages, getLastSentFollowups } from '../lib/db.js'
 import { getCustomerProfile } from '../lib/campaignContext.js'
 import { getAdContext, formatAdContext } from '../lib/adContext.js'
+import { loadFollowupKnowledge } from '../lib/knowledge.js'
 
 const TIMELINE_MESSAGES = 40
 
@@ -54,7 +55,7 @@ async function materialsText(supabase, businessId) {
 
 // Everything a message is allowed to draw on (used by quality control to catch invented prices and claims).
 export const factsText = (ctx, pack) => [
-  ctx.ad?.headline, ctx.ad?.body, ctx.flow?.instructions, ctx.materials,
+  ctx.ad?.headline, ctx.ad?.body, ctx.flow?.instructions, ctx.materials, ctx.knowledge?.facts,
   JSON.stringify(pack?.business_context ?? {}),
 ].filter(Boolean).join('\n')
 
@@ -69,8 +70,15 @@ export async function loadLeadContext(supabase, { contact, business, conv }) {
     materialsText(supabase, contact.business_id),
   ])
   const ad = await applyAdOverrides(supabase, contact, adRaw)
+  // Files the owner uploaded for follow-ups: the menu, plus the pieces that best match where this lead is right now.
+  const lastInbound = [...messages].reverse().find(m => m.direction === 'in')?.content?.text ?? ''
+  const knowledge = await loadFollowupKnowledge(supabase, {
+    businessId: contact.business_id,
+    queryText: [lastInbound, stateRes?.data?.summary, profile ? JSON.stringify(profile).slice(0, 400) : ''].filter(Boolean).join('\n'),
+  })
   return {
     messages,
+    knowledge,
     state: stateRes?.data ?? null,
     profile,
     ad,

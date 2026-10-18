@@ -51,15 +51,29 @@ function renderPersona(pack: Persona): string {
   }).join('\n\n');
 }
 
+// The business's uploaded files, as a menu. The AI reads the use case to know WHEN a file applies, then searches it with
+// file_search. It is a playbook to look things up in, never something to recite from memory.
+export function renderKnowledgeMenu(items: Array<{ id: string; title: string; use_case: string; file_type: string }>): string {
+  const lines = [...items].sort((a, b) => a.title.localeCompare(b.title)).map((k) =>
+    `- ${k.title} [id ${k.id}, ${k.file_type}]${k.use_case ? `: ${clip(k.use_case, 300)}` : ''}`);
+  return `BUSINESS FILES (you can search these with file_search)
+${lines.join('\n')}
+- When a situation matches a file's use, call file_search before you answer and answer from what it returns. Search again with different words if the first result does not cover it.
+- Treat the files as a playbook you look things up in, not something you remember. Never guess what a file says. If a search finds nothing, say you will confirm, and hand off if it matters.
+- Files marked image can be sent to the customer with send_knowledge_image.`;
+}
+
 export function buildInstructions(args: {
   businessName: string; currency: string | null; persona: Persona;
   categories: Array<{ name: string; count: number }>; skillMenu: Array<Pick<Skill, 'key' | 'title' | 'when_to_use'>>;
   ownerRules?: string;   // opening hours and hand-off rules the owner set during setup (see ownerRules.ts)
+  knowledge?: Array<{ id: string; title: string; use_case: string; file_type: string }>;
 }): string {
   const parts = [CORE_RULES, `BUSINESS\nName: ${args.businessName}${args.currency ? `\nCurrency: ${args.currency}` : ''}`];
   const persona = renderPersona(args.persona);
   if (persona) parts.push(`PERSONA AND PLAYBOOK\n${persona}`);
   if (args.ownerRules) parts.push(args.ownerRules);
+  if (args.knowledge?.length) parts.push(renderKnowledgeMenu(args.knowledge));
   if (args.categories.length) parts.push(`WHAT THE BUSINESS SELLS (categories, with number of items)\n${args.categories.map((c) => `${c.name} (${c.count})`).join(', ')}\nUse search_products to find the actual items.`);
   const menu = [...args.skillMenu].sort((a, b) => a.key.localeCompare(b.key));
   parts.push(menu.length

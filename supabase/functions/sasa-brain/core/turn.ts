@@ -5,7 +5,7 @@ import { pickFlow, type Flow } from './flows.ts';
 import { buildInput, buildInstructions, renderCustomerFile, type CustomerFile, type HistoryMessage, type Persona, type Skill } from './prompt.ts';
 import { executeBatch, resolveTools, toModelTools, type ToolRow } from './tools.ts';
 import { runLoop, type ModelCall, type Usage } from './loop.ts';
-import { runRegistryTool, settlePending, type Deps, type QueueResult, type SendItem, type SendResult, type TurnState } from './builtin.ts';
+import { queueHandoffAlert, runRegistryTool, settlePending, type Deps, type QueueResult, type SendItem, type SendResult, type TurnState } from './builtin.ts';
 
 export type TurnInput = {
   business_id: string; conversation_id?: string | null; contact_id?: number | null; trigger_message_id?: string | null;
@@ -26,6 +26,9 @@ export type TurnContext = {
   stickyFlowId: string | null;
   history: HistoryMessage[];
   ownerRules?: string;
+  knowledge?: Array<{ id: string; title: string; use_case: string; file_type: string }>;
+  handoffConfig?: TurnState['handoffConfig'];
+  ownerPhone?: string | null;
 };
 
 export type TurnDeps = {
@@ -66,6 +69,8 @@ export type TurnOutcome = {
   reply: string | null; skip_reason?: string; handoff: { reason: string; urgency: string; summary: string } | null;
   steps: unknown[]; thoughts: string; flow: string | null; flow_id: string | null; skills_loaded: string[]; holding_message: string | null;
   usage: Usage; error?: string; reruns: number;
+  // Simulation only: the photos and images that would have been sent, and who would have been alerted about a handoff.
+  outbox?: SendItem[]; handoff_alert?: TurnState['handoffAlert'];
 };
 
 export async function runTurn(deps: TurnDeps, input: TurnInput): Promise<TurnOutcome> {
@@ -218,6 +223,8 @@ async function attempt(
     businessId: input.business_id, contactId: input.contact_id ?? null, conversationId: input.conversation_id ?? null,
     currency: ctx.business.currency, simulate, seenProducts: new Map(), skills: skillByKey, skillsLoaded: new Set(),
     productsSent: [], handoff: null, corpus: [],
+    knowledge: (ctx.knowledge ?? []).map((k) => ({ id: k.id, title: k.title, file_type: k.file_type })),
+    handoffConfig: ctx.handoffConfig ?? null, ownerPhone: ctx.ownerPhone ?? null, outbox: [], handoffAlert: null,
   };
   // The flow's skills are loaded by code, up front, so the AI does not spend a call asking for them.
   const preloaded = (flow?.skill_keys ?? []).map((k) => skillByKey.get(k)).filter((s): s is Skill => Boolean(s));
@@ -228,7 +235,7 @@ async function attempt(
 
   const instructions = buildInstructions({
     businessName: ctx.business.name, currency: ctx.business.currency, persona: ctx.persona, categories: ctx.categories,
-    skillMenu: ctx.skills, ownerRules: ctx.ownerRules,
+    skillMenu: ctx.skills, ownerRules: ctx.ownerRules, knowledge: ctx.knowledge,
   });
   const input_items = buildInput({
     flow: flow ? { name: flow.name, goal: flow.goal, instructions: flow.instructions } : null,
@@ -270,7 +277,8 @@ async function attempt(
   const corpus = () => [...baseCorpus, ...state.corpus].join('\n');
   const finish = (partial: Partial<TurnOutcome> & Pick<TurnOutcome, 'status' | 'reply'>): TurnOutcome => ({
     handoff: state.handoff, steps, thoughts: loop.thoughts, flow: flow?.name ?? null, flow_id: flow?.id ?? null, skills_loaded: [...state.skillsLoaded],
-    holding_message: null, usage, reruns: 0, ...partial,
+    holding_message: null, usage, reruns: 0,
+    ...(simulate ? { outbox: state.outbox, handoff_alert: state.handoffAlert } : {}), ...partial,
   });
 
   // Photos queued by send_products may still be on their way. Waiting for them here, instead of inside the tool, is what
@@ -295,6 +303,7 @@ async function attempt(
     const reason = 'reply_failed_checks';
     const summary = `The AI could not write a safe reply. Problems: ${problems.join(' ')} Customer's last message: "${ctx.history.filter((m) => m.role === 'user').slice(-1)[0]?.text ?? input.message ?? ''}"`;
     state.handoff = { reason, urgency: 'normal', summary };
+    await queueHandoffAlert(deps.tools.db, state, { reason, urgency: 'normal', summary, source: 'rule' });
     if (!simulate) await deps.recordHandoff(input, reason, summary).catch(() => {});
     return endAfterDelivery({ status: 'handoff', reply: null, skip_reason: reason });
   };

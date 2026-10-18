@@ -41,6 +41,8 @@ import { buildReadyNotifier } from './setup/readyNotifierRuntime.js';
 import productRoutes from './productRoutes.js';
 import followupSettingsRoutes from './followupSettingsRoutes.js';
 import { createAssistantRouterForApp } from './businessAi/index.js';
+import { createKnowledgeForApp } from './knowledge/index.js';
+import { createHandoffForApp } from './handoff/index.js';
 
 dotenv.config();
 
@@ -651,6 +653,12 @@ app.use(productRoutes);
 app.use(followupSettingsRoutes);
 // Ask HeySasa, the business assistant (conversations, notes, preferences). Streams over Server-Sent Events.
 app.use('/assistant', createAssistantRouterForApp());
+// Knowledge: files the owner uploads for the chat AI and the follow-up AI to search (analysed and stored as vectors).
+const knowledge = createKnowledgeForApp();
+app.use('/knowledge', knowledge.router);
+// Handoffs: who is told when the chat AI hands a customer over, and the WhatsApp alert itself.
+const handoff = createHandoffForApp();
+app.use('/handoff', handoff.router);
 
 app.get('/debug/events', requireDebugToken, (req, res) => {
     // CHANGED: added no-transform (some proxies still buffer without it),
@@ -916,6 +924,8 @@ app.listen(PORT, () => {
     // A restart kills any setup that was running: pick those back up.
     resumeSetups().catch((error) => console.error('resumeSetups failed:', error.message));
     buildReadyNotifier().start();   // sends the one-time "set up is done" WhatsApp when first approvals exist
+    knowledge.start();              // picks up any file analysis a restart interrupted
+    handoff.start();                // sends the WhatsApp alert for each new handoff
 });
 
 process.once('SIGINT', stopProcesses);
