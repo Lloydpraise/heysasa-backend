@@ -154,11 +154,14 @@ export async function generatePlaybook(supabase, playbookId) {
       playbook_id: pb.id, business_id: pb.business_id, kind: 'flow', position: 0, status: 'draft', version,
       title: built.flow.name || 'Chat flow', goal: built.flow.goal, content: built.flow.instructions, skill_keys: built.flow.skill_keys,
       rationale: null,
+      // A bulk insert sends NULL (not the column default) for any key a row leaves out, and delay_hours is NOT NULL.
+      // The flow is not a timed step, so it carries 0.
+      delay_hours: 0,
     },
     ...steps.map((s, i) => ({
       playbook_id: pb.id, business_id: pb.business_id, kind: 'step', position: s.position, version,
       klt_phase: s.klt_phase, touchpoint_type: s.touchpoint_type, title: s.title,
-      content: reviewed[i].finalMessage, delay_hours: s.delay_hours, media: s.media, media_source: s.media_source,
+      content: reviewed[i].finalMessage, delay_hours: Number.isFinite(Number(s.delay_hours)) ? Math.round(Number(s.delay_hours)) : minGap, media: s.media, media_source: s.media_source,
       status: s.status, qc_passed: reviewed[i].passed, qc_notes: reviewed[i].issues.join('; ') || null, rationale: s.rationale,
     })),
   ]

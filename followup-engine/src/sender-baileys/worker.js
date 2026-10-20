@@ -7,6 +7,7 @@ import { effectiveDailyCap, sentTodayCount, noteSent, logWarmupHold } from '../l
 import { recordSuccessfulSend, recordFailedDispatch } from './postSend.js'
 import { ensureNumberOnWhatsApp, needsNumberLookup } from '../lib/numberCheck.js'
 import { log } from '../lib/log.js'
+import { isBusinessAwake } from '../lib/timing.js'
 
 const BATCH_SIZE = 25
 const STALE_CLAIM_MS = 2 * 60_000
@@ -45,6 +46,8 @@ export async function recoverStaleClaims() {
 }
 
 export async function processBaileysBatch() {
+  // Fetch a wider pool than we will send, because items of a business that is asleep are skipped below
+  // and must not crowd out other businesses' items.
   const { data: items, error } = await supabase
     .from('follow_up_queue')
     .select('*')
@@ -52,7 +55,7 @@ export async function processBaileysBatch() {
     .eq('channel', 'baileys')
     .lte('scheduled_at', new Date().toISOString())
     .order('scheduled_at', { ascending: true })
-    .limit(BATCH_SIZE)
+    .limit(BATCH_SIZE * 4)
 
   if (error) {
     log('error', 'sender', 'sender.fetch_batch_failed', `Failed to fetch batch: ${error.message}`, { details: { error: error.message } })
@@ -62,8 +65,11 @@ export async function processBaileysBatch() {
 
   let dispatched = 0
   let retryNeeded = false
+  let attempted = 0
+  const sleepingLogged = new Set()
 
   for (const item of items) {
+    if (attempted >= BATCH_SIZE) break
     try {
       const [business, contact] = await Promise.all([
         getBusiness(supabase, item.business_id),
@@ -75,6 +81,19 @@ export async function processBaileysBatch() {
         await logSendEvent(item.business_id, { queueId: item.id, contactId: item.contact_id, eventType: 'business_not_found' })
         continue
       }
+
+      // Quiet hours / inactive days are the business's own setting. The schedulers stop queueing during
+      // them, but anything already queued used to keep draining all night. Leave it where it is (not
+      // failed, not retried in a loop); it goes out when the business wakes up. Night-time bursts from
+      // a number are also a classic reason for WhatsApp to flag it.
+      if (!isBusinessAwake(business)) {
+        if (!sleepingLogged.has(item.business_id)) {
+          sleepingLogged.add(item.business_id)
+          log('info', 'sender', 'sender.held_quiet_hours', `Holding queued messages for ${business.name ?? item.business_id}: quiet hours or inactive day`, { business_id: item.business_id })
+        }
+        continue
+      }
+      attempted++
       if (!contact) {
         await recordFailedDispatch(supabase, item, 'contact_or_phone_not_found')
         await logSendEvent(item.business_id, { queueId: item.id, contactId: item.contact_id, eventType: 'contact_or_phone_not_found' })

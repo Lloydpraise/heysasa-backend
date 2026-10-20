@@ -19,7 +19,7 @@ import {
     recordCampaignStepReaction,
     requestStageReview
 } from './dbService.js';
-import { debugLog } from './debugConsole.js';
+import { debugLog, logEvent } from './debugConsole.js';
 import { deleteSessionRecord } from './evolutionConnections.js';
 import { scheduleDisconnectNotice } from './disconnectNotice.js';
 import { triggerChatAi } from '../chatAi/index.js';
@@ -68,6 +68,29 @@ export async function resolveBusinessId(payload) {
     throw new Error(`unknown_evolution_instance:${instanceName}`);
 }
 
+// WhatsApp's own close codes (Baileys DisconnectReason), in plain words. The code is what tells a
+// real logout or a ban apart from a harmless blink, so it must never be thrown away.
+const DISCONNECT_CODES = {
+    401: 'logged out (the phone removed the linked device, or WhatsApp ended the session)',
+    403: 'forbidden (WhatsApp refused the session, possible restriction or ban)',
+    408: 'timed out (connection lost or the phone was unreachable)',
+    411: 'multi-device mismatch',
+    428: 'connection closed (network drop)',
+    440: 'connection replaced (the same number was linked somewhere else)',
+    500: 'bad session (stored keys are corrupt)',
+    503: 'WhatsApp service unavailable',
+    515: 'restart required (normal after pairing)',
+};
+
+function readCloseReason(payload) {
+    const data = payload?.data || {};
+    const raw = data.statusReason ?? data.statusCode ?? data.reason ?? data.lastDisconnect?.error?.output?.statusCode
+        ?? data.lastDisconnect?.statusCode ?? payload?.statusReason ?? null;
+    const code = Number.isFinite(Number(raw)) ? Number(raw) : null;
+    const text = typeof raw === 'string' && code === null ? raw : (data.lastDisconnect?.error?.message ?? data.message ?? null);
+    return { code, text, meaning: code !== null ? (DISCONNECT_CODES[code] || 'unrecognised code') : null };
+}
+
 export async function processConnectionUpdate(payload, businessId) {
     const data = payload?.data || {};
     const state = String(data.state || data.status || data.connection || '').toLowerCase();
@@ -76,13 +99,22 @@ export async function processConnectionUpdate(payload, businessId) {
     const instanceName = payload?.instance || data.instance;
     if (isDisconnected) {
         if (!instanceName) throw new Error('evolution_instance_missing');
+        const reason = readCloseReason(payload);
         // Only a number that was actually connected counts as "dropped" (not a QR that timed out).
         const { data: wasConnected } = await supabase.from('whatsapp_sessions').select('id')
             .eq('instance_name', instanceName).eq('status', 'connected').limit(1);
         await deleteSessionRecord(instanceName, businessId);
         console.log(`[Webhook] Removed inactive WhatsApp session ${instanceName}`);
-        if (wasConnected?.length) scheduleDisconnectNotice({ businessId, instanceName });
-        return;
+        const dropped = !!wasConnected?.length;
+        // The one line that explains a disconnect afterwards. Before this, the state and code were lost.
+        logEvent({
+            level: dropped ? 'warn' : 'info', area: 'connection', event: 'connection.disconnected',
+            message: `${instanceName} closed${reason.code !== null ? ` with code ${reason.code}: ${reason.meaning}` : (reason.text ? `: ${reason.text}` : ' (WhatsApp gave no reason)')}${dropped ? '' : ' (it was not connected yet)'}`,
+            business_id: businessId, entity_id: instanceName,
+            details: { state, status_code: reason.code, reason_text: reason.text, meaning: reason.meaning, was_connected: dropped, raw_data_keys: Object.keys(data), raw: JSON.stringify(data).slice(0, 800) },
+        });
+        if (dropped) scheduleDisconnectNotice({ businessId, instanceName, reason });
+        return { outcome: 'disconnect', state, instance: instanceName, statusCode: reason.code };
     }
     const sessionStatus = isConnected ? 'connected' : 'pending';
     const incomingQr = data.qrcode?.base64 || data.qrCode || data.base64 || null;
@@ -127,6 +159,7 @@ export async function processConnectionUpdate(payload, businessId) {
 
     const { error } = await query;
     if (error) throw error;
+    return { outcome: isConnected ? 'connected' : 'pending', state: state || 'unknown', instance: instanceName, statusCode: readCloseReason(payload).code };
 }
 
 // Was called but never defined anywhere in this file — every live message
