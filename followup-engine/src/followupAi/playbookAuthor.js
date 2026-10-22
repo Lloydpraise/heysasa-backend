@@ -149,17 +149,22 @@ export async function generatePlaybook(supabase, playbookId) {
   await supabase.from('ad_playbook_items').update({ status: 'superseded' })
     .eq('playbook_id', pb.id).in('status', ['draft', 'approved', 'rejected', 'needs_media'])
 
+  // A bulk insert sends NULL (not the column default) for any key a row leaves out, and several columns are NOT NULL
+  // (skill_keys, delay_hours, edited_by_owner, ...). So every row carries EVERY key, with the same set on both kinds.
+  const baseRow = {
+    playbook_id: pb.id, business_id: pb.business_id, version, edited_by_owner: false,
+    klt_phase: null, touchpoint_type: null, title: null, goal: null, skill_keys: [],
+    media: null, media_source: null, qc_passed: null, qc_notes: null, rationale: null,
+  }
   const rows = [
     {
-      playbook_id: pb.id, business_id: pb.business_id, kind: 'flow', position: 0, status: 'draft', version,
-      title: built.flow.name || 'Chat flow', goal: built.flow.goal, content: built.flow.instructions, skill_keys: built.flow.skill_keys,
-      rationale: null,
-      // A bulk insert sends NULL (not the column default) for any key a row leaves out, and delay_hours is NOT NULL.
+      ...baseRow, kind: 'flow', position: 0, status: 'draft',
+      title: built.flow.name || 'Chat flow', goal: built.flow.goal, content: built.flow.instructions, skill_keys: built.flow.skill_keys ?? [],
       // The flow is not a timed step, so it carries 0.
       delay_hours: 0,
     },
     ...steps.map((s, i) => ({
-      playbook_id: pb.id, business_id: pb.business_id, kind: 'step', position: s.position, version,
+      ...baseRow, kind: 'step', position: s.position,
       klt_phase: s.klt_phase, touchpoint_type: s.touchpoint_type, title: s.title,
       content: reviewed[i].finalMessage, delay_hours: Number.isFinite(Number(s.delay_hours)) ? Math.round(Number(s.delay_hours)) : minGap, media: s.media, media_source: s.media_source,
       status: s.status, qc_passed: reviewed[i].passed, qc_notes: reviewed[i].issues.join('; ') || null, rationale: s.rationale,

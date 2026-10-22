@@ -193,9 +193,13 @@ Each message needs `key.id`, `key.remoteJid`, `key.fromMe`, and a supported `mes
 
 ### Message status updates
 
-Use the same webhook with `event: "MESSAGES_UPDATE"`. The payload can contain `data` as an array or a single update object. Each update needs a message ID at `key.id` and a status such as `SERVER_ACK`, `DELIVERY_ACK`, `READ`, or `ERROR`. The status is stored on the matching `messages` record.
+Use the same webhook with `event: "MESSAGES_UPDATE"`. The payload can contain `data` as an array or a single update object. The WhatsApp message id is read from `keyId` (Evolution's shape) or `key.id` (raw Baileys), with a status of `SERVER_ACK`, `DELIVERY_ACK`, `READ`, `PLAYED` or `ERROR` (see `src/services/messageReceipts.js`). Receipts for messages the customer sent are ignored.
 
-`READ` also sets `messages.is_read` to `true`. Delivery is currently represented by `messages.status` (`SERVER_ACK` or `DELIVERY_ACK`); there are no separate delivery/read timestamp columns.
+Each receipt is applied by the `apply_message_receipt` database function. `messages.status` is stored in plain words (`sent`, `delivered`, `read`, and `ERROR` for a failure), `delivered_at` and `read_at` are stamped, and a late receipt never moves a message backwards. `is_read` is deliberately not touched on outbound messages (it feeds the unread-count trigger). If a `messages.update` payload arrives with content but nothing readable, a `webhook.message_status_unreadable` warning is logged (shape only, a few times per process start).
+
+### Campaign replies and reactions
+
+When a customer writes, `attribute_campaign_reply` finds the campaign message it answers: the most recent campaign send to that person in the last 7 days (even if the campaign has finished), matching the contact by id or by phone (`contacts.phone_key`, the last 9 digits) because an uploaded contact and the person's real WhatsApp chat can be two rows. Each campaign message is answered once. A reaction is matched by the WhatsApp id of the message that was reacted to (`attribute_campaign_reaction`). Either one also marks the message delivered and read. Results are read from `v_campaign_summary` (sent / delivered / read / responded per campaign), `v_campaign_step_summary` (per message) and `v_campaign_responders` (one row per lead who responded).
 
 ### Contact presence updates
 

@@ -309,102 +309,61 @@ function classifyReactionEmoji(emoji) {
     return 'neutral';
 }
 
-// Attributes an inbound reply to whichever campaign step is still waiting
-// on one. "Reply" here means any inbound message after a campaign send —
-// not a WhatsApp quote-reply to that specific message — since that's the
-// signal that covers every message type today. Deliberately picks the
-// most recently sent, not-yet-replied step event for the lead's active
-// enrollment; if none is pending (no active enrollment, or every step
-// already has a replied_at), this is a no-op.
-export async function recordCampaignStepReply(contactId) {
+// A lead wrote to us: find the campaign message this answers and mark it replied. The matching lives in the
+// attribute_campaign_reply database function so it is one atomic step. It treats an uploaded contact and the
+// same person's real WhatsApp chat as one lead (matched by phone), looks at sends from the last 7 days even if
+// the campaign has since finished, and answers only the most recent send, once. Returns the step event id
+// (the follow-up engine uses it to classify the reply) or null when this was not a reply to a campaign.
+export async function recordCampaignStepReply(businessId, contactId, sentAtIso = null) {
     try {
-        const { data: enrollment, error: enrollmentError } = await supabase
-            .from('campaign_enrollments')
-            .select('id')
-            .eq('lead_id', contactId)
-            .in('status', ['pending', 'active', 'awaiting_opt_in'])
-            .maybeSingle();
-        if (enrollmentError) throw enrollmentError;
-        if (!enrollment?.id) return null;
-
-        const { data: stepEvent, error: stepEventError } = await supabase
-            .from('campaign_step_events')
-            .select('id')
-            .eq('enrollment_id', enrollment.id)
-            .not('sent_at', 'is', null)
-            .is('replied_at', null)
-            .order('sent_at', { ascending: false })
-            .limit(1)
-            .maybeSingle();
-        if (stepEventError) throw stepEventError;
-        if (!stepEvent?.id) {
-            logEvent({
-                level: 'debug', area: 'campaign', event: 'campaign.reply_unmatched',
-                message: 'Inbound reply received but no pending campaign step event to attribute it to',
-                contact_id: contactId, details: { enrollmentId: enrollment.id },
-            });
-            return null;
-        }
-
-        const { error } = await supabase
-            .from('campaign_step_events')
-            .update({ replied_at: new Date().toISOString() })
-            .eq('id', stepEvent.id);
+        const { data, error } = await supabase.rpc('attribute_campaign_reply', {
+            p_business_id: businessId,
+            p_contact_id: contactId,
+            p_at: sentAtIso || new Date().toISOString(),
+        });
         if (error) throw error;
+        const hit = Array.isArray(data) ? data[0] : data;
+        if (!hit?.step_event_id) return null;
 
         logEvent({
             level: 'ok', area: 'campaign', event: 'campaign.reply_attributed',
             message: 'Inbound reply attributed to a campaign step',
-            contact_id: contactId, entity_id: stepEvent.id, details: { enrollmentId: enrollment.id },
+            business_id: businessId, contact_id: contactId, entity_id: hit.step_event_id,
+            details: { enrollmentId: hit.enrollment_id, campaignId: hit.campaign_id, enrolledContactId: hit.lead_id },
         });
-        return stepEvent.id;
+        return hit.step_event_id;
     } catch (error) {
-        logDbFailure('recordCampaignStepReply', { contactId }, error, 'campaign');
+        logDbFailure('recordCampaignStepReply', { businessId, contactId }, error, 'campaign');
         return null;
     }
 }
 
-// Attributes an inbound reaction to the specific campaign step whose
-// outbound message was reacted to. reactedMessageId is the whatsapp_message_id
-// of the message being reacted to (see extractMessageContent), which we
-// resolve to our own messages.id, then to the campaign_step_events row
-// that message was linked to at send time.
-export async function recordCampaignStepReaction(businessId, reactedMessageId, emoji) {
-    if (!reactedMessageId) return;
+// A lead reacted to one of our messages. reactedMessageId is the WhatsApp id of the message that was reacted to;
+// the database function finds the campaign step that message belonged to. Zero matches simply means the
+// reaction was to something that was not a campaign send, which is normal and not logged as an event.
+export async function recordCampaignStepReaction(businessId, reactedMessageId, emoji, sentAtIso = null) {
+    if (!reactedMessageId || !emoji) return 0;
     try {
-        const { data: message, error: messageError } = await supabase
-            .from('messages')
-            .select('id')
-            .eq('business_id', businessId)
-            .eq('whatsapp_message_id', reactedMessageId)
-            .maybeSingle();
-        if (messageError) throw messageError;
-        if (!message?.id) {
-            logEvent({
-                level: 'debug', area: 'campaign', event: 'campaign.reaction_no_message_match',
-                message: 'Reaction received but no local message row matches this whatsapp_message_id',
-                business_id: businessId, details: { reactedMessageId },
-            });
-            return;
-        }
-
-        const { error } = await supabase
-            .from('campaign_step_events')
-            .update({
-                reacted_at: new Date().toISOString(),
-                reaction_emoji: emoji || null,
-                reply_intent: classifyReactionEmoji(emoji)
-            })
-            .eq('message_id', message.id);
-        if (error) throw error;
-
-        logEvent({
-            level: 'ok', area: 'campaign', event: 'campaign.reaction_attributed',
-            message: `Reaction "${emoji || ''}" attributed to a campaign step`,
-            business_id: businessId, details: { reactedMessageId, emoji },
+        const { data, error } = await supabase.rpc('attribute_campaign_reaction', {
+            p_business_id: businessId,
+            p_reacted_whatsapp_message_id: reactedMessageId,
+            p_emoji: emoji,
+            p_intent: classifyReactionEmoji(emoji),
+            p_at: sentAtIso || new Date().toISOString(),
         });
+        if (error) throw error;
+        const matched = Number(data ?? 0);
+        if (matched > 0) {
+            logEvent({
+                level: 'ok', area: 'campaign', event: 'campaign.reaction_attributed',
+                message: `Reaction "${emoji}" attributed to a campaign step`,
+                business_id: businessId, entity_id: reactedMessageId, details: { emoji, matched },
+            });
+        }
+        return matched;
     } catch (error) {
         logDbFailure('recordCampaignStepReaction', { businessId, reactedMessageId }, error, 'campaign');
+        return 0;
     }
 }
 

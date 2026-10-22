@@ -20,6 +20,7 @@ import {
     requestStageReview
 } from './dbService.js';
 import { debugLog, logEvent } from './debugConsole.js';
+import { extractReceiptUpdates, describePayloadShape } from './messageReceipts.js';
 import { deleteSessionRecord } from './evolutionConnections.js';
 import { scheduleDisconnectNotice } from './disconnectNotice.js';
 import { triggerChatAi } from '../chatAi/index.js';
@@ -68,29 +69,6 @@ export async function resolveBusinessId(payload) {
     throw new Error(`unknown_evolution_instance:${instanceName}`);
 }
 
-// WhatsApp's own close codes (Baileys DisconnectReason), in plain words. The code is what tells a
-// real logout or a ban apart from a harmless blink, so it must never be thrown away.
-const DISCONNECT_CODES = {
-    401: 'logged out (the phone removed the linked device, or WhatsApp ended the session)',
-    403: 'forbidden (WhatsApp refused the session, possible restriction or ban)',
-    408: 'timed out (connection lost or the phone was unreachable)',
-    411: 'multi-device mismatch',
-    428: 'connection closed (network drop)',
-    440: 'connection replaced (the same number was linked somewhere else)',
-    500: 'bad session (stored keys are corrupt)',
-    503: 'WhatsApp service unavailable',
-    515: 'restart required (normal after pairing)',
-};
-
-function readCloseReason(payload) {
-    const data = payload?.data || {};
-    const raw = data.statusReason ?? data.statusCode ?? data.reason ?? data.lastDisconnect?.error?.output?.statusCode
-        ?? data.lastDisconnect?.statusCode ?? payload?.statusReason ?? null;
-    const code = Number.isFinite(Number(raw)) ? Number(raw) : null;
-    const text = typeof raw === 'string' && code === null ? raw : (data.lastDisconnect?.error?.message ?? data.message ?? null);
-    return { code, text, meaning: code !== null ? (DISCONNECT_CODES[code] || 'unrecognised code') : null };
-}
-
 export async function processConnectionUpdate(payload, businessId) {
     const data = payload?.data || {};
     const state = String(data.state || data.status || data.connection || '').toLowerCase();
@@ -99,22 +77,13 @@ export async function processConnectionUpdate(payload, businessId) {
     const instanceName = payload?.instance || data.instance;
     if (isDisconnected) {
         if (!instanceName) throw new Error('evolution_instance_missing');
-        const reason = readCloseReason(payload);
         // Only a number that was actually connected counts as "dropped" (not a QR that timed out).
         const { data: wasConnected } = await supabase.from('whatsapp_sessions').select('id')
             .eq('instance_name', instanceName).eq('status', 'connected').limit(1);
         await deleteSessionRecord(instanceName, businessId);
         console.log(`[Webhook] Removed inactive WhatsApp session ${instanceName}`);
-        const dropped = !!wasConnected?.length;
-        // The one line that explains a disconnect afterwards. Before this, the state and code were lost.
-        logEvent({
-            level: dropped ? 'warn' : 'info', area: 'connection', event: 'connection.disconnected',
-            message: `${instanceName} closed${reason.code !== null ? ` with code ${reason.code}: ${reason.meaning}` : (reason.text ? `: ${reason.text}` : ' (WhatsApp gave no reason)')}${dropped ? '' : ' (it was not connected yet)'}`,
-            business_id: businessId, entity_id: instanceName,
-            details: { state, status_code: reason.code, reason_text: reason.text, meaning: reason.meaning, was_connected: dropped, raw_data_keys: Object.keys(data), raw: JSON.stringify(data).slice(0, 800) },
-        });
-        if (dropped) scheduleDisconnectNotice({ businessId, instanceName, reason });
-        return { outcome: 'disconnect', state, instance: instanceName, statusCode: reason.code };
+        if (wasConnected?.length) scheduleDisconnectNotice({ businessId, instanceName });
+        return;
     }
     const sessionStatus = isConnected ? 'connected' : 'pending';
     const incomingQr = data.qrcode?.base64 || data.qrCode || data.base64 || null;
@@ -159,7 +128,6 @@ export async function processConnectionUpdate(payload, businessId) {
 
     const { error } = await query;
     if (error) throw error;
-    return { outcome: isConnected ? 'connected' : 'pending', state: state || 'unknown', instance: instanceName, statusCode: readCloseReason(payload).code };
 }
 
 // Was called but never defined anywhere in this file — every live message
@@ -229,10 +197,11 @@ export async function processLiveMessage(messages, businessId) {
                 await updateLeadStateOnReply(contactId, contact.lead_state);
                 await cancelPendingFollowUps(contactId);
 
+                const sentAtIso = timestamp ? new Date(timestamp * 1000).toISOString() : new Date().toISOString();
                 if (type === 'reaction') {
-                    await recordCampaignStepReaction(businessId, reactedMessageId, text);
+                    await recordCampaignStepReaction(businessId, reactedMessageId, text, sentAtIso);
                 } else {
-                    campaignStepEventId = await recordCampaignStepReply(contactId);
+                    campaignStepEventId = await recordCampaignStepReply(businessId, contactId, sentAtIso);
                     // The lead actually said something: queue a stage re-check.
                     // (Reactions carry no text, and history sync deliberately
                     // does not do this, so old chats never flood the queue.)
@@ -484,48 +453,65 @@ export async function processHistorySync(payload, businessIdOverride) {
 // logged for now since we don't yet know what those parameter codes mean
 // (e.g. "463"); worth revisiting once a few real failures come through and
 // a pattern in the parameters is visible.
+// Receipts are applied by the apply_message_receipt database function: it stores plain words
+// (sent / delivered / read / failed), stamps delivered_at / read_at, and never moves a message backwards
+// when receipts arrive out of order. The id is read by messageReceipts.js (Evolution calls it `keyId`).
+let unreadablePayloadWarnings = 0;
+
 export async function processMessageStatusUpdate(payload, businessIdOverride) {
     const businessId = businessIdOverride;
-    const rawUpdates = Array.isArray(payload.data) ? payload.data : (payload.data?.key ? [payload.data] : []);
+    const updates = extractReceiptUpdates(payload);
 
-    for (const update of rawUpdates) {
+    // The old handler skipped every update silently. If a payload has content but nothing readable,
+    // say so (a few times, shape only) instead of pretending it worked.
+    if (!updates.length) {
+        const hasContent = Array.isArray(payload?.data) ? payload.data.length > 0 : !!payload?.data;
+        if (hasContent && unreadablePayloadWarnings < 5) {
+            unreadablePayloadWarnings += 1;
+            logEvent({
+                level: 'warn', area: 'ingest', event: 'webhook.message_status_unreadable',
+                message: 'messages.update arrived but no message id/status could be read from it',
+                business_id: businessId, details: describePayloadShape(payload),
+            });
+        }
+        return { applied: 0, unmatched: 0 };
+    }
+
+    let applied = 0;
+    let unmatched = 0;
+    for (const update of updates) {
         try {
-            const messageId = update?.key?.id;
-            const status = String(update?.status || '').toUpperCase();
-            if (!messageId || !status) continue;
-
-            let statusUpdate = supabase
-                .from('messages')
-                .update({ status, is_read: status.toUpperCase() === 'READ' })
-                .eq('whatsapp_message_id', messageId)
-                .eq('business_id', businessId);
-
-            if (status !== 'READ') statusUpdate = statusUpdate.not('status', 'ilike', 'READ');
-
-            const { error } = await statusUpdate;
-
+            const { data, error } = await supabase.rpc('apply_message_receipt', {
+                p_business_id: businessId,
+                p_whatsapp_message_id: update.whatsappMessageId,
+                p_status: update.status,
+            });
             if (error) {
-                debugLog('error', 'DB receipt update', 'Message status update failed', { messageId, status, businessId, error });
-                console.error('[Message Status Update] Failed', { messageId, status, businessId, message: error.message });
+                logEvent({
+                    level: 'error', area: 'ingest', event: 'webhook.message_status_failed',
+                    message: `Receipt ${update.status} could not be saved: ${error.message}`,
+                    business_id: businessId, entity_id: update.whatsappMessageId,
+                    details: { status: update.status, code: error.code || null },
+                });
                 continue;
             }
+            if ((data ?? 0) > 0) applied += 1; else unmatched += 1;
 
-            if (status === 'ERROR') {
-                console.warn('[Message Status Update] Delivery failure', {
-                    messageId,
-                    businessId,
-                    stubType: update.messageStubType,
-                    stubParams: update.messageStubParameters || null,
+            if (update.status === 'ERROR') {
+                logEvent({
+                    level: 'warn', area: 'ingest', event: 'webhook.message_delivery_failed',
+                    message: 'WhatsApp reported a delivery failure for a message',
+                    business_id: businessId, entity_id: update.whatsappMessageId, details: { matchedRows: data ?? 0 },
                 });
-            } else {
-                debugLog('ok', 'DB receipt update', `Message ${messageId} -> ${status}`, { messageId, status, businessId });
-                console.log(`[Message Status Update] ${messageId} -> ${status}`);
             }
         } catch (e) {
-            debugLog('error', 'Message status error', e.message, { businessId, error: e });
-            console.error('[Message Status Update] Error', { message: e.message });
+            logEvent({
+                level: 'error', area: 'ingest', event: 'webhook.message_status_failed',
+                message: `Receipt handling crashed: ${e.message}`, business_id: businessId, entity_id: update.whatsappMessageId,
+            });
         }
     }
+    return { applied, unmatched };
 }
 
 export async function processPresenceUpdate(payload, businessIdOverride) {
