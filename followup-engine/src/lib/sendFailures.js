@@ -3,7 +3,9 @@
 // Ground rule: every message that does not go through is a ban risk, so we retry
 // less, not more. Numbers that are not on WhatsApp are never retried. Everything
 // else gets at most 3 more tries, spaced out, and then is given up on and reported.
-// (instance_down is the one exception: it is not the lead's fault, so it waits longer.)
+// instance_down is the one exception: it is not the lead's fault (the connection is), so it never
+// counts against the lead and never gives up. The row is just put back a few minutes later and the
+// sender's cool-down (antiban.js) stops it knocking on a dead connection in the meantime.
 const MIN = 60_000
 const HOUR = 60 * MIN
 
@@ -14,7 +16,7 @@ const POLICY = {
   timeout:         { permanent: false, retryDelays: [5 * MIN, 30 * MIN, 2 * HOUR], reportAs: 'error' },
   server_error:    { permanent: false, retryDelays: [5 * MIN, 30 * MIN, 2 * HOUR], reportAs: 'error' },
   rate_limited:    { permanent: false, retryDelays: [HOUR, 3 * HOUR, 6 * HOUR],    reportAs: 'error' },
-  instance_down:   { permanent: false, retryDelays: Array(6).fill(30 * MIN),        reportAs: 'error' },
+  instance_down:   { permanent: false, retryDelays: [10 * MIN], countsAgainstLead: false, reportAs: 'error' },
   auth_error:      { permanent: false, retryDelays: [30 * MIN, HOUR, 2 * HOUR],     reportAs: 'error' },
   unknown:         { permanent: false, retryDelays: [5 * MIN, 30 * MIN, 2 * HOUR], reportAs: 'error' },
 }
@@ -43,10 +45,13 @@ export function classifyFailure(errorMessage) {
 export function decideRetry(errorMessage, attemptsSoFar) {
   const failureClass = classifyFailure(errorMessage)
   const policy = POLICY[failureClass]
-  if (policy.permanent || attemptsSoFar > policy.retryDelays.length) {
-    return { failureClass, giveUp: true, retryInMs: null, reportAs: policy.permanent ? policy.reportAs : 'error', permanent: policy.permanent }
+  if (policy.countsAgainstLead === false) {
+    return { failureClass, giveUp: false, retryInMs: policy.retryDelays[0], reportAs: 'error', permanent: false, countsAttempt: false }
   }
-  return { failureClass, giveUp: false, retryInMs: policy.retryDelays[attemptsSoFar - 1], reportAs: 'warn', permanent: false }
+  if (policy.permanent || attemptsSoFar > policy.retryDelays.length) {
+    return { failureClass, giveUp: true, retryInMs: null, reportAs: policy.permanent ? policy.reportAs : 'error', permanent: policy.permanent, countsAttempt: true }
+  }
+  return { failureClass, giveUp: false, retryInMs: policy.retryDelays[attemptsSoFar - 1], reportAs: 'warn', permanent: false, countsAttempt: true }
 }
 
 // Kept for anything that still imports the old name.

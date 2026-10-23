@@ -389,12 +389,30 @@ export async function requestStageReview(conversationId, reason = 'responded') {
 
 export async function cancelPendingFollowUps(contactId) {
     try {
-        const { error } = await supabase.from('follow_up_queue')
+        const { data: cancelled, error } = await supabase.from('follow_up_queue')
             .update({ status: 'cancelled', skip_reason: 'lead_replied' })
             .eq('contact_id', contactId)
-            .in('status', ['pending', 'ready_to_send']);
+            .in('status', ['pending', 'ready_to_send'])
+            .select('campaign_id');
 
         if (error) throw error;
+
+        // A lead who replied must also leave the campaigns whose messages were just cancelled. Cancelling only the queue row
+        // left the enrollment open, so the campaign scheduler queued the same step again and the lead got it anyway.
+        // Follow-up AI campaigns (ai_managed) keep the lead enrolled: their planner decides what happens after a reply.
+        let campaignIds = [...new Set((cancelled ?? []).map(r => r.campaign_id).filter(Boolean))];
+        if (campaignIds.length) {
+            const { data: plain } = await supabase.from('campaigns').select('id').in('id', campaignIds).neq('ai_managed', true);
+            campaignIds = (plain ?? []).map(c => c.id);
+        }
+        if (campaignIds.length) {
+            const { error: exitError } = await supabase.from('campaign_enrollments')
+                .update({ status: 'exited' })
+                .eq('lead_id', contactId)
+                .in('campaign_id', campaignIds)
+                .in('status', ['pending', 'active']);
+            if (exitError) throw exitError;
+        }
     } catch (error) {
         logDbFailure('cancelPendingFollowUps', { contactId }, error);
     }

@@ -1,16 +1,48 @@
 import { supabase } from '../supabaseClient.js'
-import { getBusiness, getContact } from '../lib/db.js'
+import { getBusiness, getContact, getConversation } from '../lib/db.js'
 import { sendContentViaEvolution } from './evolutionSender.js'
 import { resolveSendTarget } from '../lib/sendTarget.js'
-import { checkAntiban, recordSend, primeAntiban } from './antiban.js'
+import { checkAntiban, recordSend, recordFailedAttempt, primeAntiban } from './antiban.js'
 import { effectiveDailyCap, sentTodayCount, noteSent, logWarmupHold } from '../lib/warmup.js'
 import { recordSuccessfulSend, recordFailedDispatch } from './postSend.js'
 import { ensureNumberOnWhatsApp, needsNumberLookup } from '../lib/numberCheck.js'
+import { checkSendBalance } from '../lib/billing.js'
+import { NON_CUSTOMER_TYPES } from '../lib/leadTypes.js'
+import { confirmInstanceAfterFailure, healDemotedSessions } from '../lib/instanceHealth.js'
 import { log } from '../lib/log.js'
 import { isBusinessAwake } from '../lib/timing.js'
+import { nextAwakeAt } from '../lib/wakeTimes.js'
 
-const BATCH_SIZE = 25
+// How the sender picks work (one pass = one call to processBaileysBatch):
+//   1. Businesses with a connected number are visited one by one, in random order, so a business with
+//      a 900-lead campaign can never sit in front of everyone else's follow-ups.
+//   2. For each business the cheap, in-memory gates run FIRST (quiet hours, antiban gap/hourly ceiling,
+//      cool-down, daily cap). If any says "not now", the business is skipped with no per-message queries.
+//   3. Only then are its oldest due messages read, and at most ONE of them is attempted: after an attempt
+//      (sent or failed) the antiban gap closes the gate again anyway.
+//   4. Everything that could have changed since the message was queued is re-checked right before it goes
+//      (opt-out, customer type, replies, holds, balance), because a big campaign waits in the queue for days.
+const POOL_PER_BUSINESS = 25
 const STALE_CLAIM_MS = 2 * 60_000
+const REPLY_WINDOW_MS = 2 * 3_600_000
+const HOLD_LOG_EVERY_MS = 10 * 60_000
+const NO_BALANCE_RETRY_MS = 10 * 60_000
+const WAKE_PAD_MS = 250
+
+let claimedAtSupported = true   // flips to false if the claimed_at column has not been added yet (see migration)
+const lastHoldLog = new Map()
+
+function logHold(businessId, reason, message, details = {}) {
+  const key = `${businessId}:${reason}`
+  if (Date.now() - (lastHoldLog.get(key) ?? 0) < HOLD_LOG_EVERY_MS) return
+  lastHoldLog.set(key, Date.now())
+  log('info', 'sender', `sender.held_${reason}`, message, { business_id: businessId, details })
+}
+
+function nextUtcMidnight() {
+  const d = new Date()
+  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1, 0, 0, 30)
+}
 
 async function logSendEvent(businessId, { queueId = null, contactId = null, instanceName = null, eventType, reason = null }) {
   const { error } = await supabase.from('follow_up_send_events').insert({
@@ -24,237 +56,377 @@ async function logSendEvent(businessId, { queueId = null, contactId = null, inst
   if (error) log('error', 'sender', 'sender.log_event_failed', `Failed to log send event: ${error.message}`, { business_id: businessId, details: { error: error.message } })
 }
 
+// A 'sending' row is one we claimed and never finished (process crashed or was restarted mid-send).
+// It is judged by WHEN IT WAS CLAIMED (claimed_at), not by scheduled_at (a campaign row's scheduled_at can be days old,
+// which made every row in flight look stale). Before a stale row goes back in the queue we look for an outbound message
+// to that person since the claim: if one exists the send DID happen, so the row is closed as sent instead of sent twice.
 export async function recoverStaleClaims() {
   const cutoff = new Date(Date.now() - STALE_CLAIM_MS).toISOString()
-  const { data, error } = await supabase
-    .from('follow_up_queue')
-    .update({
-      status: 'ready_to_send',
-      last_dispatch_error: 'recovered_stale_sending_claim'
-    })
+  let query = supabase.from('follow_up_queue')
+    .select('id, business_id, contact_id, campaign_id, scheduled_at' + (claimedAtSupported ? ', claimed_at' : ''))
     .eq('status', 'sending')
-    .lte('scheduled_at', cutoff)
-    .select('id')
+  query = claimedAtSupported
+    ? query.or(`claimed_at.lte.${cutoff},and(claimed_at.is.null,scheduled_at.lte.${cutoff})`)
+    : query.lte('scheduled_at', cutoff)
+  let { data, error } = await query.limit(200)
 
+  if (error && claimedAtSupported && /claimed_at/.test(error.message ?? '')) {
+    claimedAtSupported = false
+    return recoverStaleClaims()
+  }
   if (error) {
     log('error', 'sender', 'sender.stale_claims_recovery_failed', `Failed to recover stale claims: ${error.message}`, { details: { error: error.message } })
     return
   }
-  if (data?.length) {
-    log('warn', 'sender', 'sender.stale_claims_recovered', `Recovered ${data.length} stale sending claim(s)`, { details: { count: data.length, ids: data.map(r => r.id) } })
+  if (!data?.length) return
+
+  let requeued = 0
+  let closedAsSent = 0
+  for (const row of data) {
+    const since = row.claimed_at ?? new Date(Date.now() - 30 * 60_000).toISOString()
+    const { data: outbound } = await supabase.from('messages').select('id')
+      .eq('contact_id', row.contact_id).eq('direction', 'out').eq('agent_role', 'follow_up_ai')
+      .gte('created_at', since).limit(1)
+    if (outbound?.length) {
+      await supabase.from('follow_up_queue').update({ status: 'sent', processed_at: new Date().toISOString(), last_dispatch_error: 'recovered_already_sent' })
+        .eq('id', row.id).eq('status', 'sending')
+      closedAsSent++
+    } else {
+      await supabase.from('follow_up_queue').update({ status: 'ready_to_send', last_dispatch_error: 'recovered_stale_sending_claim' })
+        .eq('id', row.id).eq('status', 'sending')
+      requeued++
+    }
+  }
+  log('warn', 'sender', 'sender.stale_claims_recovered', `Recovered ${data.length} stale sending claim(s): ${requeued} back in the queue, ${closedAsSent} were already sent`, { details: { requeued, closedAsSent, ids: data.map(r => r.id) } })
+}
+
+async function claimItem(item) {
+  const base = { status: 'sending' }
+  const attempt = async (payload) => supabase.from('follow_up_queue').update(payload).eq('id', item.id).eq('status', 'ready_to_send').select('id').maybeSingle()
+  let res = await attempt(claimedAtSupported ? { ...base, claimed_at: new Date().toISOString() } : base)
+  if (res.error && claimedAtSupported && /claimed_at/.test(res.error.message ?? '')) {
+    claimedAtSupported = false
+    res = await attempt(base)
+  }
+  return res
+}
+
+// Put a row back without counting an attempt (our own hiccup, or "not yet": nothing was sent).
+async function releaseItem(item, delayMs, reason) {
+  await supabase.from('follow_up_queue')
+    .update({ status: 'ready_to_send', scheduled_at: new Date(Date.now() + delayMs).toISOString(), last_dispatch_error: reason })
+    .eq('id', item.id).in('status', ['sending', 'ready_to_send'])
+}
+
+// Close a message for good (opt-out, not a customer, not on WhatsApp) and free the person's campaign spot.
+async function skipItemForGood(item, skipReason, failureClass = null) {
+  await supabase.from('follow_up_queue').update({
+    status: 'skipped', skip_reason: skipReason, ...(failureClass ? { failure_class: failureClass } : {}), processed_at: new Date().toISOString()
+  }).eq('id', item.id).eq('status', 'ready_to_send')
+  if (item.campaign_id) {
+    await supabase.from('campaign_enrollments').update({ status: 'exited' })
+      .eq('campaign_id', item.campaign_id).eq('lead_id', item.contact_id).in('status', ['pending', 'active'])
   }
 }
 
-export async function processBaileysBatch() {
-  // Fetch a wider pool than we will send, because items of a business that is asleep are skipped below
-  // and must not crowd out other businesses' items.
+// What has to be true at the moment of sending. Returns null when fine, otherwise
+// { action: 'skip', reason } (never going to be sent) or { action: 'hold', delayMs, reason } (not now).
+async function sendTimeCheck(item, contact, business) {
+  if (contact.do_not_contact) return { action: 'skip', reason: 'do_not_contact' }
+  if (NON_CUSTOMER_TYPES.has(contact.lead_type)) return { action: 'skip', reason: 'not_a_customer' }
+  if (['won', 'lost'].includes(contact.lead_state ?? '')) return { action: 'skip', reason: `lead_${contact.lead_state}` }
+  if (!business.followup_ai_enabled) return { action: 'hold', delayMs: 10 * 60_000, reason: 'followup_disabled' }
+  if (!business.subscription_active) return { action: 'hold', delayMs: 30 * 60_000, reason: 'subscription_inactive' }
+
+  const { data: leadState } = await supabase.from('lead_ai_state').select('hold_until')
+    .eq('business_id', item.business_id).eq('contact_id', item.contact_id).maybeSingle()
+  const holdUntil = leadState?.hold_until ? Date.parse(leadState.hold_until) : 0
+  if (holdUntil > Date.now()) return { action: 'hold', delayMs: Math.min(holdUntil - Date.now(), 24 * 3_600_000), reason: 'followup_hold' }
+
+  // The lead wrote in recently (a reply cancels queued rows, this catches the one that slipped through).
+  // Chat AI messages never come through here, so this only ever protects campaign and follow-up sends.
+  const conv = await getConversation(supabase, item.contact_id, item.business_id)
+  if (conv?.last_user_message_at && Date.now() - Date.parse(conv.last_user_message_at) < REPLY_WINDOW_MS) {
+    return { action: 'hold', delayMs: 30 * 60_000, reason: 'lead_recently_active' }
+  }
+  return null
+}
+
+async function processBusiness(businessId, ctx) {
+  const business = await getBusiness(supabase, businessId)
+  if (!business) {
+    logHold(businessId, 'business_missing', `Messages are waiting for ${businessId} but the business record was not found`)
+    return 0
+  }
+
+  // ── Business-level gates: cheap, and they decide before any message is read ──────────────
+  if (!isBusinessAwake(business)) {
+    logHold(businessId, 'quiet_hours', `Holding queued messages for ${business.name ?? businessId}: quiet hours or inactive day`)
+    ctx.wake(nextAwakeAt(business))
+    return 0
+  }
+  await primeAntiban(supabase, businessId)
+  const gate = checkAntiban(businessId, business.followup_daily_cap)
+  if (!gate.allowed) {
+    if (gate.reason === 'cooldown') logHold(businessId, 'cooldown', `Cooling down ${business.name ?? businessId}: recent sends failed, waiting ${Math.ceil(gate.retryAfterMs / 60_000)} min`, { retryAfterMs: gate.retryAfterMs })
+    ctx.wake(Date.now() + gate.retryAfterMs + WAKE_PAD_MS)
+    return 0
+  }
+
+  // The daily cap is checked HERE, at send time, for everything (campaigns included). It used to be checked only at the moment a
+  // message was promoted to "ready", when nothing had been sent yet, so a big campaign was waved through whole and then
+  // drained at the hourly ceiling regardless of the cap. During a business's first week the slow-start cap applies.
+  const warm = await effectiveDailyCap(supabase, businessId, business.followup_daily_cap)
+  const sentToday = await sentTodayCount(supabase, businessId)
+  if (sentToday >= warm.cap) {
+    if (warm.warmupActive) logWarmupHold(businessId, warm.day, warm.cap)
+    else logHold(businessId, 'daily_cap', `Daily cap reached for ${business.name ?? businessId}: ${sentToday}/${warm.cap} sent today, resuming tomorrow`, { sentToday, cap: warm.cap })
+    ctx.wake(nextUtcMidnight())
+    return 0
+  }
+
+  // ── Read this business's oldest due messages ─────────────────────────────────────────────
   const { data: items, error } = await supabase
     .from('follow_up_queue')
     .select('*')
     .eq('status', 'ready_to_send')
     .eq('channel', 'baileys')
+    .eq('business_id', businessId)
     .lte('scheduled_at', new Date().toISOString())
     .order('scheduled_at', { ascending: true })
-    .limit(BATCH_SIZE * 4)
-
+    .limit(POOL_PER_BUSINESS)
   if (error) {
-    log('error', 'sender', 'sender.fetch_batch_failed', `Failed to fetch batch: ${error.message}`, { details: { error: error.message } })
-    return { dispatched: 0, retryNeeded: true }
+    log('error', 'sender', 'sender.fetch_batch_failed', `Failed to fetch batch for ${businessId}: ${error.message}`, { business_id: businessId, details: { error: error.message } })
+    ctx.retry = true
+    return 0
   }
-  if (!items?.length) return { dispatched: 0, retryNeeded: false }
+  if (!items?.length) return 0
 
-  let dispatched = 0
-  let retryNeeded = false
-  let attempted = 0
-  const sleepingLogged = new Set()
+  const sessions = ctx.sessionsByBusiness.get(businessId) ?? []
+  const lookupWaitCampaigns = new Set()
 
   for (const item of items) {
-    if (attempted >= BATCH_SIZE) break
     try {
-      const [business, contact] = await Promise.all([
-        getBusiness(supabase, item.business_id),
-        getContact(supabase, item.contact_id)
-      ])
-
-      if (!business) {
-        await recordFailedDispatch(supabase, item, 'business_not_found')
-        await logSendEvent(item.business_id, { queueId: item.id, contactId: item.contact_id, eventType: 'business_not_found' })
-        continue
-      }
-
-      // Quiet hours / inactive days are the business's own setting. The schedulers stop queueing during
-      // them, but anything already queued used to keep draining all night. Leave it where it is (not
-      // failed, not retried in a loop); it goes out when the business wakes up. Night-time bursts from
-      // a number are also a classic reason for WhatsApp to flag it.
-      if (!isBusinessAwake(business)) {
-        if (!sleepingLogged.has(item.business_id)) {
-          sleepingLogged.add(item.business_id)
-          log('info', 'sender', 'sender.held_quiet_hours', `Holding queued messages for ${business.name ?? item.business_id}: quiet hours or inactive day`, { business_id: item.business_id })
-        }
-        continue
-      }
-      attempted++
-      if (!contact) {
-        await recordFailedDispatch(supabase, item, 'contact_or_phone_not_found')
-        await logSendEvent(item.business_id, { queueId: item.id, contactId: item.contact_id, eventType: 'contact_or_phone_not_found' })
-        continue
-      }
-
-      // Where does this message go? A phone number when we have one, otherwise the
-      // contact's WhatsApp ID (@lid) - customers whose number WhatsApp hides are
-      // still fully reachable that way. See lib/sendTarget.js.
-      const target = resolveSendTarget(contact, contact.country_code)
-      if (!target) {
-        await recordFailedDispatch(supabase, item, 'no_send_target')
-        await logSendEvent(item.business_id, { queueId: item.id, contactId: item.contact_id, eventType: 'no_send_target' })
-        continue
-      }
-
-      // Campaign items: if the campaign's assigned instance doesn't match
-      // what this queue row was stamped with, or the campaign got paused
-      // in the meantime, just leave this item for a later pass — nothing
-      // here ever fails the campaign itself anymore.
-      const { data: campaign } = item.campaign_id
-        ? await supabase.from('campaigns').select('whatsapp_instance_name, status').eq('id', item.campaign_id).maybeSingle()
-        : { data: null }
-      if (item.campaign_id && (!campaign || campaign.status !== 'active' || !item.assigned_instance_name || campaign.whatsapp_instance_name !== item.assigned_instance_name)) {
-        continue
-      }
-
-      // whatsapp_sessions is the single source of truth for connection
-      // state (kept live by Evolution's connection.update webhook) — no
-      // extra live ping to re-confirm it. A connected row is trusted as-is;
-      // if it's actually stale, the send below will fail for real and get
-      // retried like any other send failure.
-      const sessionQuery = supabase
-        .from('whatsapp_sessions')
-        .select('instance_name')
-        .eq('business_id', item.business_id)
-        .eq('status', 'connected')
-      const { data: session, error: sessionError } = item.campaign_id
-        ? await sessionQuery.eq('instance_name', item.assigned_instance_name).limit(1)
-        : await sessionQuery.order('updated_at', { ascending: false }).limit(1)
-
-      if (sessionError) {
-        await logSendEvent(item.business_id, { queueId: item.id, contactId: item.contact_id, eventType: 'session_lookup_failed', reason: sessionError.message })
-        retryNeeded = true
-        continue
-      }
-      const activeSession = session?.[0] ?? null
-      if (!activeSession?.instance_name) {
-        // Connection-update events wake the sender if the number reconnects.
-        continue
-      }
-
-      // Antiban gate — if not allowed yet, leave it ready_to_send and try
-      // again next poll cycle. Don't count this as a failed attempt.
-      await primeAntiban(supabase, item.business_id)
-      const gate = checkAntiban(item.business_id, business.followup_daily_cap)
-      if (!gate.allowed) { retryNeeded = true; continue }
-
-      // Slow start for new numbers: only during a business's first week is the
-      // daily total held lower. After that this check does nothing.
-      const warm = await effectiveDailyCap(supabase, item.business_id, business.followup_daily_cap)
-      if (warm.warmupActive && (await sentTodayCount(supabase, item.business_id)) >= warm.cap) {
-        logWarmupHold(item.business_id, warm.day, warm.cap)
-        retryNeeded = true
-        continue
-      }
-
-      // Manual-campaign numbers are checked on WhatsApp just before their turn, at random times
-      // (see lib/numberCheck.js). Auto campaigns and AI follow-ups are never looked up, because
-      // those people already messaged us. A number known not to be on WhatsApp is skipped
-      // (not failed, not retried) and its campaign spot is closed.
-      //
-      // A @lid target is never looked up and never gated on wa_exists: that person
-      // already messaged us, so they are on WhatsApp by definition, and "is this
-      // number on WhatsApp" is meaningless for an ID that is not a number.
-      const isLidTarget = target.kind === 'lid'
-      const numberCheck = isLidTarget
-        ? { status: 'ok' }
-        : (await needsNumberLookup(supabase, item))
-          ? await ensureNumberOnWhatsApp(supabase, { instanceName: activeSession.instance_name, contact, businessId: item.business_id })
-          : (contact.wa_exists === false ? { status: 'not_on_whatsapp' } : { status: 'ok' })
-      if (numberCheck.status === 'wait') { retryNeeded = true; continue }
-      if (numberCheck.status === 'not_on_whatsapp') {
-        await supabase.from('follow_up_queue').update({
-          status: 'skipped', skip_reason: 'number_not_on_whatsapp', failure_class: 'not_on_whatsapp', processed_at: new Date().toISOString()
-        }).eq('id', item.id).eq('status', 'ready_to_send')
-        if (item.campaign_id) {
-          await supabase.from('campaign_enrollments').update({ status: 'exited' })
-            .eq('campaign_id', item.campaign_id).eq('lead_id', item.contact_id).in('status', ['pending', 'active'])
-        }
-        await logSendEvent(item.business_id, { queueId: item.id, contactId: item.contact_id, instanceName: activeSession.instance_name, eventType: 'skipped', reason: 'number_not_on_whatsapp' })
-        continue
-      }
-
-      const { data: claimedItem, error: claimError } = await supabase
-        .from('follow_up_queue')
-        .update({ status: 'sending' })
-        .eq('id', item.id)
-        .eq('status', 'ready_to_send')
-        .select('id')
-        .maybeSingle()
-
-      if (claimError) {
-        log('error', 'sender', 'sender.claim_failed', `Could not mark ${item.id} as sending: ${claimError.message}`, {
-          business_id: item.business_id, contact_id: item.contact_id, entity_id: item.id, details: { error: claimError.message }
-        })
-        continue
-      }
-      if (!claimedItem) continue
-
-      const sendStartedAt = Date.now()
-      const result = await sendContentViaEvolution(activeSession.instance_name, target.number, {
-        text: item.final_message,
-        media: item.media
-      }, contact.country_code)
-      const sendDurationMs = Date.now() - sendStartedAt
-
-      if (!result.ok) {
-        await recordFailedDispatch(supabase, item, result.error ?? 'send_failed')
-        await logSendEvent(item.business_id, {
-          queueId: item.id,
-          contactId: item.contact_id,
-          instanceName: activeSession.instance_name,
-          eventType: 'failed',
-          reason: result.error ?? 'send_failed'
-        })
-        log('warn', 'sender', 'sender.send_failed', `Send failed to ${target.label}: ${result.error ?? 'send_failed'}`, {
-          business_id: item.business_id, contact_id: item.contact_id, entity_id: item.id,
-          duration_ms: sendDurationMs,
-          details: { instance: activeSession.instance_name, campaignId: item.campaign_id ?? null, targetKind: target.kind, error: result.error ?? 'send_failed' }
-        })
-        continue
-      }
-
-      recordSend(item.business_id)
-      noteSent(item.business_id)
-      await recordSuccessfulSend(supabase, {
-        item,
-        contact,
-        business,
-        finalMessage: item.final_message,
-        whatsappMessageId: result.messageId
-      })
-      log('ok', 'sender', 'sender.sent', `Sent to ${target.label}`, {
-        business_id: item.business_id, contact_id: item.contact_id, entity_id: item.id,
-        duration_ms: sendDurationMs,
-        details: { instance: activeSession.instance_name, campaignId: item.campaign_id ?? null, targetKind: target.kind, whatsappMessageId: result.messageId }
-      })
-      dispatched++
+      const outcome = await processItem(item, { business, sessions, ctx, lookupWaitCampaigns })
+      if (outcome === 'sent') return 1
+      if (outcome === 'attempted' || outcome === 'hold') return 0
     } catch (e) {
       log('error', 'sender', 'sender.unexpected_error', `Unexpected error for queue item ${item.id}: ${e.message}`, {
         business_id: item.business_id, contact_id: item.contact_id, entity_id: item.id,
         details: { error: { name: e.name, message: e.message } }
       })
-      await recordFailedDispatch(supabase, item, e.message).catch(() => {})
+      // Our own hiccup (database, bug) is not the lead's fault and nothing was sent: put it back a few minutes later without
+      // counting an attempt, and slow this business down.
+      recordFailedAttempt(businessId, 'unknown')
+      await releaseItem(item, 5 * 60_000, `unexpected: ${String(e.message).slice(0, 150)}`).catch(() => {})
       await logSendEvent(item.business_id, { queueId: item.id, contactId: item.contact_id, eventType: 'failed', reason: e.message }).catch(() => {})
+      ctx.retry = true
+      return 0
+    }
+  }
+  return 0
+}
+
+// 'skipped'  -> this message is not going now / ever; look at the next one
+// 'hold'     -> the whole business must wait; stop
+// 'attempted'-> a send was tried and failed; stop (the antiban gap is now closed)
+// 'sent'     -> sent; stop
+async function processItem(item, { business, sessions, ctx, lookupWaitCampaigns }) {
+  const businessId = item.business_id
+  if (item.campaign_id && lookupWaitCampaigns.has(item.campaign_id)) return 'skipped'
+
+  const contact = await getContact(supabase, item.contact_id)
+  if (!contact) {
+    await recordFailedDispatch(supabase, item, 'contact_or_phone_not_found')
+    await logSendEvent(businessId, { queueId: item.id, contactId: item.contact_id, eventType: 'contact_or_phone_not_found' })
+    return 'skipped'
+  }
+
+  // Where does this message go? A phone number when we have one, otherwise the contact's WhatsApp ID (@lid). See lib/sendTarget.js.
+  const target = resolveSendTarget(contact, contact.country_code)
+  if (!target) {
+    await recordFailedDispatch(supabase, item, 'no_send_target')
+    await logSendEvent(businessId, { queueId: item.id, contactId: item.contact_id, eventType: 'no_send_target' })
+    return 'skipped'
+  }
+
+  // Campaign items: if the campaign's assigned instance doesn't match what this queue row was stamped with, or the campaign
+  // got paused in the meantime, leave the item for a later pass: nothing here ever fails the campaign itself.
+  let campaign = null
+  if (item.campaign_id) {
+    campaign = ctx.campaigns.get(item.campaign_id)
+    if (campaign === undefined) {
+      const { data } = await supabase.from('campaigns').select('whatsapp_instance_name, status').eq('id', item.campaign_id).maybeSingle()
+      campaign = data ?? null
+      ctx.campaigns.set(item.campaign_id, campaign)
+    }
+    if (!campaign || campaign.status !== 'active' || !item.assigned_instance_name || campaign.whatsapp_instance_name !== item.assigned_instance_name) return 'skipped'
+  }
+
+  // whatsapp_sessions is the single source of truth for connection state (kept live by Evolution's connection.update webhook).
+  const activeSession = item.campaign_id
+    ? sessions.find(s => s.instance_name === item.assigned_instance_name)
+    : sessions[0]
+  if (!activeSession?.instance_name) return 'skipped'   // connection-update events wake the sender when the number reconnects
+
+  // Re-check at the moment of sending what may have changed since the message was queued.
+  const check = await sendTimeCheck(item, contact, business)
+  if (check?.action === 'skip') {
+    await skipItemForGood(item, check.reason)
+    await logSendEvent(businessId, { queueId: item.id, contactId: item.contact_id, instanceName: activeSession.instance_name, eventType: 'skipped', reason: check.reason })
+    return 'skipped'
+  }
+  if (check?.action === 'hold') {
+    await releaseItem(item, check.delayMs, check.reason)
+    return 'skipped'
+  }
+
+  // Manual-campaign numbers are checked on WhatsApp just before their turn, at random times (see lib/numberCheck.js).
+  // Auto campaigns and AI follow-ups are never looked up, because those people already messaged us.
+  // A @lid target is never looked up and never gated on wa_exists: that person already messaged us.
+  const isLidTarget = target.kind === 'lid'
+  const numberCheck = isLidTarget
+    ? { status: 'ok' }
+    : (await needsNumberLookup(supabase, item))
+      ? await ensureNumberOnWhatsApp(supabase, { instanceName: activeSession.instance_name, contact, businessId })
+      : (contact.wa_exists === false ? { status: 'not_on_whatsapp' } : { status: 'ok' })
+  if (numberCheck.status === 'wait') {
+    ctx.wake(Date.now() + (numberCheck.retryAfterMs ?? 60_000) + WAKE_PAD_MS)
+    if (item.campaign_id) lookupWaitCampaigns.add(item.campaign_id)   // the rest of this campaign would wait too: skip them without queries
+    return 'skipped'
+  }
+  if (numberCheck.status === 'not_on_whatsapp') {
+    await skipItemForGood(item, 'number_not_on_whatsapp', 'not_on_whatsapp')
+    await logSendEvent(businessId, { queueId: item.id, contactId: item.contact_id, instanceName: activeSession.instance_name, eventType: 'skipped', reason: 'number_not_on_whatsapp' })
+    return 'skipped'
+  }
+
+  // Funds: checked per message, right before it goes. (It used to be checked only when a message was queued, while the wallet
+  // was still full, so a big campaign sent its whole remainder for free once the wallet ran out.)
+  if (!(await checkSendBalance(supabase, businessId))) {
+    logHold(businessId, 'no_balance', `Not sending for ${business.name ?? businessId}: balance too low for another message`)
+    if (item.campaign_id) {
+      await supabase.from('campaigns').update({ status: 'paused', failure_reason: 'insufficient_balance', failed_at: null })
+        .eq('id', item.campaign_id).eq('status', 'active')
+      ctx.campaigns.delete(item.campaign_id)
+    }
+    ctx.wake(Date.now() + NO_BALANCE_RETRY_MS)
+    return 'hold'
+  }
+
+  const { data: claimedItem, error: claimError } = await claimItem(item)
+  if (claimError) {
+    log('error', 'sender', 'sender.claim_failed', `Could not mark ${item.id} as sending: ${claimError.message}`, {
+      business_id: businessId, contact_id: item.contact_id, entity_id: item.id, details: { error: claimError.message }
+    })
+    return 'skipped'
+  }
+  if (!claimedItem) return 'skipped'
+
+  const sendStartedAt = Date.now()
+  const result = await sendContentViaEvolution(activeSession.instance_name, target.number, {
+    text: item.final_message,
+    media: item.media
+  }, contact.country_code)
+  const sendDurationMs = Date.now() - sendStartedAt
+
+  if (!result.ok) {
+    const decision = await recordFailedDispatch(supabase, item, result.error ?? 'send_failed')
+    // A failed attempt still touches WhatsApp: the same gap applies to the next one, and a run of connection-type
+    // failures puts the whole business on a growing cool-down instead of working through every lead.
+    const cool = recordFailedAttempt(businessId, decision.failureClass)
+    if (['instance_down', 'timeout', 'server_error'].includes(decision.failureClass)) {
+      await confirmInstanceAfterFailure(supabase, { instanceName: activeSession.instance_name, businessId })
+    }
+    await logSendEvent(businessId, {
+      queueId: item.id, contactId: item.contact_id, instanceName: activeSession.instance_name,
+      eventType: 'failed', reason: result.error ?? 'send_failed'
+    })
+    log('warn', 'sender', 'sender.send_failed', `Send failed to ${target.label}: ${result.error ?? 'send_failed'}`, {
+      business_id: businessId, contact_id: item.contact_id, entity_id: item.id,
+      duration_ms: sendDurationMs,
+      details: { instance: activeSession.instance_name, campaignId: item.campaign_id ?? null, targetKind: target.kind, error: result.error ?? 'send_failed', failureClass: decision.failureClass, coolDownMs: cool }
+    })
+    return 'attempted'
+  }
+
+  recordSend(businessId)
+  noteSent(businessId)
+  try {
+    await recordSuccessfulSend(supabase, {
+      item, contact, business,
+      finalMessage: item.final_message,
+      whatsappMessageId: result.messageId
+    })
+  } catch (e) {
+    // The message IS out. Never put it back in the queue (that would send it twice): close it as sent and report the bookkeeping failure.
+    log('error', 'sender', 'sender.bookkeeping_failed', `Sent to ${target.label} but saving the result failed: ${e.message}`, {
+      business_id: businessId, contact_id: item.contact_id, entity_id: item.id, details: { error: e.message, whatsappMessageId: result.messageId }
+    })
+    await supabase.from('follow_up_queue').update({ status: 'sent', processed_at: new Date().toISOString(), last_dispatch_error: 'bookkeeping_failed_after_send' }).eq('id', item.id).catch(() => {})
+  }
+  log('ok', 'sender', 'sender.sent', `Sent to ${target.label}`, {
+    business_id: businessId, contact_id: item.contact_id, entity_id: item.id,
+    duration_ms: sendDurationMs,
+    details: { instance: activeSession.instance_name, campaignId: item.campaign_id ?? null, targetKind: target.kind, whatsappMessageId: result.messageId }
+  })
+  return 'sent'
+}
+
+const shuffle = (list) => {
+  const a = [...list]
+  for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]] }
+  return a
+}
+
+// Returns { dispatched, retryNeeded, wakeAt }.
+//   wakeAt      = earliest moment (ms) something is expected to become possible (gap over, lookup slot, cap reset, quiet hours end)
+//   retryNeeded = something failed in a way with no known time: try again in a minute
+export async function processBaileysBatch() {
+  await healDemotedSessions(supabase).catch(() => {})
+
+  const { data: sessionRows, error } = await supabase
+    .from('whatsapp_sessions')
+    .select('business_id, instance_name, updated_at')
+    .eq('status', 'connected')
+    .order('updated_at', { ascending: false })
+  if (error) {
+    log('error', 'sender', 'sender.fetch_batch_failed', `Failed to read connected sessions: ${error.message}`, { details: { error: error.message } })
+    return { dispatched: 0, retryNeeded: true, wakeAt: null }
+  }
+
+  const sessionsByBusiness = new Map()
+  for (const row of sessionRows ?? []) {
+    if (!row.business_id || !row.instance_name) continue
+    const list = sessionsByBusiness.get(row.business_id) ?? []
+    list.push(row)
+    sessionsByBusiness.set(row.business_id, list)
+  }
+  if (!sessionsByBusiness.size) return { dispatched: 0, retryNeeded: false, wakeAt: null }
+
+  let wakeAt = null
+  const ctx = {
+    sessionsByBusiness,
+    campaigns: new Map(),   // per pass: campaign rows are read once, not once per message
+    retry: false,
+    wake(at) { if (Number.isFinite(at) && (wakeAt === null || at < wakeAt)) wakeAt = at },
+  }
+
+  let dispatched = 0
+  for (const businessId of shuffle([...sessionsByBusiness.keys()])) {
+    try {
+      dispatched += await processBusiness(businessId, ctx)
+    } catch (e) {
+      log('error', 'sender', 'sender.business_pass_failed', `Sender pass failed for ${businessId}: ${e.message}`, { business_id: businessId, details: { error: { name: e.name, message: e.message } } })
+      ctx.retry = true
     }
   }
 
-  if (dispatched) {
-    log('info', 'sender', 'sender.batch_done', `Dispatched ${dispatched}/${items.length}`, { details: { dispatched, total: items.length } })
-  }
-  return { dispatched, retryNeeded }
+  if (dispatched) log('info', 'sender', 'sender.batch_done', `Dispatched ${dispatched} across ${sessionsByBusiness.size} connected business(es)`, { details: { dispatched, businesses: sessionsByBusiness.size } })
+  return { dispatched, retryNeeded: ctx.retry, wakeAt }
+}
+
+export function _resetSenderForTests() {
+  claimedAtSupported = true
+  lastHoldLog.clear()
 }

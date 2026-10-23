@@ -9,6 +9,7 @@ import { runLeadTemperatureReview } from './leadTemperatureReview.js'
 import { runAutoListSync } from './autoListSync.js'
 import { log } from '../lib/log.js'
 import { runAdIntake } from '../followupAi/adIntake.js'
+import { wantsGeneration } from '../followupAi/playbookRules.js'
 import { createSwitchWatch } from '../followupAi/switchWatch.js'
 import { createSetupWatch } from '../followupAi/setupWatch.js'
 import { ensureDefaultSkills } from '../followupAi/skills.js'
@@ -305,8 +306,8 @@ function subscribe() {
   // a new ad row, or an owner edit in the ad editor, starts the Follow-up AI's ad intake after a short quiet period
   watch('ad_attributions', () => afterQuiet('AdIntake', () => void invoke('AdIntake', runAdIntake), 5_000))
   watch('ad_playbooks', (payload) => {
-    const row = payload.new
-    if (row && (row.status === 'pending' || row.regenerate_requested_at)) afterQuiet('AdIntake', () => void invoke('AdIntake', runAdIntake), 2_000)
+    // not while the engine is writing the playbook, and not for its own 'failed' update (that is how a retry loop starts)
+    if (wantsGeneration(payload.new)) afterQuiet('AdIntake', () => void invoke('AdIntake', runAdIntake), 2_000)
   })
   // The owner switching the Follow-up AI on starts the ad intake right away, so plans for the ads already found get written now.
   const followupAiSwitch = createSwitchWatch()

@@ -33,6 +33,15 @@ async function inBatches(items, size, fn) {
   return out
 }
 
+// A failed generation parks the playbook. It does NOT ask for another try: every try costs an author call plus a quality
+// check per step. The ad intake tries again only when a new lead arrives on the ad after `failed_at`.
+export async function markPlaybookFailed(supabase, playbookId, patch = {}) {
+  const { error } = await supabase.from('ad_playbooks')
+    .update({ status: 'failed', failed_at: new Date().toISOString(), regenerate_requested_at: null, ...patch })
+    .eq('id', playbookId)
+  if (error) log('error', 'followup_ai', 'followup_ai.playbook_mark_failed_error', error.message, { details: { playbookId } })
+}
+
 // A picture copied into our storage (once). Updates the playbook's image list so the editor offers it.
 async function ensureStoredImage(supabase, pb) {
   const { imageUrl } = effectiveAd(pb)
@@ -44,6 +53,11 @@ async function ensureStoredImage(supabase, pb) {
   if (pb.chosen_image_url === imageUrl) patch.chosen_image_url = stored
   if (pb.auto_thumbnail_url === imageUrl) patch.auto_thumbnail_url = stored
   await supabase.from('ad_playbooks').update(patch).eq('id', pb.id)
+  // Swapping the owner's chosen picture for our stored copy fires the owner-edit trigger, which would ask for a
+  // rewrite of a playbook we are already writing. Put the request back to what it was: this is not an owner edit.
+  if (patch.chosen_image_url) {
+    await supabase.from('ad_playbooks').update({ regenerate_requested_at: pb.regenerate_requested_at ?? null }).eq('id', pb.id)
+  }
   return { pb: { ...pb, ...patch }, imageUrl: stored }
 }
 
@@ -101,8 +115,8 @@ export async function generatePlaybook(supabase, playbookId) {
     pb.version > 1 || pb.regenerate_requested_at ? 'The owner corrected the ad details above. Rewrite everything for the corrected ad.' : '',
   ].filter(Boolean).join('\n\n')
 
-  const run = async (extra = '') => {
-    const raw = await callBot(supabase, BOTS.author, userContent + extra, AUTHOR_PROMPT, {
+  const run = async () => {
+    const raw = await callBot(supabase, BOTS.author, userContent, AUTHOR_PROMPT, {
       json: true, temperature: 0.7, maxTokens: 4000, businessId: pb.business_id, cacheKey: `fuaiauth:${pb.business_id}`,
       images: hasImage ? [ad.imageUrl] : undefined,
     })
@@ -110,19 +124,18 @@ export async function generatePlaybook(supabase, playbookId) {
     try { return { parsed: JSON.parse(raw) } } catch { return { parsed: null } }
   }
 
-  let result = await run()
+  // One author call per attempt. A bad answer is not asked for again here: the playbook is parked, and a new lead on
+  // the ad brings it back.
+  const result = await run()
   if (result.unavailable) {
-    await supabase.from('ad_playbooks').update({ status: 'pending' }).eq('id', pb.id) // AI down or out of credit: try again later, nothing spent
+    // AI down or out of credit. Parked like any other failure: no automatic retry, a new lead on this ad brings it back.
+    await markPlaybookFailed(supabase, pb.id, { last_error: 'ai_unavailable' })
     return { ok: false, reason: 'ai_unavailable' }
   }
   const rules = { maxSteps: budget.max, minSteps: budget.min, minGapHours: minGap, hasTestimonial: testimonials.length > 0, hasAdImage: hasImage }
-  let built = validatePlaybook(result.parsed, rules)
-  if (!built.ok || built.problems.includes('too_few_steps')) {
-    result = await run(`\n\nYour last answer had a problem (${built.problems.join(', ') || 'unreadable'}). Return the full JSON again with ${budget.min} to ${budget.max} steps.`)
-    if (!result.unavailable) built = validatePlaybook(result.parsed, rules)
-  }
+  const built = validatePlaybook(result.parsed, rules)
   if (!built.ok || built.steps.length < Math.min(3, budget.min)) {
-    await supabase.from('ad_playbooks').update({ status: 'failed', last_error: built.problems.join(', ') || 'unreadable_answer', data_quality: quality, data_issues: issues }).eq('id', pb.id)
+    await markPlaybookFailed(supabase, pb.id, { last_error: built.problems.join(', ') || 'unreadable_answer', data_quality: quality, data_issues: issues })
     await logTurn(supabase, { businessId: pb.business_id, kind: 'author', decision: 'failed', reason: built.problems.join(', ') || 'unreadable_answer', details: { adId: pb.ad_id } })
     return { ok: false, reason: 'invalid_playbook', problems: built.problems }
   }
@@ -172,7 +185,7 @@ export async function generatePlaybook(supabase, playbookId) {
   ]
   const { error: insertError } = await supabase.from('ad_playbook_items').insert(rows)
   if (insertError) {
-    await supabase.from('ad_playbooks').update({ status: 'failed', last_error: insertError.message }).eq('id', pb.id)
+    await markPlaybookFailed(supabase, pb.id, { last_error: insertError.message })
     log('error', 'followup_ai', 'followup_ai.playbook_save_failed', insertError.message, { business_id: pb.business_id, details: { adId: pb.ad_id } })
     return { ok: false, reason: 'save_failed' }
   }

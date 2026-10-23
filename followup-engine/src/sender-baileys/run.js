@@ -6,7 +6,7 @@ import { isAnalysisActive, onAnalysisFinished, deferUntilAnalysisEnds } from '..
 
 const RETRY_WHEN_BLOCKED_MS = 60_000
 const CHAT_AI_RETRY_MS = 60_000
-const BATCH_SIZE = 25
+const HEARTBEAT_MS = 180_000
 let senderDrain
 let senderWakePending = false
 let senderWakeTimer = null
@@ -85,7 +85,9 @@ function wakeSender() {
       do {
         senderWakePending = false
         result = await processBaileysBatch()
-      } while (senderWakePending || result.dispatched >= BATCH_SIZE)
+      } while (senderWakePending)
+      // The batch says when something becomes possible again (antiban gap over, lookup slot, daily cap reset, end of quiet hours).
+      if (result.wakeAt) scheduleSenderWake(result.wakeAt)
       if (result.retryNeeded) scheduleSenderWake(Date.now() + RETRY_WHEN_BLOCKED_MS)
       await scheduleNextDue()
     } catch (e) {
@@ -98,6 +100,14 @@ function wakeSender() {
   })()
   return senderDrain
 }
+
+// Safety net: a dropped realtime channel or a missed timer must not leave queued messages stranded.
+setInterval(() => {
+  void (async () => {
+    try { await recoverStaleClaims() } catch { /* logged inside */ }
+    void wakeSender()
+  })()
+}, HEARTBEAT_MS).unref()
 
 log('info', 'sender', 'sender.started', 'Follow-up sender listening for queue and eligibility changes')
 

@@ -2,6 +2,7 @@ import { getBusiness, getContactsByIds, getConversationsByContactIds } from '../
 import { resolveMediaMergeFields, resolveMergeFields } from '../lib/mergeFields.js'
 import { isBusinessAwake } from '../lib/timing.js'
 import { log } from '../lib/log.js'
+import { checkSendBalance } from '../lib/billing.js'
 import { NON_CUSTOMER_TYPES } from '../lib/leadTypes.js'
 import { planAiEnrollment } from '../followupAi/campaignPlanner.js'
 
@@ -60,6 +61,15 @@ async function syncCampaignsWithFollowupToggle(supabase) {
       .eq('failure_reason', 'followup_ai_disabled')
       .select('id')
     if (resumed?.length) log('info', 'engine', 'campaign_scheduler.resumed', `Resumed ${resumed.length} campaign(s) — follow-ups re-enabled`, { details: { count: resumed.length, campaignIds: resumed.map(r => r.id) } })
+    // Campaigns the sender paused because the wallet ran out come back by themselves once there is money for a send.
+    const { data: lowFunds } = await supabase.from('campaigns').select('id, business_id')
+      .in('business_id', enabledIds).eq('status', 'paused').eq('failure_reason', 'insufficient_balance')
+    for (const row of lowFunds ?? []) {
+      if (!(await checkSendBalance(supabase, row.business_id))) continue
+      await supabase.from('campaigns').update({ status: 'active', failure_reason: null, failed_at: null })
+        .eq('id', row.id).eq('status', 'paused').eq('failure_reason', 'insufficient_balance')
+      log('info', 'engine', 'campaign_scheduler.resumed_funds', `Resumed campaign ${row.id}: balance topped up`, { business_id: row.business_id, entity_id: row.id })
+    }
   }
 }
 
@@ -111,15 +121,28 @@ async function seedCampaignEnrollments(supabase) {
     const leadIds = [...new Set((members ?? []).map(member => member.lead_id))]
     if (!leadIds.length) continue
 
-    const [{ data: contacts, error: contactsError }, { data: existingOpen, error: existingError }, { data: existingHere, error: hereError }] = await Promise.all([
-      supabase.from('contacts').select('id, business_id, do_not_contact, wa_exists, lead_type').in('id', leadIds),
-      supabase.from('campaign_enrollments').select('lead_id, campaign_id')
-        .in('lead_id', leadIds).in('status', ['pending', 'active', 'awaiting_opt_in']),
-      // Any status, this campaign only: a completed/exited enrollment still
-      // occupies UNIQUE(campaign_id, lead_id) and would fail the whole batch insert.
-      supabase.from('campaign_enrollments').select('lead_id').eq('campaign_id', campaign.id).in('lead_id', leadIds)
-    ])
-    const existing = [...(existingOpen ?? []), ...(existingHere ?? [])]
+    // Lookups are chunked: a 900-lead list as one .in() filter makes a request URL too long for the API gateway.
+    const contacts = []
+    const existingOpen = []
+    const existingHere = []
+    let contactsError = null
+    let existingError = null
+    let hereError = null
+    for (const ids of chunked(leadIds, IN_CHUNK)) {
+      const [c, o, h] = await Promise.all([
+        supabase.from('contacts').select('id, business_id, do_not_contact, wa_exists, lead_type').in('id', ids),
+        supabase.from('campaign_enrollments').select('lead_id, campaign_id')
+          .in('lead_id', ids).in('status', ['pending', 'active', 'awaiting_opt_in']),
+        // Any status, this campaign only: a completed/exited enrollment still
+        // occupies UNIQUE(campaign_id, lead_id) and would fail the whole batch insert.
+        supabase.from('campaign_enrollments').select('lead_id').eq('campaign_id', campaign.id).in('lead_id', ids)
+      ])
+      contactsError = contactsError ?? c.error
+      existingError = existingError ?? o.error
+      hereError = hereError ?? h.error
+      contacts.push(...(c.data ?? [])); existingOpen.push(...(o.data ?? [])); existingHere.push(...(h.data ?? []))
+    }
+    const existing = [...existingOpen, ...existingHere]
 
     if (contactsError) {
       log('error', 'engine', 'campaign_scheduler.contact_lookup_failed', `Contact lookup failed for campaign ${campaign.id}: ${contactsError.message}`, {
@@ -151,26 +174,29 @@ async function seedCampaignEnrollments(supabase) {
     }
 
     if (!rows.length) continue
-    const { error: enrollmentError } = await supabase
-      .from('campaign_enrollments')
-      .insert(rows, { onConflict: 'campaign_id,lead_id', ignoreDuplicates: true })
-
-    if (enrollmentError) {
-      if (enrollmentError.code === '23505' || enrollmentError.code === 'P0001') {
-        log('debug', 'engine', 'campaign_scheduler.enrollment_conflict', `Skipped conflicting enrollments for campaign ${campaign.id}: ${enrollmentError.message}`, {
-          entity_id: campaign.id, details: { code: enrollmentError.code }
-        })
-      } else {
-        log('error', 'engine', 'campaign_scheduler.enrollment_insert_failed', `Enrollment insert failed for campaign ${campaign.id}: ${enrollmentError.message}`, {
-          entity_id: campaign.id, details: { error: enrollmentError.message }
+    // Chunked insert; if a chunk is rejected (one row hit a unique/trigger conflict) it is retried row by row, so one bad
+    // row no longer blocks the whole list on every cycle.
+    let insertedHere = 0
+    for (const part of chunked(rows, INSERT_CHUNK)) {
+      const { error: enrollmentError } = await supabase.from('campaign_enrollments').insert(part)
+      if (!enrollmentError) { insertedHere += part.length; continue }
+      log('warn', 'engine', 'campaign_scheduler.enrollment_batch_retry', `Enrollment batch of ${part.length} rejected for campaign ${campaign.id} (${enrollmentError.message}); retrying row by row`, {
+        entity_id: campaign.id, details: { code: enrollmentError.code, error: enrollmentError.message }
+      })
+      for (const row of part) {
+        const { error: rowError } = await supabase.from('campaign_enrollments').insert(row)
+        if (!rowError) { insertedHere++; continue }
+        if (rowError.code === '23505' || rowError.code === 'P0001') continue   // already enrolled / blocked by rule: expected
+        log('error', 'engine', 'campaign_scheduler.enrollment_insert_failed', `Enrollment insert failed for campaign ${campaign.id}: ${rowError.message}`, {
+          entity_id: campaign.id, details: { error: rowError.message, leadId: row.lead_id }
         })
       }
-      continue
     }
+    if (!insertedHere) continue
 
-    enrolled += rows.length
-    log('info', 'engine', 'campaign_scheduler.enrolled', `Enrolled ${rows.length} contacts in campaign ${campaign.id}`, {
-      entity_id: campaign.id, details: { count: rows.length }
+    enrolled += insertedHere
+    log('info', 'engine', 'campaign_scheduler.enrolled', `Enrolled ${insertedHere} contacts in campaign ${campaign.id}`, {
+      entity_id: campaign.id, details: { count: insertedHere }
     })
   }
 
@@ -201,12 +227,23 @@ export async function runCampaignScheduler(supabase, { seed = true } = {}) {
   const seeded = seed ? await seedCampaignEnrollments(supabase) : 0
   if (seeded) log('info', 'engine', 'campaign_scheduler.seeded', `Seeded ${seeded} campaign enrollments`, { details: { seeded } })
 
-  const { data: due, error } = await supabase
-    .from('campaign_enrollments')
-    .select('id, campaign_id, lead_id, current_step, status, step_order, schedule_reason')
-    .in('status', ['pending', 'active'])
-    .or(`next_send_at.is.null,next_send_at.lte.${now}`)
-    .limit(BATCH_SIZE)
+  // Not one unordered query: with hundreds of enrollments already waiting in the queue (active, nothing new to do for
+  // them), a plain limit kept returning the same ones and new or due-for-step-2 enrollments starved. New (pending) ones
+  // go first, then active ones whose next step is due, then active ones with no time set; each page is ordered by id.
+  const dueCols = 'id, campaign_id, lead_id, current_step, status, step_order, schedule_reason'
+  const due = []
+  let error = null
+  const pages = [
+    () => supabase.from('campaign_enrollments').select(dueCols).eq('status', 'pending').or(`next_send_at.is.null,next_send_at.lte.${now}`),
+    () => supabase.from('campaign_enrollments').select(dueCols).eq('status', 'active').lte('next_send_at', now),
+    () => supabase.from('campaign_enrollments').select(dueCols).eq('status', 'active').is('next_send_at', null),
+  ]
+  for (const page of pages) {
+    if (due.length >= BATCH_SIZE) break
+    const res = await page().order('id', { ascending: true }).limit(BATCH_SIZE - due.length)
+    if (res.error) { error = res.error; break }
+    due.push(...(res.data ?? []))
+  }
 
   if (error) {
     log('error', 'engine', 'campaign_scheduler.enrollment_fetch_failed', `Enrollment fetch failed: ${error.message}`, { details: { error: error.message } })

@@ -10,7 +10,7 @@ function fakeDb(tables) {
     const run = () => {
       requests.push({ table: name, op: q.op, payload: q.payload, filters: q.filters })
       const rows = tables[name] ?? (tables[name] = [])
-      const match = (r) => q.filters.every(([t, c, v]) => (t === 'in' ? v.includes(r[c]) : r[c] === v))
+      const match = (r) => q.filters.every(([t, c, v]) => (t === 'in' ? v.includes(r[c]) : t === 'lte' ? (r[c] != null && r[c] <= v) : t === 'isnull' ? r[c] == null : r[c] === v))
       if (q.op === 'select') return { data: rows.filter(match).slice(0, q.limit ?? 1000), error: null }
       if (q.op === 'update') { const hit = rows.filter(match); hit.forEach(r => Object.assign(r, q.payload)); return { data: hit, error: null } }
       if (q.op === 'insert') {
@@ -22,7 +22,9 @@ function fakeDb(tables) {
       return { data: null, error: null }
     }
     const b = {
-      select() { return b }, limit(n) { q.limit = n; return b }, or() { return b },
+      select() { return b }, limit(n) { q.limit = n; return b }, or() { return b }, order() { return b },
+      lte(c, v) { q.filters.push(['lte', c, v]); return b },
+      is(c) { q.filters.push(['isnull', c]); return b },
       in(c, v) { q.filters.push(['in', c, v]); return b },
       eq(c, v) { q.filters.push(['eq', c, v]); return b },
       update(p) { q.op = 'update'; q.payload = p; return b },
@@ -98,4 +100,15 @@ test('paused campaign, or one whose WhatsApp session is not connected, queues no
   const t2 = scenario({ contacts: 5 }); t2.whatsapp_sessions[0].status = 'disconnected'
   assert.equal((await runCampaignScheduler(fakeDb(t2), { seed: false })).queued, 0)
   assert.equal(t2.follow_up_queue.length, 0)
+})
+
+test('new (pending) enrollments are served before active ones when the batch is smaller than the backlog', async () => {
+  const tables = scenario({ contacts: 10 })
+  for (const e of tables.campaign_enrollments.slice(0, 5)) e.status = 'active'   // five already in flight
+  const prev = process.env.CAMPAIGN_BATCH_SIZE
+  const db = fakeDb(tables)
+  const result = await runCampaignScheduler(db, { seed: false })
+  assert.ok(result.queued > 0)
+  assert.ok(db.requests.some(r => r.table === 'campaign_enrollments' && r.filters.some(f => f[1] === 'status' && f[2] === 'pending')))
+  process.env.CAMPAIGN_BATCH_SIZE = prev
 })

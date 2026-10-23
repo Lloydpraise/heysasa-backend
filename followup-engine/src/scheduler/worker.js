@@ -166,14 +166,19 @@ export async function runWorker(supabase, queueItemId) {
   // Sends are billed in KES; AI (rewrite / QC) in USD. Both wallets must be able to pay for this item.
   const hasBalance = (await checkSendBalance(supabase, item.business_id)) && (await checkAiBalance(supabase, item.business_id))
   if (!hasBalance) {
-    await flagInsufficientFunds(supabase, item.business_id)
+    // A campaign message just waits: the sender pauses the campaign and the toggle sync resumes it once funds are back.
+    // flagInsufficientFunds switches follow-ups off and pauses EVERY campaign of the business, which is too blunt for a
+    // wallet that dips below the price of one message mid-campaign.
+    if (!item.campaign_id) await flagInsufficientFunds(supabase, item.business_id)
     return stallItem('insufficient_balance')
   }
 
   // ── 5. Daily cap check ───────────────────────────────────────
   const dailyCap = (await effectiveDailyCap(supabase, item.business_id, business.followup_daily_cap ?? DEFAULT_DAILY_CAP)).cap
   const dailyCount = await getDailyCount(supabase, item.business_id)
-  if (dailyCount >= dailyCap) return stallItem('daily_cap_reached')
+  // Campaign messages are not held here: promoting them early is harmless (they wait in 'ready_to_send') and the sender
+  // enforces the daily cap at send time. Holding them here made the whole campaign trickle in only when the count dipped.
+  if (!item.campaign_id && dailyCount >= dailyCap) return stallItem('daily_cap_reached')
 
   // ── 6. Load persona pack (Optional) ──────────────────────────
   const pack = await getPersonaPack(supabase, item.business_id)
@@ -190,7 +195,8 @@ export async function runWorker(supabase, queueItemId) {
   if (conv?.last_user_message_at && hoursSince(conv.last_user_message_at) < 2) {
     // Follow-up AI items wait instead of dying: the planner will place the next send properly.
     if (item.aiManaged || item.authored_by === 'ai_scheduled') return stallItem('lead_recently_active', 30 * 60_000)
-    return skipItem('lead_recently_active')
+    // Skipping a campaign message here used to push the lead out and get them re-queued in a loop: wait instead.
+    return item.campaign_id ? stallItem('lead_recently_active', 30 * 60_000) : skipItem('lead_recently_active')
   }
 
   // Sentiment check — don't send if last reply was aggressive/negative.

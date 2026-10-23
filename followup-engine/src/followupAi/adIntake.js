@@ -3,10 +3,14 @@
 //
 // Spend is deliberately bounded: only ads with leads in the last 30 days, a few new playbooks per business per run, and
 // a couple of AI generations per run. Everything produced is a draft for the owner.
+//
+// A playbook that fails is never retried on its own. It is tried again only when a NEW lead arrives on that ad after
+// the failure (or when the owner edits the ad). A failure that repeats itself must never keep calling the AI.
 
 import { log } from '../lib/log.js'
 import { NON_CUSTOMER_TYPES } from '../lib/leadTypes.js'
-import { generatePlaybook } from './playbookAuthor.js'
+import { generatePlaybook, markPlaybookFailed } from './playbookAuthor.js'
+import { shouldRetryFailed } from './playbookRules.js'
 import { logTurn } from './turns.js'
 
 const RECENT_DAYS = 30
@@ -20,16 +24,20 @@ export async function runAdIntake(supabase) {
 
   // 1. ads that actually have leads, per business
   const { data: leads, error } = await supabase.from('contacts')
-    .select('business_id, ad_id, original_ad_id, lead_type')
+    .select('business_id, ad_id, original_ad_id, lead_type, ad_attributed_at')
     .eq('is_ad_lead', true).gte('ad_attributed_at', since).limit(5000)
   if (error) throw new Error(`ad intake: lead lookup failed: ${error.message}`)
 
   const wanted = new Map() // business_id -> Set(ad_id)
+  const latestLead = new Map() // `${business_id}:${ad_id}` -> newest ad_attributed_at (ms)
   for (const c of leads ?? []) {
     const adKey = c.original_ad_id || c.ad_id
     if (!adKey || NON_CUSTOMER_TYPES.has(c.lead_type)) continue
     if (!wanted.has(c.business_id)) wanted.set(c.business_id, new Set())
     wanted.get(c.business_id).add(String(adKey))
+    const at = Date.parse(c.ad_attributed_at)
+    const key = `${c.business_id}:${adKey}`
+    if (Number.isFinite(at) && at > (latestLead.get(key) ?? 0)) latestLead.set(key, at)
   }
   const businessIds = [...wanted.keys()]
   let created = 0
@@ -38,7 +46,7 @@ export async function runAdIntake(supabase) {
     const active = new Set((businesses ?? []).filter(b => b.followup_ai_enabled && b.subscription_active).map(b => b.business_id))
 
     const [{ data: existing }, { data: attributions }] = await Promise.all([
-      supabase.from('ad_playbooks').select('id, business_id, ad_id, status, auto_headline, auto_body, auto_thumbnail_url').in('business_id', [...active]),
+      supabase.from('ad_playbooks').select('id, business_id, ad_id, status, failed_at, auto_headline, auto_body, auto_thumbnail_url').in('business_id', [...active]),
       supabase.from('ad_attributions').select('business_id, ad_id, ad_headline, ad_body, ad_thumbnail_url').in('business_id', [...active]),
     ])
     const have = new Map((existing ?? []).map(p => [`${p.business_id}:${p.ad_id}`, p]))
@@ -60,6 +68,16 @@ export async function runAdIntake(supabase) {
           if (insertError) { log('error', 'followup_ai', 'followup_ai.intake_insert_failed', insertError.message, { business_id: businessId }); continue }
           made++; created++
           await logTurn(supabase, { businessId, kind: 'intake', decision: 'ad_found', details: { adId } })
+          continue
+        }
+
+        // failed before: one more try, but only because a new lead arrived on this ad after the failure
+        if (current.status === 'failed') {
+          const latest = latestLead.get(key)
+          if (latest && shouldRetryFailed({ failedAt: current.failed_at, latestLeadAt: new Date(latest).toISOString() })) {
+            await supabase.from('ad_playbooks').update({ ...Object.fromEntries(Object.entries(auto).filter(([, v]) => v)), status: 'pending' }).eq('id', current.id)
+            await logTurn(supabase, { businessId, kind: 'intake', decision: 'retry_new_lead', details: { adId } })
+          }
           continue
         }
 
@@ -89,7 +107,7 @@ export async function runAdIntake(supabase) {
       if (result.ok) generated++
     } catch (e) {
       log('error', 'followup_ai', 'followup_ai.playbook_failed', `Playbook ${item.id} failed: ${e.message}`, { business_id: item.business_id })
-      await supabase.from('ad_playbooks').update({ status: 'failed', last_error: String(e.message).slice(0, 300) }).eq('id', item.id)
+      await markPlaybookFailed(supabase, item.id, { last_error: String(e.message).slice(0, 300) })
     }
   }
   return { created, generated }

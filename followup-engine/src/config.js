@@ -3,7 +3,9 @@ import 'dotenv/config'
 export const SUPABASE_URL = process.env.SUPABASE_URL ?? ''
 export const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY ?? process.env.SUPABASE_SERVICE_KEY ?? ''
 
+// Falls back to the old Oracle address only so an unset variable cannot suddenly break sending; set EVOLUTION_URL on the server.
 export const EVOLUTION_URL = process.env.EVOLUTION_URL ?? 'http://129.213.33.173:8080'
+if (!process.env.EVOLUTION_URL) console.error('[config] EVOLUTION_URL is not set: using the legacy fallback address. Set EVOLUTION_URL in the environment.')
 export const EVOLUTION_KEY = process.env.EVOLUTION_API_KEY ?? process.env.EVOLUTION_KEY ?? ''
 export const PLATFORM_EVOLUTION_INSTANCE = process.env.PLATFORM_EVOLUTION_INSTANCE ?? ''
 export const EVOLUTION_WEBHOOK_URL = process.env.EVOLUTION_WEBHOOK_URL ?? ''

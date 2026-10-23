@@ -2,6 +2,8 @@ import { runWorker } from './worker.js'
 import { isBusinessAwake } from '../lib/timing.js'
 import { log } from '../lib/log.js'
 
+const WORKER_CONCURRENCY = Math.max(1, parseInt(process.env.SCHEDULER_WORKER_CONCURRENCY ?? '8'))
+
 export async function runScheduler(supabase) {
   const { data: items, error } = await supabase
     .from('follow_up_queue')
@@ -40,9 +42,18 @@ export async function runScheduler(supabase) {
   // The old Deno version had to HTTP-call its own worker route because
   // edge functions are stateless/cold-start-per-invocation. A
   // persistent Node process doesn't have that constraint.
-  const results = await Promise.allSettled(
-    awakeItems.map(item => runWorker(supabase, item.id))
-  )
+  // Run them through a small pool instead of all at once: 50 workers at the same moment each fire several queries
+  // (plus AI calls for rewritten campaigns), which spikes the database and the shared 40 requests/second budget.
+  const results = new Array(awakeItems.length)
+  let cursor = 0
+  const lanes = Array.from({ length: Math.min(WORKER_CONCURRENCY, awakeItems.length) }, async () => {
+    while (cursor < awakeItems.length) {
+      const idx = cursor++
+      try { results[idx] = { status: 'fulfilled', value: await runWorker(supabase, awakeItems[idx].id) } }
+      catch (reason) { results[idx] = { status: 'rejected', reason } }
+    }
+  })
+  await Promise.all(lanes)
 
   const failures = results.filter(r => r.status === 'rejected')
   if (failures.length) {

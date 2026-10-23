@@ -208,19 +208,19 @@ export async function recordSuccessfulSend(supabase, { item, contact, business, 
   }
 }
 
-// Only "number not on WhatsApp" is a permanent stop now. Everything else
-// (Evolution errors, timeouts, transient network failures) is assumed
-// recoverable — it stays ready_to_send and comes back up for another
-// attempt in the next retry pass, indefinitely, rather than being given
-// up on after a fixed attempt count.
 // What happens to a message that did not go through (see lib/sendFailures.js for the rules):
 //   - number not on WhatsApp / invalid number: given up at once, never retried
+//   - connection down (instance_down): put back a few minutes later, never counted against the lead,
+//     never given up (the lead is not the problem)
 //   - anything else: retried a few times, spaced out, then given up and reported
 // When a message is given up on, the person's campaign enrolment is closed too, so they do not
 // sit in the campaign forever waiting for a message that will never go.
+// Returns the decision so the sender can pace itself (see antiban.recordFailedAttempt).
 export async function recordFailedDispatch(supabase, item, errorMessage) {
-  const attempts = (item.dispatch_attempts ?? 0) + 1
-  const decision = decideRetry(errorMessage, attempts)
+  const prior = item.dispatch_attempts ?? 0
+  const preview = decideRetry(errorMessage, prior + 1)
+  const attempts = preview.countsAttempt === false ? prior : prior + 1
+  const decision = preview
 
   await supabase.from('follow_up_queue').update(decision.giveUp
     ? { status: 'failed', dispatch_attempts: attempts, last_dispatch_error: errorMessage, failure_class: decision.failureClass, processed_at: new Date().toISOString() }
@@ -240,4 +240,5 @@ export async function recordFailedDispatch(supabase, item, errorMessage) {
     business_id: item.business_id, contact_id: item.contact_id, entity_id: item.id,
     details: { attempts, failureClass: decision.failureClass, permanent: decision.permanent, giveUp: decision.giveUp, error: errorMessage }
   })
+  return decision
 }

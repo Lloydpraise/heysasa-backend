@@ -95,3 +95,21 @@ export function validatePlaybook(raw, { maxSteps = MAX_STEPS, minSteps = MIN_STE
   if (out.length >= 5 && !out.some(s => s.klt_phase === 'trust')) problems.push('no_trust_step')
   return { flow, steps: out, problems, ok: !problems.includes('flow_instructions_missing') && out.length > 0 }
 }
+
+// ── When may the AI be called for a playbook? ─────────────────────────────────────────────────────────────────────
+// Every generation costs money (an author call plus a quality check per step), so a failure must never retry by itself.
+// A failed playbook is tried again only when a NEW lead arrives on that ad after the failure.
+export function shouldRetryFailed({ failedAt, latestLeadAt }) {
+  const failed = Date.parse(failedAt)
+  const lead = Date.parse(latestLeadAt)
+  if (!Number.isFinite(failed) || !Number.isFinite(lead)) return false
+  return lead > failed
+}
+
+// Should a change to an ad_playbooks row start the ad intake? Not while the engine is writing it, and not for the
+// engine's own 'failed' update (which clears the regenerate request). An owner edit of a failed playbook still does.
+export function wantsGeneration(row) {
+  if (!row) return false
+  if (row.status === 'generating') return false
+  return row.status === 'pending' || !!row.regenerate_requested_at
+}
