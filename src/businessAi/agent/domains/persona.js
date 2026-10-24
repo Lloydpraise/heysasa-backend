@@ -1,20 +1,32 @@
 // The persona pack: how the chat AI and the campaign writer sound like this business.
 // Every change saves a NEW version (the old one is kept), so Undo is a real undo and nothing is ever lost.
 import { ToolError, asText, clip, must } from '../helpers.js';
+import { loadActivePack, savePackVersion } from '../../../personaPack.js';
 
 // customer_profiles is generated from real chats; the owner-facing editor never lets it be rewritten here either.
 const PROTECTED = new Set(['customer_profiles']);
 const SECTION_RE = /^[a-z][a-z0-9_]{1,39}$/;
 const MAX_SECTION_CHARS = 6000;
 
+// Each WhatsApp account has its own pack; while it has none, the business-wide pack is used (ACCOUNTS.md rule 8).
 async function activePack(ctx) {
-  return must(await ctx.db.from('persona_packs').select('id, version, pack').eq('business_id', ctx.businessId).eq('is_active', true).order('version', { ascending: false }).limit(1).maybeSingle(), 'persona pack');
+  try {
+    const { row } = await loadActivePack(ctx.db, ctx.businessId, ctx.accountId ?? null, 'id, version, pack, account_id');
+    return row;
+  } catch (error) {
+    throw new Error(`persona pack: ${error.message}`);
+  }
 }
 
+// A change made while an account is selected becomes that account's own pack (starting from the fallback if needed).
 async function saveVersion(ctx, current, pack, by = 'ask_heysasa') {
-  if (current) must(await ctx.db.from('persona_packs').update({ is_active: false }).eq('id', current.id).eq('business_id', ctx.businessId), 'retire version');
-  const row = must(await ctx.db.from('persona_packs').insert({ business_id: ctx.businessId, version: (current?.version || 0) + 1, pack, is_active: true, generated_by: by, generated_at: ctx.now().toISOString() }).select('version').single(), 'save version');
-  return row.version;
+  try {
+    const saved = await savePackVersion(ctx.db, { businessId: ctx.businessId, accountId: ctx.accountId ?? null, pack, generatedBy: by, now: ctx.now() });
+    return saved.version;
+  } catch (error) {
+    must({ error }, 'save version');
+    throw error;
+  }
 }
 
 const sizeOf = (v) => (typeof v === 'string' ? v.length : JSON.stringify(v ?? '').length);

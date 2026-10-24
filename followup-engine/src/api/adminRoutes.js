@@ -7,7 +7,7 @@ import { supabase } from '../supabaseClient.js'
 import { OPENAI_MODEL } from '../config.js'
 import * as prompts from '../scheduler/prompts.js'
 import { QC_FALLBACK } from '../lib/qc.js'
-import { getContact, getBusiness, getPersonaPack, getConversation } from '../lib/db.js'
+import { getContact, getBusinessForAccount, getPersonaPack, getConversation } from '../lib/db.js'
 import { rewriteSuggestedMessage } from '../scheduler/generateDraft.js'
 import { runOptInClassifier } from '../scheduler/optInClassifier.js'
 import { runCampaignReplyIntentClassifier } from '../scheduler/campaignReplyIntentClassifier.js'
@@ -120,13 +120,13 @@ adminRouter.post('/admin/engine/preview-rewrite', async (req, res) => {
     const contact = await getContact(supabase, contactId)
     if (!contact) return res.status(404).json({ ok: false, error: 'contact_not_found' })
     const [business, pack, conv, profile] = await Promise.all([
-      getBusiness(supabase, contact.business_id),
-      getPersonaPack(supabase, contact.business_id),
+      getBusinessForAccount(supabase, contact.business_id, contact.account_id ?? null),
+      getPersonaPack(supabase, contact.business_id, contact.account_id ?? null),
       getConversation(supabase, contact.id, contact.business_id),
       getCustomerProfile(supabase, contact.id),
     ])
 
-    const stored = ruleId ? await getAutoCampaignContext(supabase, contact.business_id, ruleId) : {}
+    const stored = ruleId ? await getAutoCampaignContext(supabase, contact.business_id, ruleId, contact.account_id ?? null) : {}
     const objective = String(req.body.objective ?? '').trim() || stored.objective || null
     const playbook = String(req.body.playbook ?? '').trim() || stored.playbook || null
     const extra = { objective, playbook, profile, skipBilling: true } // admin preview: not billed to the business

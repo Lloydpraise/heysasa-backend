@@ -25,7 +25,7 @@ const lastClassifiedAt = new Map() // contact_id -> ISO timestamp of last-seen i
 export async function runOptInClassifier(supabase, onlyContactId = null) {
   let consentPendingQuery = supabase
     .from('contacts')
-    .select('id, business_id, name')
+    .select('id, business_id, account_id, name')
     .eq('follow_up_opted_in', false)
     .eq('do_not_contact', false)
     .not('consent_message_sent_at', 'is', null)
@@ -48,7 +48,7 @@ export async function runOptInClassifier(supabase, onlyContactId = null) {
   if (stillNeedLookup.length) {
     let contactLookup = supabase
       .from('contacts')
-      .select('id, business_id, name')
+      .select('id, business_id, account_id, name')
       .in('id', stillNeedLookup)
       .eq('follow_up_opted_in', false)
       .eq('do_not_contact', false)
@@ -61,7 +61,7 @@ export async function runOptInClassifier(supabase, onlyContactId = null) {
   // follow-ups — still worth checking for a stop-signal.
   let activeOptedInQuery = supabase
     .from('contacts')
-    .select('id, business_id, name')
+    .select('id, business_id, account_id, name')
     .eq('follow_up_opted_in', true)
     .eq('do_not_contact', false)
     .or(`id.in.(${enrolledIds.length ? enrolledIds.join(',') : '0'}),follow_up_count.gt.0`)
@@ -88,7 +88,7 @@ export async function runOptInClassifier(supabase, onlyContactId = null) {
       if (lastClassifiedAt.get(contact.id) === lastInbound.created_at) return
 
       const userContent = `Lead's WhatsApp reply:\n"${lastInbound.content.text}"`
-      const raw = await callBot(supabase, 'opt_in_classifier', userContent, OPT_IN_CLASSIFIER_FALLBACK, { json: true, temperature: 0, maxTokens: 30, cacheKey: `opt_in:${contact.business_id}`, businessId: contact.business_id })
+      const raw = await callBot(supabase, 'opt_in_classifier', userContent, OPT_IN_CLASSIFIER_FALLBACK, { json: true, temperature: 0, maxTokens: 30, cacheKey: `opt_in:${contact.business_id}`, businessId: contact.business_id, accountId: contact.account_id ?? null })
       lastClassifiedAt.set(contact.id, lastInbound.created_at)
       if (!raw) return
 

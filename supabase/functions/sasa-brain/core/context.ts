@@ -12,6 +12,7 @@ import { readHandoffConfig, renderHandoffRules } from './handoff.ts';
 import type { CustomerFile, HistoryMessage, Skill } from './prompt.ts';
 import type { Flow } from './flows.ts';
 import type { ToolRow } from './tools.ts';
+import { own, shared } from './builtin.ts';
 
 // What the AI may search: the business's active, finished files that the chat AI is allowed to use.
 export type KnowledgeSource = { id: string; title: string; use_case: string; file_type: string };
@@ -103,29 +104,48 @@ export function createContextCache(opts: { coreMs?: number; categoriesMs?: numbe
   return { core: ttl<Core>(opts.coreMs ?? 30_000, now), categories: ttl<Category[]>(opts.categoriesMs ?? 300_000, now) };
 }
 
+// The settings the chat AI runs with. For an account: the business columns with accounts.settings laid over them
+// (account_settings), so a number can have its own model, rules and handoff people. Without an account: the business row.
 // deno-lint-ignore no-explicit-any
-async function loadCore(db: any, businessId: string): Promise<Core> {
+function loadBusinessRow(db: any, businessId: string, accountId: string | null): Promise<any> {
+  if (!accountId) {
+    return db.from('businesses').select('name, currency, chat_ai_model, chat_ai_settings, owner_phone, phone').eq('business_id', businessId).maybeSingle().then((r: never) => must(r, 'the business'));
+  }
+  return db.rpc('account_settings', { p_account_id: accountId }).then((r: never) => {
+    const settings = must(r, 'the account settings');
+    if (settings && settings.business_id !== businessId) throw new Error('this account belongs to another business');
+    return settings;
+  });
+}
+
+// deno-lint-ignore no-explicit-any
+async function loadCore(db: any, businessId: string, accountId: string | null): Promise<Core> {
+  // Account-owned (skills, flows): this account only. Catalog (persona fallback, knowledge files): this account's plus the
+  // business-level ones. Tools: read for the whole business; resolveTools keeps the account's own, the business's and global ones.
   const [business, personaRows, skillRows, toolRows, flowRows, knowledgeRows] = await Promise.all([
-    db.from('businesses').select('name, currency, chat_ai_model, chat_ai_settings, owner_phone, phone').eq('business_id', businessId).maybeSingle().then((r: never) => must(r, 'the business')),
-    db.from('persona_packs').select('pack').eq('business_id', businessId).eq('is_active', true).order('version', { ascending: false }).limit(1).then((r: never) => must(r, 'the persona pack')),
-    db.from('chat_ai_skills').select('key, title, when_to_use, instructions').eq('business_id', businessId).eq('enabled', true).then((r: never) => must(r, 'skills')),
-    db.from('chat_ai_tools').select('name, business_id, description, parameters, kind, target, phase').eq('enabled', true).or(`business_id.is.null,business_id.eq.${businessId}`).then((r: never) => must(r, 'tools')),
-    db.from('chat_flows').select('id, name, enabled, priority, trigger, goal, instructions, skill_keys, created_at').eq('business_id', businessId).eq('enabled', true).then((r: never) => must(r, 'flows')),
-    db.from('knowledge_sources').select('id, title, use_case, file_type').eq('business_id', businessId).eq('is_active', true).eq('status', 'ready').in('used_by', ['chat', 'both']).order('created_at', { ascending: true }).limit(40).then((r: never) => must(r, 'knowledge')),
+    loadBusinessRow(db, businessId, accountId),
+    shared(db.from('persona_packs').select('pack, account_id').eq('business_id', businessId).eq('is_active', true), accountId).order('version', { ascending: false }).limit(accountId ? 10 : 1).then((r: never) => must(r, 'the persona pack')),
+    own(db.from('chat_ai_skills').select('key, title, when_to_use, instructions').eq('business_id', businessId).eq('enabled', true), accountId).then((r: never) => must(r, 'skills')),
+    db.from('chat_ai_tools').select('name, business_id, account_id, description, parameters, kind, target, phase').eq('enabled', true).or(`business_id.is.null,business_id.eq.${businessId}`).then((r: never) => must(r, 'tools')),
+    own(db.from('chat_flows').select('id, name, enabled, priority, trigger, goal, instructions, skill_keys, created_at').eq('business_id', businessId).eq('enabled', true), accountId).then((r: never) => must(r, 'flows')),
+    shared(db.from('knowledge_sources').select('id, title, use_case, file_type').eq('business_id', businessId).eq('is_active', true).eq('status', 'ready').in('used_by', ['chat', 'both']), accountId).order('created_at', { ascending: true }).limit(40).then((r: never) => must(r, 'knowledge')),
   ]);
-  if (!business) throw new Error('business not found');
+  if (!business) throw new Error(accountId ? 'account not found' : 'business not found');
+  // The account's own persona; the business-wide pack only while the account has none yet (ACCOUNTS.md rule 8).
+  // deno-lint-ignore no-explicit-any
+  const persona = (personaRows ?? []).find((p: any) => accountId && p.account_id === accountId) ?? (personaRows ?? []).find((p: any) => !accountId || !p.account_id);
   const knowledge = (knowledgeRows ?? []) as KnowledgeSource[];
   // A business with no files never sees the two file tools, so the AI is not tempted to search nothing.
   const tools = ((toolRows ?? []) as ToolRow[]).filter((t) => knowledge.length > 0 || !KNOWLEDGE_TOOLS.includes(t.name));
   // The picture-sending tool is only useful when at least one file is an image.
   const visibleTools = knowledge.some((k) => k.file_type === 'image') ? tools : tools.filter((t) => t.name !== 'send_knowledge_image');
-  return { business, personaPack: personaRows?.[0]?.pack ?? null, skills: (skillRows ?? []) as Skill[], toolRows: visibleTools, flows: (flowRows ?? []) as Flow[], knowledge };
+  return { business, personaPack: persona?.pack ?? null, skills: (skillRows ?? []) as Skill[], toolRows: visibleTools, flows: (flowRows ?? []) as Flow[], knowledge };
 }
 
 // deno-lint-ignore no-explicit-any
-async function loadCategories(db: any, businessId: string): Promise<Category[]> {
+async function loadCategories(db: any, businessId: string, accountId: string | null): Promise<Category[]> {
   const productRows = must(
-    await db.from('products').select('category').eq('business_id', businessId).eq('status', 'approved').eq('ai_visible', true).limit(5000),
+    await shared(db.from('products').select('category').eq('business_id', businessId).eq('status', 'approved').eq('ai_visible', true), accountId).limit(5000),
     'products',
   );
   const counts = new Map<string, number>();
@@ -136,16 +156,20 @@ async function loadCategories(db: any, businessId: string): Promise<Category[]> 
   return [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).map(([name, count]) => ({ name, count }));
 }
 
+// Cached per WhatsApp number: two accounts of one business have their own skills, flows and persona.
+const cacheKey = (businessId: string, accountId: string | null) => (accountId ? `${businessId}:${accountId}` : businessId);
 // deno-lint-ignore no-explicit-any
-const getCore = (db: any, businessId: string, cache?: ContextCache) => (cache ? cache.core(businessId, () => loadCore(db, businessId)) : loadCore(db, businessId));
+const getCore = (db: any, businessId: string, accountId: string | null, cache?: ContextCache) =>
+  (cache ? cache.core(cacheKey(businessId, accountId), () => loadCore(db, businessId, accountId)) : loadCore(db, businessId, accountId));
 // deno-lint-ignore no-explicit-any
-const getCategories = (db: any, businessId: string, cache?: ContextCache) => (cache ? cache.categories(businessId, () => loadCategories(db, businessId)) : loadCategories(db, businessId));
+const getCategories = (db: any, businessId: string, accountId: string | null, cache?: ContextCache) =>
+  (cache ? cache.categories(cacheKey(businessId, accountId), () => loadCategories(db, businessId, accountId)) : loadCategories(db, businessId, accountId));
 
 // Just the settings (how long to wait for a burst of messages, how hard the model thinks). One cached read, so a turn can
 // decide how long to wait without loading the whole context first.
 // deno-lint-ignore no-explicit-any
 export async function loadSettings(db: any, input: TurnInput, cache?: ContextCache) {
-  const core = await getCore(db, input.business_id, input.simulate === true ? undefined : cache);
+  const core = await getCore(db, input.business_id, input.account_id ?? null, input.simulate === true ? undefined : cache);
   return readSettings(core.business.chat_ai_settings);
 }
 
@@ -165,11 +189,12 @@ async function loadVolatile(db: any, input: TurnInput): Promise<Volatile> {
   }
 
   const contactId = input.contact_id;
+  const accountId = input.account_id ?? null;
   const [contact, convo, members, messages] = await Promise.all([
-    db.from('contacts').select('name, ad_headline, ad_body, lead_summary, context_summary, customer_intent, lead_quality, objection_tags, notes, ad_id, original_ad_id').eq('id', contactId).maybeSingle().then((r: never) => must(r, 'the customer')),
-    db.from('conversations').select('conv_stage, lead_stage_service, lead_stage_ecom, context_summary, chat_ai_flow_id').eq('id', input.conversation_id).maybeSingle().then((r: never) => must(r, 'the conversation')),
+    own(db.from('contacts').select('name, ad_headline, ad_body, lead_summary, context_summary, customer_intent, lead_quality, objection_tags, notes, ad_id, original_ad_id').eq('id', contactId), accountId).maybeSingle().then((r: never) => must(r, 'the customer')),
+    own(db.from('conversations').select('conv_stage, lead_stage_service, lead_stage_ecom, context_summary, chat_ai_flow_id').eq('id', input.conversation_id), accountId).maybeSingle().then((r: never) => must(r, 'the conversation')),
     db.from('list_members').select('list_id').eq('lead_id', contactId).then((r: never) => must(r, 'the customer lists')),
-    db.from('messages').select('direction, agent_role, type, content, created_at').eq('conversation_id', input.conversation_id).order('created_at', { ascending: false }).limit(HISTORY_LIMIT).then((r: never) => must(r, 'messages')),
+    own(db.from('messages').select('direction, agent_role, type, content, created_at').eq('conversation_id', input.conversation_id), accountId).order('created_at', { ascending: false }).limit(HISTORY_LIMIT).then((r: never) => must(r, 'messages')),
   ]);
   const history = toHistory([...(messages ?? [])].reverse());
   const customer: CustomerFile = {
@@ -189,7 +214,8 @@ async function loadVolatile(db: any, input: TurnInput): Promise<Volatile> {
 export async function loadContext(db: any, input: TurnInput, cache?: ContextCache): Promise<TurnContext> {
   const businessId = input.business_id;
   const c = input.simulate === true ? undefined : cache;
-  const [core, categories, chat] = await Promise.all([getCore(db, businessId, c), getCategories(db, businessId, c), loadVolatile(db, input)]);
+  const accountId = input.account_id ?? null;
+  const [core, categories, chat] = await Promise.all([getCore(db, businessId, accountId, c), getCategories(db, businessId, accountId, c), loadVolatile(db, input)]);
 
   return {
     business: { name: core.business.name || 'the business', currency: core.business.currency || null, model: core.business.chat_ai_model || 'gpt-5-mini' },

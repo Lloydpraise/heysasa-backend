@@ -35,8 +35,16 @@ export function messageText(content, max = 400) {
   return '[media]';
 }
 
+// Per-account keys (ACCOUNTS.md "Upserts use the account keys"): rows keyed by rule_id are unique per account.
+// ctx.db stamps account_id on the row; without an account (business-wide, single number) the old key still applies.
+export const ruleKey = (ctx) => (ctx?.accountId ? 'account_id,rule_id' : 'business_id,rule_id');
+// The optional p_account_id argument of the account-aware database functions.
+export const accountArg = (ctx) => (ctx?.accountId ? { p_account_id: ctx.accountId } : {});
+
 // A database error is a bug as far as the owner is concerned: throw it as a plain Error (the runner hides the detail).
 export function must(result, what) {
+  // The database refuses a WhatsApp row it cannot place on an account (business-wide view, several numbers).
+  if (/account_id_required/.test(result?.error?.message ?? '')) throw new ToolError('This business has more than one WhatsApp number. Pick the number at the top of the page, then ask again.');
   if (result?.error) throw new Error(`${what}: ${result.error.message}`);
   return result?.data;
 }

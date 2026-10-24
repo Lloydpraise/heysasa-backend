@@ -19,8 +19,13 @@ export function createStore(supabase) {
     async loadPreferences(businessId) {
       return must(await supabase.from('ba_preferences').select('*').eq('business_id', businessId).maybeSingle(), 'preferences');
     },
-    async loadPersona(businessId) {
-      const rows = must(await supabase.from('persona_packs').select('pack').eq('business_id', businessId).eq('is_active', true).order('version', { ascending: false }).limit(1), 'persona pack');
+    // The account's own pack, else the business-wide one (ACCOUNTS.md rule 8).
+    async loadPersona(businessId, accountId = null) {
+      if (accountId) {
+        const own = must(await supabase.from('persona_packs').select('pack').eq('business_id', businessId).eq('account_id', accountId).eq('is_active', true).order('version', { ascending: false }).limit(1), 'persona pack');
+        if (own?.[0]?.pack) return own[0].pack;
+      }
+      const rows = must(await supabase.from('persona_packs').select('pack').eq('business_id', businessId).is('account_id', null).eq('is_active', true).order('version', { ascending: false }).limit(1), 'persona pack');
       return rows?.[0]?.pack ?? null;
     },
     async loadSkills(businessId) {
@@ -150,9 +155,11 @@ export function createStore(supabase) {
     },
 
     // ── catalog ──
-    async matchProducts(businessId, embedding, query) {
+    // accountId: the selected WhatsApp account's products plus the shared catalog (migration 20261024100230).
+    async matchProducts(businessId, embedding, query, accountId = null) {
       return must(await supabase.rpc('match_products_v8', {
         query_embedding: embedding, match_threshold: 0.3, match_count: 5, filter_business_id: businessId, query_text: query,
+        ...(accountId ? { filter_account_id: accountId } : {}),
       }), 'product search') ?? [];
     },
   };

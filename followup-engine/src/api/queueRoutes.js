@@ -1,22 +1,31 @@
 import { Router } from 'express'
 import { supabase } from '../supabaseClient.js'
-import { getBusiness, getContact, getPersonaPack, getConversation } from '../lib/db.js'
+import { getBusinessForAccount, getContact, getPersonaPack, getConversation } from '../lib/db.js'
+import { forAccount } from './authMiddleware.js'
 import { generateFollowupDraft } from '../scheduler/generateDraft.js'
 import { normalizeOutboundMedia } from '../lib/media.js'
 import { log } from '../lib/log.js'
 
 export const queueRouter = Router()
 
+// Is this row inside the request's account scope? (Selected account, or every account the user may see.)
+function inScope(scope, accountId) {
+  if (!scope) return true
+  if (scope.accountId) return accountId === scope.accountId
+  if (scope.isAdmin) return true
+  return !!accountId && (scope.accountIds ?? []).includes(accountId)
+}
+
 // Shared loader — fetches the item and confirms it belongs to the
-// authenticated business AND is actually awaiting approval. Every
-// route below calls this first.
+// authenticated business (and the selected account) AND is actually
+// awaiting approval. Every route below calls this first.
 async function loadOwnedAwaitingItem(req, res) {
   const { id } = req.params
   const { data: item, error } = await supabase
     .from('follow_up_queue').select('*').eq('id', id).single()
 
   if (error || !item) { res.status(404).json({ error: 'not_found' }); return null }
-  if (item.business_id !== req.businessId) { res.status(403).json({ error: 'forbidden' }); return null }
+  if (item.business_id !== req.businessId || !inScope(req.scope, item.account_id ?? null)) { res.status(403).json({ error: 'forbidden' }); return null }
   if (item.approval_status !== 'awaiting_approval') {
     res.status(409).json({ error: 'not_awaiting_approval', status: item.approval_status })
     return null
@@ -26,10 +35,10 @@ async function loadOwnedAwaitingItem(req, res) {
 
 // GET /queue/pending — list this business's messages needing approval
 queueRouter.get('/queue/pending', async (req, res) => {
-  const { data, error } = await supabase
+  const { data, error } = await forAccount(supabase
     .from('follow_up_queue')
-    .select('id, contact_id, sequence_step, touchpoint_type, draft_message, media, qc_passed, qc_notes, scheduled_at')
-    .eq('business_id', req.businessId)
+    .select('id, account_id, contact_id, sequence_step, touchpoint_type, draft_message, media, qc_passed, qc_notes, scheduled_at')
+    .eq('business_id', req.businessId), req.scope)
     .eq('approval_status', 'awaiting_approval')
     .order('scheduled_at', { ascending: true })
 
@@ -39,10 +48,10 @@ queueRouter.get('/queue/pending', async (req, res) => {
 
 // GET /queue/status — delivery history and current scheduling state
 queueRouter.get('/queue/status', async (req, res) => {
-  const { data, error } = await supabase
+  const { data, error } = await forAccount(supabase
     .from('follow_up_queue')
-    .select('id, contact_id, campaign_id, campaign_step, sequence_step, touchpoint_type, status, approval_status, channel, final_message, media, scheduled_at, processed_at, dispatch_attempts, last_dispatch_error, skip_reason, created_at')
-    .eq('business_id', req.businessId)
+    .select('id, account_id, contact_id, campaign_id, campaign_step, sequence_step, touchpoint_type, status, approval_status, channel, final_message, media, scheduled_at, processed_at, dispatch_attempts, last_dispatch_error, skip_reason, created_at')
+    .eq('business_id', req.businessId), req.scope)
     .order('scheduled_at', { ascending: false })
     .limit(100)
 
@@ -55,7 +64,7 @@ queueRouter.post('/queue/:id/approve', async (req, res) => {
   const item = await loadOwnedAwaitingItem(req, res)
   if (!item) return
 
-  const business = await getBusiness(supabase, item.business_id)
+  const business = await getBusinessForAccount(supabase, item.business_id, item.account_id ?? null)
   if (!business) return res.status(500).json({ error: 'business_not_found' })
 
   let media
@@ -101,11 +110,11 @@ queueRouter.post('/queue/:id/regenerate', async (req, res) => {
 
   const [contact, business] = await Promise.all([
     getContact(supabase, item.contact_id),
-    getBusiness(supabase, item.business_id)
+    getBusinessForAccount(supabase, item.business_id, item.account_id ?? null)
   ])
   if (!contact || !business) return res.status(500).json({ error: 'contact_or_business_not_found' })
 
-  const pack = await getPersonaPack(supabase, item.business_id)
+  const pack = await getPersonaPack(supabase, item.business_id, item.account_id ?? contact.account_id ?? null)
   if (!pack) return res.status(500).json({ error: 'no_persona_pack' })
 
   const conv = await getConversation(supabase, item.contact_id, item.business_id)

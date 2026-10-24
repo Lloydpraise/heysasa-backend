@@ -15,9 +15,10 @@ const GRACE_MS = 2 * 60_000;
 const REPEAT_MS = 6 * 60 * 60_000;
 const lastNoticeAt = new Map();
 
-export function scheduleDisconnectNotice({ businessId, instanceName, reason = null }) {
+// Each WhatsApp account (number) is tracked on its own, so one number dropping never hides another's notice.
+export function scheduleDisconnectNotice({ businessId, accountId = null, instanceName, reason = null }) {
     const timer = setTimeout(() => {
-        checkAndNotify(businessId, instanceName, reason).catch((error) => {
+        checkAndNotify(businessId, instanceName, reason, accountId).catch((error) => {
             logEvent({ level: 'warn', area: 'connection', event: 'connection.owner_notice_error', message: error.message, details: { businessId } });
         });
     }, GRACE_MS);
@@ -45,13 +46,14 @@ async function alertOperator({ businessId, name, instanceName, reason, ownerOutc
     }
 }
 
-async function checkAndNotify(businessId, instanceName, reason) {
+async function checkAndNotify(businessId, instanceName, reason, accountId = null) {
+    const noticeKey = accountId || businessId;
     // Came back during the grace period? Then there is nothing to report.
     const { data: live } = await supabase.from('whatsapp_sessions').select('id')
         .eq('business_id', businessId).eq('instance_name', instanceName).eq('status', 'connected').limit(1);
     if (live?.length) return;
 
-    if (Date.now() - (lastNoticeAt.get(businessId) || 0) < REPEAT_MS) return;
+    if (Date.now() - (lastNoticeAt.get(noticeKey) || 0) < REPEAT_MS) return;
 
     const { data: business } = await supabase.from('businesses')
         .select('name, owner_phone, phone, business_type').eq('business_id', businessId).maybeSingle();
@@ -64,7 +66,7 @@ async function checkAndNotify(businessId, instanceName, reason) {
         return;
     }
 
-    lastNoticeAt.set(businessId, Date.now());
+    lastNoticeAt.set(noticeKey, Date.now());
 
     const to = business.owner_phone || business.phone;
     let ownerOutcome;

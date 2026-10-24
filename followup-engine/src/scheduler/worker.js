@@ -2,8 +2,9 @@ import {
   DEFAULT_DAILY_CAP, DEFAULT_ZONE_RECENT, DEFAULT_ZONE_MEDIUM, DEFAULT_MAX_PER_LEAD
 } from '../config.js'
 import {
-  getBusiness, getContact, getPersonaPack, getConversation, getMessages, getDailyCount
+  getBusinessForAccount, getContact, getPersonaPack, getConversation, getMessages, getDailyCount
 } from '../lib/db.js'
+import { instanceForRow } from '../lib/accounts.js'
 import { checkSendBalance, checkAiBalance, flagInsufficientFunds } from '../lib/billing.js'
 import { leadAgeDays, hoursSince } from '../lib/timing.js'
 import { rewriteSuggestedMessage } from './generateDraft.js'
@@ -82,26 +83,40 @@ export async function runWorker(supabase, queueItemId) {
 
   if (item.campaign_id) {
     const { data: campaign, error: campaignError } = await supabase
-      .from('campaigns').select('id, status, business_id, whatsapp_instance_name, ai_managed').eq('id', item.campaign_id).maybeSingle()
+      .from('campaigns').select('id, status, business_id, account_id, whatsapp_instance_name, ai_managed').eq('id', item.campaign_id).maybeSingle()
     if (campaignError) throw new Error(`campaign status lookup failed: ${campaignError.message}`)
     // Campaign not active right now (e.g. paused because follow-ups are
     // toggled off) — nothing here fails or pauses it further, just wait.
     if (!campaign || campaign.status !== 'active') return stallItem('campaign_inactive')
-    const selectedInstance = item.assigned_instance_name || campaign.whatsapp_instance_name
-    if (!selectedInstance) return stallItem('campaign_instance_unassigned')
+    // The instance is the account's (accounts.instance_name); the stored campaign/queue name only counts for
+    // rows without an account. A disconnected or suspended account waits like a disconnected instance.
+    const accountId = item.account_id ?? campaign.account_id ?? null
+    const route = await instanceForRow(supabase, {
+      accountId, storedInstance: item.assigned_instance_name || campaign.whatsapp_instance_name
+    })
+    if (!route.ok) {
+      if (route.reason === 'instance_unassigned') return stallItem('campaign_instance_unassigned')
+      return stallItem(route.reason === 'account_suspended' ? 'account_suspended' : 'instance_not_connected')
+    }
+    const selectedInstance = route.instance
 
-    // whatsapp_sessions is the single source of truth for connection
-    // state — a connected row is trusted as-is, no extra live ping. If
-    // it's genuinely stale, the actual send attempt downstream will
-    // fail for real and that gets retried on its own schedule.
-    const { data: connectedSession } = await supabase
-      .from('whatsapp_sessions')
-      .select('instance_name')
-      .eq('business_id', item.business_id)
-      .eq('instance_name', selectedInstance)
-      .eq('status', 'connected')
-      .maybeSingle()
-    if (!connectedSession) return stallItem('instance_not_connected')
+    if (route.legacy) {
+      // whatsapp_sessions is the single source of truth for connection
+      // state — a connected row is trusted as-is, no extra live ping. If
+      // it's genuinely stale, the actual send attempt downstream will
+      // fail for real and that gets retried on its own schedule.
+      const { data: connectedSession } = await supabase
+        .from('whatsapp_sessions')
+        .select('instance_name')
+        .eq('business_id', item.business_id)
+        .eq('instance_name', selectedInstance)
+        .eq('status', 'connected')
+        .maybeSingle()
+      if (!connectedSession) return stallItem('instance_not_connected')
+    }
+    if (item.assigned_instance_name !== selectedInstance) {
+      await updateQueueItem({ assigned_instance_name: selectedInstance })
+    }
     item.assigned_instance_name = selectedInstance
     item.aiManaged = campaign.ai_managed === true
   }
@@ -109,7 +124,7 @@ export async function runWorker(supabase, queueItemId) {
   // ── 2. Load contact + business ───────────────────────────────
   const [contact, business] = await Promise.all([
     getContact(supabase, item.contact_id),
-    getBusiness(supabase, item.business_id)
+    getBusinessForAccount(supabase, item.business_id, item.account_id ?? null)
   ])
 
   // Structural/data problems — not eligibility rules, so still a
@@ -164,24 +179,27 @@ export async function runWorker(supabase, queueItemId) {
 
   // ── 4. Billing check ─────────────────────────────────────────
   // Sends are billed in KES; AI (rewrite / QC) in USD. Both wallets must be able to pay for this item.
-  const hasBalance = (await checkSendBalance(supabase, item.business_id)) && (await checkAiBalance(supabase, item.business_id))
+  // The wallet is the account's own on separate billing, otherwise the business's.
+  const accountId = item.account_id ?? contact.account_id ?? null
+  const hasBalance = (await checkSendBalance(supabase, item.business_id, accountId)) && (await checkAiBalance(supabase, item.business_id, accountId))
   if (!hasBalance) {
     // A campaign message just waits: the sender pauses the campaign and the toggle sync resumes it once funds are back.
     // flagInsufficientFunds switches follow-ups off and pauses EVERY campaign of the business, which is too blunt for a
     // wallet that dips below the price of one message mid-campaign.
-    if (!item.campaign_id) await flagInsufficientFunds(supabase, item.business_id)
+    if (!item.campaign_id) await flagInsufficientFunds(supabase, item.business_id, accountId)
     return stallItem('insufficient_balance')
   }
 
   // ── 5. Daily cap check ───────────────────────────────────────
-  const dailyCap = (await effectiveDailyCap(supabase, item.business_id, business.followup_daily_cap ?? DEFAULT_DAILY_CAP)).cap
-  const dailyCount = await getDailyCount(supabase, item.business_id)
+  // Per WhatsApp number: the account's cap (its settings) and its own count.
+  const dailyCap = (await effectiveDailyCap(supabase, item.business_id, business.followup_daily_cap ?? DEFAULT_DAILY_CAP, accountId)).cap
+  const dailyCount = await getDailyCount(supabase, item.business_id, accountId)
   // Campaign messages are not held here: promoting them early is harmless (they wait in 'ready_to_send') and the sender
   // enforces the daily cap at send time. Holding them here made the whole campaign trickle in only when the count dipped.
   if (!item.campaign_id && dailyCount >= dailyCap) return stallItem('daily_cap_reached')
 
   // ── 6. Load persona pack (Optional) ──────────────────────────
-  const pack = await getPersonaPack(supabase, item.business_id)
+  const pack = await getPersonaPack(supabase, item.business_id, accountId)
 
   // Quiet hours / inactive days are no longer handled per item here —
   // the scheduler (scheduler.js / campaignScheduler.js) now checks
@@ -213,7 +231,7 @@ export async function runWorker(supabase, queueItemId) {
   // ── 9. Campaign items: own toggles, no AI zone system ──────────
   if (item.campaign_id) {
     const { data: campaign } = await supabase
-      .from('campaigns').select('ai_rewrite_enabled, auto_approve, kind, rule_id, business_id, ai_managed, min_gap_hours').eq('id', item.campaign_id).single()
+      .from('campaigns').select('ai_rewrite_enabled, auto_approve, kind, rule_id, business_id, account_id, ai_managed, min_gap_hours').eq('id', item.campaign_id).single()
 
     // Follow-up AI campaigns: the director decides before anything is written or sent.
     if (campaign?.ai_managed) {
@@ -232,7 +250,7 @@ export async function runWorker(supabase, queueItemId) {
       // or platform default); every AI-rewritten campaign message also gets this lead's profile.
       const extra = { profile: await getCustomerProfile(supabase, contact.id) }
       if (campaign.kind === 'auto' && campaign.rule_id) {
-        Object.assign(extra, await getAutoCampaignContext(supabase, campaign.business_id, campaign.rule_id))
+        Object.assign(extra, await getAutoCampaignContext(supabase, campaign.business_id, campaign.rule_id, campaign.account_id ?? accountId))
       }
       const result = await rewriteSuggestedMessage(supabase, item.final_message, contact, business, pack, conv, extra)
       if (!result.ok) {

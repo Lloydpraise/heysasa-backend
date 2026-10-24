@@ -18,12 +18,14 @@ export async function getAdContext(supabase, contact) {
   let platform = clean(contact.ad_platform, 40)
 
   if (adKey && contact.business_id && (!headline || !body)) {
-    const { data } = await supabase
+    // ad_attributions are per account (account_id, ad_id): the same ad can reach two numbers of one business.
+    let query = supabase
       .from('ad_attributions')
       .select('ad_headline, ad_body, ad_platform')
       .eq('business_id', contact.business_id)
       .eq('ad_id', adKey)
-      .maybeSingle()
+    if (contact.account_id) query = query.eq('account_id', contact.account_id)
+    const { data } = await query.limit(1).maybeSingle()
     headline = headline || clean(data?.ad_headline, 200)
     body = body || clean(data?.ad_body, MAX_BODY_CHARS)
     platform = platform || clean(data?.ad_platform, 40)

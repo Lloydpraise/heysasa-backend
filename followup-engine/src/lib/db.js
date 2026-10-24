@@ -24,6 +24,21 @@ export async function getBusiness(s, businessId) {
   return data
 }
 
+// The business settings as one account sees them: the businesses row with accounts.settings laid over it
+// (SQL account_settings(), the same merge as loadAccountSettings in src/services/accounts.js). Caps, quiet hours
+// and AI switches for an account's follow-ups come from here. Without an account, the plain business row.
+export async function getBusinessForAccount(s, businessId, accountId = null) {
+  if (!accountId) return getBusiness(s, businessId)
+  try {
+    const { data, error } = await s.rpc('account_settings', { p_account_id: accountId })
+    if (!error && data && (!businessId || data.business_id === businessId)) return data
+    if (error) log('warn', 'engine', 'db.account_settings_failed', `account_settings failed for ${accountId}: ${error.message}`, { business_id: businessId, details: { accountId } })
+  } catch (e) {
+    log('warn', 'engine', 'db.account_settings_failed', `account_settings failed for ${accountId}: ${e.message}`, { business_id: businessId, details: { accountId } })
+  }
+  return getBusiness(s, businessId)
+}
+
 // ── Contact ───────────────────────────────────────────────────
 export const CONTACT_SELECT = `
     id, name, phone, social_id, country_code, business_id, do_not_contact, follow_up_opted_in,
@@ -32,7 +47,7 @@ export const CONTACT_SELECT = `
     created_at, last_seen, daily_followup_count, daily_followup_reset_at,
     lifetime_followups_sent, followup_zone, product_interests,
     wa_exists, wa_checked_at,
-    lead_type, is_ad_lead, ad_id, original_ad_id, ad_headline, ad_body, ad_platform, ad_source_url
+    lead_type, is_ad_lead, account_id, ad_id, original_ad_id, ad_headline, ad_body, ad_platform, ad_source_url
   `
 
 export async function getContact(s, contactId) {
@@ -53,10 +68,19 @@ export async function getContactsByIds(s, ids, chunkSize = 200) {
 }
 
 // ── Persona Pack ──────────────────────────────────────────────
-export async function getPersonaPack(s, businessId) {
-  const { data } = await s.from('persona_packs')
-    .select('pack').eq('business_id', businessId).eq('is_active', true).single()
-  return data?.pack ?? null
+// The account's active pack, falling back to the business-wide one (account_id null). Without an account,
+// the business-wide pack, or the business's only active pack (single-number businesses).
+export async function getPersonaPack(s, businessId, accountId = null) {
+  const active = () => s.from('persona_packs').select('pack').eq('business_id', businessId).eq('is_active', true)
+  if (accountId) {
+    const { data } = await active().eq('account_id', accountId).limit(1).maybeSingle()
+    if (data?.pack) return data.pack
+  }
+  const { data: shared } = await active().is('account_id', null).limit(1).maybeSingle()
+  if (shared?.pack) return shared.pack
+  if (accountId) return null
+  const { data: any } = await active().order('updated_at', { ascending: false }).limit(1).maybeSingle()
+  return any?.pack ?? null
 }
 
 // ── Conversation ──────────────────────────────────────────────
@@ -164,18 +188,22 @@ const TOUCHPOINT_MATERIAL_MAP = {
   product_reminder: ['educational'],
 }
 
-export async function getMaterialsForTouchpoint(s, businessId, touchpointType) {
+// Materials are business catalog rows: the account's own plus the business-level ones (account_id null).
+export async function getMaterialsForTouchpoint(s, businessId, touchpointType, accountId = null) {
   const types = TOUCHPOINT_MATERIAL_MAP[touchpointType] ?? []
   if (!types.length) return []
 
   const { data } = await s.from('followup_materials')
-    .select('material_type, title, content, image_url')
+    .select('material_type, title, content, image_url, account_id')
     .eq('business_id', businessId)
     .eq('is_active', true)
     .in('material_type', types)
     .or('expires_at.is.null,expires_at.gt.' + new Date().toISOString())
-    .limit(3)
-  return data ?? []
+    .limit(accountId ? 20 : 3)
+  return (data ?? [])
+    .filter(m => !accountId || !m.account_id || m.account_id === accountId)
+    .slice(0, 3)
+    .map(({ account_id: _accountId, ...m }) => m)
 }
 
 // ── Bot config ────────────────────────────────────────────────
@@ -216,11 +244,13 @@ export async function getStageWeight(s, stage, businessType) {
 }
 
 // ── Daily cap check ───────────────────────────────────────────
-export async function getDailyCount(s, businessId) {
+// Caps count per WhatsApp number: per account when there is one, else per business.
+export async function getDailyCount(s, businessId, accountId = null) {
   const today = new Date().toISOString().split('T')[0]
-  const { count } = await s.from('follow_up_queue')
+  let query = s.from('follow_up_queue')
     .select('id', { count: 'exact', head: true })
-    .eq('business_id', businessId)
+  query = accountId ? query.eq('account_id', accountId) : query.eq('business_id', businessId)
+  const { count } = await query
     .eq('status', 'sent')
     .gte('processed_at', today + 'T00:00:00Z')
   return count ?? 0

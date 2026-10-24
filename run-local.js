@@ -30,6 +30,8 @@ import { formatCatalogForPrompt, groundNlpProducts, imageKeyFor } from './src/pr
 import { billAiUsage } from './src/services/aiBilling.js';
 import { createMessageStore, createPatchBuffer, bulkWrite, bulkDelete } from './src/services/batchIo.js';
 import { createDbGuard } from './src/services/dbGuard.js';
+import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
 dotenv.config();
 
@@ -52,6 +54,11 @@ const REQUESTED_CONTACT_IDS = Array.isArray(requestedAnalysisConfig.contactIds)
     ? requestedAnalysisConfig.contactIds
     : [];
 let BUSINESS_ID = REQUESTED_BUSINESS_ID;
+// The WhatsApp account whose chats are analysed (ACCOUNTS.md). A business with several accounts is analysed
+// one account at a time: without an accountId, main() runs this script once per account (see runPerAccount).
+let ACCOUNT_ID = requestedAnalysisConfig.accountId || process.env.ACCOUNT_ID || null;
+// Narrows a query on an account-scoped table to this run's account.
+const onAccount = (query) => (ACCOUNT_ID ? query.eq('account_id', ACCOUNT_ID) : query);
 
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4.1-mini';
 // The personal/business decision feeds everything downstream, so it can be
@@ -129,14 +136,14 @@ async function startRun(runType) {
     // Close out runs that died without finishing so they stop showing as "running".
     try {
         const failure = { status: 'failed', finished_at: new Date().toISOString(), fatal_error: 'stale: process ended without finishing' };
-        let sweep = supabase.from('enrichment_runs').update(failure).eq('status', 'running')
-            .in('run_type', ['full_pass', 'contact_pass'])
+        let sweep = onAccount(supabase.from('enrichment_runs').update(failure).eq('status', 'running')
+            .in('run_type', ['full_pass', 'contact_pass']))
             .or(`heartbeat_at.lt.${ago(DEAD_AFTER_MS)},and(heartbeat_at.is.null,started_at.lt.${ago(STALE_RUN_HOURS * 3600000)})`);
         if (BUSINESS_ID) sweep = sweep.eq('business_id', BUSINESS_ID);
         const { error } = await sweep;
         if (error) {
             // heartbeat column not migrated yet: fall back to age only
-            let fallback = supabase.from('enrichment_runs').update(failure).eq('status', 'running').in('run_type', ['full_pass', 'contact_pass']).lt('started_at', ago(STALE_RUN_HOURS * 3600000));
+            let fallback = onAccount(supabase.from('enrichment_runs').update(failure).eq('status', 'running').in('run_type', ['full_pass', 'contact_pass']).lt('started_at', ago(STALE_RUN_HOURS * 3600000)));
             if (BUSINESS_ID) fallback = fallback.eq('business_id', BUSINESS_ID);
             await fallback;
         }
@@ -144,14 +151,14 @@ async function startRun(runType) {
         warn('RunLog', `Stale-run sweep failed: ${e.message}`);
     }
 
-    // Only one analysis per business at a time, whoever started it (API, persona pack, CLI).
+    // Only one analysis per account at a time, whoever started it (API, persona pack, CLI).
     if (BUSINESS_ID) {
         try {
-            const { data: running } = await supabase.from('enrichment_runs')
+            const { data: running } = await onAccount(supabase.from('enrichment_runs')
                 .select('id, started_at, heartbeat_at')
                 .eq('business_id', BUSINESS_ID)
                 .in('run_type', ['full_pass', 'contact_pass'])
-                .eq('status', 'running');
+                .eq('status', 'running'));
             const live = (running || []).find(r => Date.now() - new Date(r.heartbeat_at || r.started_at).getTime() < LIVE_WINDOW_MS);
             if (live) {
                 warn('RunLog', `An analysis is already running for ${BUSINESS_ID} (run ${String(live.id).slice(0, 8)}). Exiting so two runs don't process the same chats.`);
@@ -168,6 +175,7 @@ async function startRun(runType) {
             id: RUN_ID,
             run_type: runType,
             business_id: BUSINESS_ID || null,
+            ...(ACCOUNT_ID ? { account_id: ACCOUNT_ID } : {}),
             started_at: new Date().toISOString(),
             status: 'running'
         });
@@ -378,11 +386,26 @@ async function flushWrites() {
     }
     if (pendingAdAttributions.length) {
         const rows = pendingAdAttributions.splice(0);
-        await bulkWrite({ supabase, table: 'ad_attributions', rows, mode: 'upsert', onConflict: 'business_id,ad_id', dedupeKey: (r) => `${r.business_id}|${r.ad_id}`, chunkSize: BATCH_SIZE, onRowError: onWriteFailure('ad'), onNotice: (m) => warn('Batch', m) });
+        await upsertAdAttributions(rows, onWriteFailure('ad'));
     }
     await contactBuffer.flush();
     await conversationByContactBuffer.flush();
     await conversationByIdBuffer.flush();
+}
+
+// ad_attributions is keyed per account (account_id, ad_id). Rows of contacts that have no account (a business
+// that never connected WhatsApp) keep the old business key. Returns how many rows were written.
+async function upsertAdAttributions(rows, onRowError) {
+    let written = 0;
+    const withAccount = rows.filter((r) => r.account_id);
+    const without = rows.filter((r) => !r.account_id).map(({ account_id: _drop, ...r }) => r);
+    if (withAccount.length) {
+        written += (await bulkWrite({ supabase, table: 'ad_attributions', rows: withAccount, mode: 'upsert', onConflict: 'account_id,ad_id', dedupeKey: (r) => `${r.account_id}|${r.ad_id}`, chunkSize: BATCH_SIZE, onRowError, onNotice: (m) => warn('Batch', m) }))?.written || 0;
+    }
+    if (without.length) {
+        written += (await bulkWrite({ supabase, table: 'ad_attributions', rows: without, mode: 'upsert', onConflict: 'business_id,ad_id', dedupeKey: (r) => `${r.business_id}|${r.ad_id}`, chunkSize: BATCH_SIZE, onRowError, onNotice: (m) => warn('Batch', m) }))?.written || 0;
+    }
+    return written;
 }
 
 // Called at the top of each loop iteration: at every batch boundary, send the previous batch's
@@ -558,9 +581,10 @@ async function runAdAttributionExtraction() {
 
     let contactsQuery = applyContactScope(supabase
         .from('contacts')
-        .select('id, business_id, is_ad_lead')
+        .select('id, business_id, account_id, is_ad_lead')
         .order('id'));
     if (BUSINESS_ID) contactsQuery = contactsQuery.eq('business_id', BUSINESS_ID);
+    contactsQuery = onAccount(contactsQuery);
 
     let contacts;
     try {
@@ -609,6 +633,7 @@ async function runAdAttributionExtraction() {
             if (ad.ad_id) {
                 pendingAdAttributions.push({
                     business_id: contact.business_id,
+                    account_id: contact.account_id ?? null,
                     ad_id: ad.ad_id,
                     ad_platform: ad.ad_platform,
                     ad_headline: ad.ad_headline,
@@ -746,7 +771,7 @@ async function callOpenAiJson({ model, system, user, maxTokens, promptId = null,
             if (billing) {
                 const u = body.usage || {};
                 await billAiUsage(supabase, {
-                    businessId: billing.businessId, runner: billing.runner, model: resolvedModel, runId: billing.runId || null,
+                    businessId: billing.businessId, accountId: ACCOUNT_ID, runner: billing.runner, model: resolvedModel, runId: billing.runId || null,
                     promptTokens: u.prompt_tokens || 0, cachedTokens: u.prompt_tokens_details?.cached_tokens || 0, completionTokens: u.completion_tokens || 0
                 });
             }
@@ -826,6 +851,7 @@ async function runClassificationPass() {
         .select('id, business_id, name, lead_type, lead_state, is_ad_lead, lead_type_source, lead_type_classified_at, classifier_version')
         .order('id'));
     if (BUSINESS_ID) contactsQuery = contactsQuery.eq('business_id', BUSINESS_ID);
+    contactsQuery = onAccount(contactsQuery);
 
     let contacts;
     try {
@@ -953,6 +979,7 @@ async function runStructuralEnrichment() {
         .eq('lead_type', 'business')
         .order('id'));
     if (BUSINESS_ID) contactsQuery = contactsQuery.eq('business_id', BUSINESS_ID);
+    contactsQuery = onAccount(contactsQuery);
 
     let contacts;
     try {
@@ -1048,9 +1075,9 @@ async function loadOpenerTemplates() {
     const firstByContact = new Map();
     let from = 0;
     while (true) {
-        let query = supabase.from('messages')
+        let query = onAccount(supabase.from('messages')
             .select('id, contact_id, content, created_at')
-            .eq('business_id', BUSINESS_ID)
+            .eq('business_id', BUSINESS_ID))
             .in('direction', ['in', 'inbound'])
             .eq('type', 'text')
             .order('created_at', { ascending: true })
@@ -1091,10 +1118,10 @@ const imageMentionIndexes = new Map();
 async function getImageMentionIndex(businessId) {
     if (!imageMentionIndexes.has(businessId)) {
         imageMentionIndexes.set(businessId, (async () => {
-            const rows = await fetchAllPages((from, to) => supabase.from('product_mentions')
+            const rows = await fetchAllPages((from, to) => onAccount(supabase.from('product_mentions')
                 .select('source_ref, product_id')
                 .eq('business_id', businessId)
-                .eq('kind', 'image')
+                .eq('kind', 'image'))
                 .order('source_ref', { ascending: true })
                 .order('product_id', { ascending: true })
                 .range(from, to));
@@ -1275,15 +1302,15 @@ async function runProductDiscoveryPhase() {
     if (!BUSINESS_ID) return skipped('no_business');
     try {
         const result = await runProductDiscovery({
-            supabase, businessId: BUSINESS_ID, openaiKey: OPENAI_KEY,
+            supabase, businessId: BUSINESS_ID, accountId: ACCOUNT_ID, openaiKey: OPENAI_KEY,
             textModel: OPENAI_MODEL, visionModel: process.env.OPENAI_VISION_MODEL || OPENAI_MODEL,
             // Re-analysing everyone must not re-read every image: discovery has its own force switch.
             force: requestedAnalysisConfig.forceProducts === true || process.env.FORCE_PRODUCT_DISCOVERY === '1',
             // Setup bundle 1: text only (fast). A normal discovery run adds the images afterwards.
             textOnly: requestedAnalysisConfig.productsTextOnly === true,
             log, warn, err, progress,
-            recordUsage: ({ businessId, model, promptTokens, cachedTokens, completionTokens }) =>
-                billAiUsage(supabase, { businessId, runner: 'product_discovery', model, promptTokens, cachedTokens, completionTokens, runId: crypto.randomUUID() }),
+            recordUsage: ({ businessId, accountId, model, promptTokens, cachedTokens, completionTokens }) =>
+                billAiUsage(supabase, { businessId, accountId, runner: 'product_discovery', model, promptTokens, cachedTokens, completionTokens, runId: crypto.randomUUID() }),
         });
         return {
             skipped: false,
@@ -1318,6 +1345,7 @@ async function runNLPPass() {
         .eq('contacts.lead_type', 'business')
         .order('id');
     if (BUSINESS_ID) conversationsQuery = conversationsQuery.eq('business_id', BUSINESS_ID);
+    conversationsQuery = onAccount(conversationsQuery);
 
     let conversations;
     try {
@@ -1373,12 +1401,14 @@ async function runNLPPass() {
             // products are excluded and approved products still respect ai_visible.
             if (!productsCache.has(businessId)) {
                 let products;
-                const approved = await supabase
+                // The account's own products plus the business catalog (account_id null).
+                let approvedQuery = supabase
                     .from('products')
                     .select('id, title, price, type, aliases, category, status, ai_visible, mention_count')
                     .eq('business_id', businessId)
-                    .in('status', ['approved', 'discovered'])
-                    .order('mention_count', { ascending: false });
+                    .in('status', ['approved', 'discovered']);
+                if (ACCOUNT_ID) approvedQuery = approvedQuery.or(`account_id.eq.${ACCOUNT_ID},account_id.is.null`);
+                const approved = await approvedQuery.order('mention_count', { ascending: false });
                 if (approved.error) {
                     // The products migration has not been run yet: behave as before rather than fail the analysis.
                     if (!/column .* does not exist|42703/i.test(`${approved.error.code} ${approved.error.message}`)) {
@@ -1500,10 +1530,11 @@ async function recomputeAdAttributionRollups() {
 
     let contactsQuery = applyContactScope(supabase
         .from('contacts')
-        .select('id, business_id, ad_id, read_receipt, lead_state, product_interests')
+        .select('id, business_id, account_id, ad_id, read_receipt, lead_state, product_interests')
         .not('ad_id', 'is', null)
         .order('id'));
     if (BUSINESS_ID) contactsQuery = contactsQuery.eq('business_id', BUSINESS_ID);
+    contactsQuery = onAccount(contactsQuery);
 
     let attributedContacts;
     try {
@@ -1519,10 +1550,10 @@ async function recomputeAdAttributionRollups() {
 
     const groups = new Map();
     for (const c of attributedContacts) {
-        const key = `${c.business_id}|${c.ad_id}`;
+        const key = `${c.business_id}|${c.account_id ?? ''}|${c.ad_id}`;
         if (!groups.has(key)) {
             groups.set(key, {
-                business_id: c.business_id, ad_id: c.ad_id,
+                business_id: c.business_id, account_id: c.account_id ?? null, ad_id: c.ad_id,
                 lead_count: 0, reply_count: 0, product_interest_count: 0, conversion_count: 0
             });
         }
@@ -1535,11 +1566,7 @@ async function recomputeAdAttributionRollups() {
 
     beginStage('AdAttribution');
     const rollupRows = [...groups.values()].map(rollup => ({ ...rollup, updated_at: new Date().toISOString() }));
-    const { written: updated } = await bulkWrite({
-        supabase, table: 'ad_attributions', rows: rollupRows, mode: 'upsert', onConflict: 'business_id,ad_id',
-        dedupeKey: (r) => `${r.business_id}|${r.ad_id}`, chunkSize: BATCH_SIZE,
-        onRowError: onWriteFailure('ad_rollup'), onNotice: (m) => warn('Batch', m),
-    });
+    const updated = await upsertAdAttributions(rollupRows, onWriteFailure('ad_rollup'));
     log('AdAttribution', `✓ Rolled up counts for ${updated} ads.`);
 }
 
@@ -1550,6 +1577,7 @@ async function main() {
     console.log('--------------------------------------------------');
 
     await resolveActiveInstance();
+    if (await runPerAccount()) return;
     await assertMigrationApplied();
     await startRun(REQUESTED_CONTACT_IDS.length ? 'contact_pass' : 'full_pass');
 
@@ -1601,6 +1629,42 @@ async function main() {
     console.log('✅ Done! Check enrichment_errors table for any per-item failures.');
     console.log('--------------------------------------------------');
     process.exit(0);
+}
+
+// A business with several WhatsApp accounts is analysed one account at a time: this script runs itself once per
+// account (only accounts that own one of the requested contacts, for a contact pass) and exits with the combined
+// result. Returns false when this process should do the work itself (one account, or ACCOUNT_ID already set).
+async function runPerAccount() {
+    if (ACCOUNT_ID || !BUSINESS_ID) return false;
+    const { data: accounts, error } = await supabase.from('accounts').select('id').eq('business_id', BUSINESS_ID).neq('status', 'closed').order('created_at');
+    if (error) throw new Error(`Account lookup failed: ${error.message}`);
+    if ((accounts || []).length <= 1) {
+        ACCOUNT_ID = accounts?.[0]?.id ?? null;
+        return false;
+    }
+
+    let plan = accounts.map((a) => ({ accountId: a.id, contactIds: [] }));
+    if (REQUESTED_CONTACT_IDS.length) {
+        const { data: rows, error: contactError } = await supabase.from('contacts').select('id, account_id').eq('business_id', BUSINESS_ID).in('id', REQUESTED_CONTACT_IDS);
+        if (contactError) throw new Error(`Contact lookup failed: ${contactError.message}`);
+        plan = plan.map((p) => ({ ...p, contactIds: (rows || []).filter((r) => r.account_id === p.accountId).map((r) => r.id) })).filter((p) => p.contactIds.length);
+    }
+    log('Scope', `Business ${BUSINESS_ID} has ${accounts.length} WhatsApp accounts; analysing ${plan.length} of them one at a time.`);
+
+    const script = fileURLToPath(import.meta.url);
+    const codes = [];
+    for (const step of plan) {
+        const config = { ...requestedAnalysisConfig, businessId: BUSINESS_ID, accountId: step.accountId, contactIds: step.contactIds };
+        const code = await new Promise((resolve) => {
+            const child = spawn(process.execPath, [script], { env: { ...process.env, ANALYSIS_CONFIG: JSON.stringify(config) }, stdio: ['ignore', 'inherit', 'inherit'] });
+            child.on('error', () => resolve(1));
+            child.on('close', (c) => resolve(c ?? 1));
+        });
+        codes.push(code);
+    }
+    const failed = codes.filter((c) => c !== 0 && c !== 3).length;
+    const busy = codes.filter((c) => c === 3).length;
+    process.exit(failed ? 1 : (busy && busy === codes.length ? 3 : 0));
 }
 
 main().catch(async (e) => {

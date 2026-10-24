@@ -34,7 +34,8 @@ async function stopLead(supabase, { item, contact, kind, campaignId }) {
   } else if (kind === 'handoff') {
     // a person should take over: stop talking over them for a week
     await supabase.from('lead_ai_state').upsert({
-      business_id: item.business_id, contact_id: contact.id, hold_until: new Date(Date.now() + 7 * 86_400_000).toISOString(),
+      business_id: item.business_id, ...((item.account_id ?? contact.account_id) ? { account_id: item.account_id ?? contact.account_id } : {}),
+      contact_id: contact.id, hold_until: new Date(Date.now() + 7 * 86_400_000).toISOString(),
       hold_reason: 'handed to the owner by the Follow-up AI', updated_at: now,
     }, { onConflict: 'business_id,contact_id' })
   } else if (campaignId) {
@@ -45,14 +46,14 @@ async function stopLead(supabase, { item, contact, kind, campaignId }) {
 // Shared tail: quality control, then the approval route. `route` = 'ready_to_send' | 'awaiting_approval'.
 async function finish(supabase, h, { item, contact, business, pack, ctx, message, media, route, skipAi, why, extraUpdate = {}, campaignId = null, stepNumber = null }) {
   const qc = await qcMessage(supabase, message, {
-    businessId: item.business_id, pack, contextText: factsText(ctx, pack),
+    businessId: item.business_id, accountId: item.account_id ?? contact.account_id ?? null, pack, contextText: factsText(ctx, pack),
     previousMessages: ctx.lastFollowups, timeline: formatTimeline(ctx.messages.slice(-12)), skipAi,
   })
   if (!qc.passed) {
     await supabase.from('follow_up_queue').update({
       status: 'skipped', skip_reason: 'qc_failed', qc_passed: false, qc_notes: qc.issues.join('; ').slice(0, 500), draft_message: message,
     }).eq('id', item.id)
-    await logTurn(supabase, { businessId: item.business_id, contactId: contact.id, campaignId, queueId: item.id, kind: 'qc', decision: 'failed', reason: qc.issues.join('; '), stepNumber })
+    await logTurn(supabase, { businessId: item.business_id, accountId: item.account_id ?? contact.account_id ?? null, contactId: contact.id, campaignId, queueId: item.id, kind: 'qc', decision: 'failed', reason: qc.issues.join('; '), stepNumber })
     // campaigns skip a failing step and carry on with the next one; the owner is asked to fix it (Home)
     if (campaignId) await advanceAiEnrollment(supabase, { campaignId, contact, business, sentStep: stepNumber, tag: 'qc_failed' })
     return { status: 'skipped', reason: 'qc_failed', issues: qc.issues }
@@ -71,7 +72,7 @@ async function finish(supabase, h, { item, contact, business, pack, ctx, message
 export async function processAiManagedItem(supabase, h, { item, contact, business, pack, conv, campaign }) {
   const ctx = await loadLeadContext(supabase, { contact, business, conv })
   const [skills, { data: steps }, { data: enrollment }] = await Promise.all([
-    loadSkills(supabase, item.business_id, 'director'),
+    loadSkills(supabase, item.business_id, 'director', item.account_id ?? contact.account_id ?? null),
     supabase.from('campaign_steps').select(STEP_COLUMNS).eq('campaign_id', item.campaign_id),
     supabase.from('campaign_enrollments').select('id, current_step, step_order').eq('campaign_id', item.campaign_id).eq('lead_id', item.contact_id).maybeSingle(),
   ])
@@ -90,12 +91,12 @@ export async function processAiManagedItem(supabase, h, { item, contact, busines
     decision = result.decision
   }
   await logTurn(supabase, {
-    businessId: item.business_id, contactId: contact.id, campaignId: item.campaign_id, queueId: item.id, kind: 'director',
+    businessId: item.business_id, accountId: item.account_id ?? contact.account_id ?? null, contactId: contact.id, campaignId: item.campaign_id, queueId: item.id, kind: 'director',
     decision: decision.action, reason: decision.reason ?? need.why, stepNumber: planned.step_number,
     details: { called: need.needed, why: need.why, chosenStep: decision.stepNumber, downgraded: decision.downgraded === true, stageAsk: decision.stageAsk?.stage ?? null },
   })
   // The director saw the customer move on: ask for the stage change. Checked, billed and audited by the stage worker.
-  if (decision.stageAsk) await requestStageChange(supabase, { businessId: item.business_id, contact, conv, ask: decision.stageAsk })
+  if (decision.stageAsk) await requestStageChange(supabase, { businessId: item.business_id, accountId: item.account_id ?? contact.account_id ?? null, contact, conv, ask: decision.stageAsk })
   const lastInboundAt = conv?.last_user_message_at ?? null
 
   if (decision.action === 'reschedule') {
@@ -158,8 +159,8 @@ export async function processAiScheduledItem(supabase, h, { item, contact, busin
     const result = await runDirector(supabase, { business, contact, pack, conv, ctx, skills: skills.filter(s => (s.used_by ?? []).includes('director')), planned, remaining: [], why: need.why })
     if (!result.ok) return h.stallItem('ai_unavailable', AI_RETRY_MS)
     const d = result.decision
-    await logTurn(supabase, { businessId: item.business_id, contactId: contact.id, queueId: item.id, kind: 'director', decision: d.action, reason: d.reason, details: { standalone: true, why: need.why, stageAsk: d.stageAsk?.stage ?? null } })
-    if (d.stageAsk) await requestStageChange(supabase, { businessId: item.business_id, contact, conv, ask: d.stageAsk })
+    await logTurn(supabase, { businessId: item.business_id, accountId: item.account_id ?? contact.account_id ?? null, contactId: contact.id, queueId: item.id, kind: 'director', decision: d.action, reason: d.reason, details: { standalone: true, why: need.why, stageAsk: d.stageAsk?.stage ?? null } })
+    if (d.stageAsk) await requestStageChange(supabase, { businessId: item.business_id, accountId: item.account_id ?? contact.account_id ?? null, contact, conv, ask: d.stageAsk })
     if (d.action === 'reschedule') {
       const plan = await computeNextSend(supabase, { business, contact, delayHours: d.delayHours ?? 24, lastInboundAt: conv?.last_user_message_at ?? null })
       await h.updateQueueItem({ scheduled_at: plan.at.toISOString(), skip_reason: 'director_rescheduled' })

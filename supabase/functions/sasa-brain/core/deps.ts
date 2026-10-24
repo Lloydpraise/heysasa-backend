@@ -6,6 +6,7 @@ import type { QueueResult, SendItem, SendResult } from './builtin.ts';
 import { loadContext, loadSettings, type ContextCache } from './context.ts';
 import { enqueue, enqueueAndWait, waitForDelivery } from './outbox.ts';
 import { makeCallModel, makeEmbed } from './openai.ts';
+import { own } from './builtin.ts';
 
 export type RuntimeDeps = {
   // deno-lint-ignore no-explicit-any
@@ -35,12 +36,14 @@ export function buildDeps(rt: RuntimeDeps, request: TurnInput): TurnDeps {
       const { data, error } = await rt.db.rpc('bill_ai_usage', {
         p_business_id: request.business_id, p_runner: BILLING_RUNNER, p_model: model || 'default',
         p_prompt_tokens: Math.round(promptTokens), p_cached_tokens: Math.round(cachedTokens), p_completion_tokens: Math.round(completionTokens), p_run_id: turnId,
+        // The account is charged (its own wallet on separate billing) and every charge is tagged with it.
+        p_account_id: request.account_id ?? null,
       });
       if (!error) { base += Number(data?.base_usd ?? 0); billed += Number(data?.billed_usd ?? 0); return; }
       lastError = error.message;
       if (attempt < 3) await rt.sleep(400 * attempt);
     }
-    console.error(`[billing] FAILED to bill chat AI usage business=${request.business_id} model=${model} prompt=${promptTokens} cached=${cachedTokens} completion=${completionTokens}: ${lastError}`);
+    console.error(`[billing] FAILED to bill chat AI usage business=${request.business_id} account=${request.account_id ?? '-'} model=${model} prompt=${promptTokens} cached=${cachedTokens} completion=${completionTokens}: ${lastError}`);
   };
   const pendingBills: Array<Promise<void>> = [];
   const track = (promise: Promise<void>) => { pendingBills.push(promise.catch(() => {})); };
@@ -64,7 +67,7 @@ export function buildDeps(rt: RuntimeDeps, request: TurnInput): TurnDeps {
       return { ok: true, results: items.map(() => ({ ok: true, messageId: null })) };
     }
     if (!input.conversation_id || !input.contact_id) return { ok: false, error: 'missing conversation or contact' };
-    return enqueueAndWait(rt.db, { businessId: input.business_id, conversationId: input.conversation_id, contactId: input.contact_id }, items);
+    return enqueueAndWait(rt.db, { businessId: input.business_id, accountId: input.account_id ?? null, conversationId: input.conversation_id, contactId: input.contact_id }, items);
   };
 
   // Same as `send`, but returns as soon as the messages are saved for the sender. `settled` finishes when the sender has.
@@ -73,7 +76,7 @@ export function buildDeps(rt: RuntimeDeps, request: TurnInput): TurnDeps {
     const failed = (error: string): QueueResult => ({ ok: false, error, settled: Promise.resolve({ ok: false, error }) });
     if (input.simulate) return { ok: true, settled: Promise.resolve({ ok: true, results: items.map(() => ({ ok: true, messageId: null })) }) };
     if (!input.conversation_id || !input.contact_id) return failed('missing conversation or contact');
-    const queued = await enqueue(rt.db, { businessId: input.business_id, conversationId: input.conversation_id, contactId: input.contact_id }, items);
+    const queued = await enqueue(rt.db, { businessId: input.business_id, accountId: input.account_id ?? null, conversationId: input.conversation_id, contactId: input.contact_id }, items);
     if (!queued.ok) return failed(queued.error);
     const settled = waitForDelivery(rt.db, queued.queued);
     settled.catch(() => {});   // the turn reads the outcome later; this only stops an early failure being reported as unhandled
@@ -83,14 +86,25 @@ export function buildDeps(rt: RuntimeDeps, request: TurnInput): TurnDeps {
   return {
     turnId,
     spend: () => ({ base, billed }),
-    async canAfford(businessId: string) {
+    async canAfford(businessId: string, accountId?: string | null) {
       // Same rule as the backend gate: an empty wallet pauses the AI; HeySasa's own business is never charged.
-      const [{ data: bal }, { data: biz }] = await Promise.all([
-        rt.db.from('business_balances').select('balance_usd').eq('business_id', businessId).maybeSingle(),
+      // The wallet is the account's own (account_balances) when it is billed separately, else the business's.
+      const [{ data: biz }, { data: account }] = await Promise.all([
         rt.db.from('businesses').select('business_type').eq('business_id', businessId).maybeSingle(),
+        accountId ? rt.db.from('accounts').select('billing_mode').eq('id', accountId).maybeSingle() : Promise.resolve({ data: null }),
       ]);
       if (biz?.business_type === 'heysasa') return true;
+      const { data: bal } = account?.billing_mode === 'separate'
+        ? await rt.db.from('account_balances').select('balance_usd').eq('account_id', accountId).maybeSingle()
+        : await rt.db.from('business_balances').select('balance_usd').eq('business_id', businessId).maybeSingle();
       return Boolean(bal) && Number(bal.balance_usd) > 0;
+    },
+    // A suspended or closed account (access fee past grace, or closed) gets no chat AI. No account: nothing to check.
+    async canOperate(input: TurnInput) {
+      if (!input.account_id) return true;
+      const { data, error } = await rt.db.rpc('account_can_operate', { p_account_id: input.account_id });
+      if (error) throw new Error(`could not check the account: ${error.message}`);
+      return data !== false;
     },
     loadContext: (input) => loadContext(rt.db, input, rt.contextCache),
     loadSettings: (input) => loadSettings(rt.db, input, rt.contextCache),
@@ -103,7 +117,7 @@ export function buildDeps(rt: RuntimeDeps, request: TurnInput): TurnDeps {
     // When the customer's newest message arrived, so the burst wait only covers what is left of the quiet time.
     async latestInboundAt(input: TurnInput) {
       if (!input.conversation_id) return null;
-      const { data, error } = await rt.db.from('messages').select('created_at').eq('conversation_id', input.conversation_id)
+      const { data, error } = await own(rt.db.from('messages').select('created_at').eq('conversation_id', input.conversation_id), input.account_id)
         .eq('direction', 'in').neq('type', 'reaction').order('created_at', { ascending: false }).limit(1).maybeSingle();
       const at = error || !data?.created_at ? NaN : Date.parse(data.created_at);
       return Number.isFinite(at) ? at : null;
@@ -111,9 +125,9 @@ export function buildDeps(rt: RuntimeDeps, request: TurnInput): TurnDeps {
 
     async hasNewerInbound(input: TurnInput) {
       if (!input.conversation_id || !input.trigger_message_id) return false;
-      const { data: trigger } = await rt.db.from('messages').select('created_at').eq('whatsapp_message_id', input.trigger_message_id).maybeSingle();
+      const { data: trigger } = await own(rt.db.from('messages').select('created_at').eq('whatsapp_message_id', input.trigger_message_id), input.account_id).maybeSingle();
       if (!trigger?.created_at) return false;
-      const { data } = await rt.db.from('messages').select('id').eq('conversation_id', input.conversation_id).eq('direction', 'in')
+      const { data } = await own(rt.db.from('messages').select('id').eq('conversation_id', input.conversation_id), input.account_id).eq('direction', 'in')
         .gt('created_at', trigger.created_at).neq('type', 'reaction').limit(1);
       return Boolean(data?.length);
     },
@@ -133,20 +147,22 @@ export function buildDeps(rt: RuntimeDeps, request: TurnInput): TurnDeps {
 
     async recordHandoff(input: TurnInput, reason: string, summary: string) {
       if (!input.conversation_id) return;
-      await rt.db.from('conversations').update({
+      await own(rt.db.from('conversations').update({
         handover_flag: true, handover_reason: reason, handover_urgency: 'normal', handover_summary: summary,
         handover_at: new Date().toISOString(), handover_source: 'rule', handover_resolved_at: null,
-      }).eq('id', input.conversation_id);
+      }).eq('id', input.conversation_id), input.account_id);
     },
 
     async rememberFlow(input: TurnInput, flowId: string) {
       if (!input.conversation_id) return;
-      await rt.db.from('conversations').update({ chat_ai_flow_id: flowId }).eq('id', input.conversation_id);
+      await own(rt.db.from('conversations').update({ chat_ai_flow_id: flowId }).eq('id', input.conversation_id), input.account_id);
     },
 
     async logTurn(row: Record<string, unknown>) {
       await Promise.all(pendingBills);   // embedding bills run beside the turn; settle them so the logged cost is complete
-      await rt.db.from('chat_ai_turns').insert({ ...row, cost_usd: base || row.cost_usd || null });
+      // account_id null (a business without accounts) is left out, so the database fills it from the conversation.
+      const { account_id, ...rest } = row;
+      await rt.db.from('chat_ai_turns').insert({ ...rest, ...(account_id ? { account_id } : {}), cost_usd: base || row.cost_usd || null });
     },
   };
 }

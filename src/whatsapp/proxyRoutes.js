@@ -13,6 +13,16 @@ function sendEvolutionError(res, error) {
     return res.status(status).json(error?.body ?? { message: error?.message || 'evolution_unreachable' });
 }
 
+// Each connection belongs to one HeySasa account (one WhatsApp number, see ACCOUNTS.md). The dashboard sends the
+// account in X-Account-Id; members only reach the accounts they are assigned to.
+function inScope(req, accountId) {
+    const scope = req.scope;
+    if (!scope) return true;                         // auth without account scope (tests, older callers)
+    if (accountId == null) return scope.isAdmin;     // a row from before accounts existed
+    if (scope.accountId) return accountId === scope.accountId;
+    return scope.accountIds.includes(accountId);
+}
+
 // deps: { auth, supabase, evolution(path, options) -> parsed JSON (throws { status, body } on a bad answer), log, now }
 export function createWhatsAppProxyRouter({ auth, supabase, evolution, log = () => {}, now = () => Date.now() }) {
     const router = Router();
@@ -24,10 +34,10 @@ export function createWhatsAppProxyRouter({ auth, supabase, evolution, log = () 
         const name = String(req.params.name || '');
         if (!INSTANCE_NAME.test(name)) return res.status(400).json({ message: 'invalid_instance_name' });
         const { data, error } = await supabase.from('whatsapp_sessions')
-            .select('id, business_id, instance_name, status, updated_at')
+            .select('id, business_id, account_id, instance_name, status, updated_at')
             .eq('instance_name', name).eq('business_id', req.businessId).maybeSingle();
         if (error) return res.status(500).json({ message: 'lookup_failed' });
-        if (!data) return res.status(404).json({ message: 'instance_not_found' });
+        if (!data || !inScope(req, data.account_id)) return res.status(404).json({ message: 'instance_not_found' });
         req.session = data;
         return next();
     }
@@ -37,6 +47,7 @@ export function createWhatsAppProxyRouter({ auth, supabase, evolution, log = () 
         const cutoff = new Date(now() - ABANDONED_AFTER_MS).toISOString();
         const { data } = await supabase.from('whatsapp_sessions').select('id, instance_name, updated_at')
             .eq('business_id', businessId).eq('status', 'pending').lt('updated_at', cutoff);
+        // The account stays (pending or disconnected); only the unfinished connection goes.
         for (const row of data || []) {
             try { await evolution(`/instance/delete/${encodeURIComponent(row.instance_name)}`, { method: 'DELETE' }); } catch { /* already gone */ }
             await supabase.from('whatsapp_sessions').delete().eq('id', row.id).eq('status', 'pending');
@@ -44,17 +55,25 @@ export function createWhatsAppProxyRouter({ auth, supabase, evolution, log = () 
         }
     }
 
-    // Starts a new connection. The session row is written first (as pending), so webhooks for this instance are
-    // recognised from the very first event, even if the owner closes the window before naming the connection.
+    // Starts a new connection for the selected account. The session row is written first (as pending), so webhooks
+    // for this instance are recognised from the very first event, even if the owner closes the window early.
+    // A business with no account yet gets its first one from the database (whatsapp_sessions_ensure_account).
     router.post('/instance/create', async (req, res) => {
         const name = String(req.body?.instanceName || '');
         if (!INSTANCE_NAME.test(name)) return res.status(400).json({ message: 'invalid_instance_name' });
+        const accountId = req.scope?.accountId ?? null;
+        if (!accountId && req.scope?.accountIds?.length) return res.status(400).json({ message: 'account_required' });
         await clearAbandoned(req.businessId).catch(() => {});
 
+        if (accountId) {
+            const { data: live } = await supabase.from('whatsapp_sessions').select('instance_name')
+                .eq('account_id', accountId).eq('status', 'connected').limit(1);
+            if (live?.length) return res.status(409).json({ message: 'account_already_connected', instance: live[0].instance_name });
+        }
         const { data: taken } = await supabase.from('whatsapp_sessions').select('id').eq('instance_name', name).maybeSingle();
         if (taken) return res.status(409).json({ message: 'instance_name_taken' });
         const { data: row, error } = await supabase.from('whatsapp_sessions')
-            .insert({ business_id: req.businessId, instance_name: name, status: 'pending', updated_at: new Date(now()).toISOString() })
+            .insert({ business_id: req.businessId, account_id: accountId, instance_name: name, status: 'pending', updated_at: new Date(now()).toISOString() })
             .select('id').single();
         if (error || !row) return res.status(500).json({ message: 'could_not_save_connection' });
 
@@ -73,6 +92,13 @@ export function createWhatsAppProxyRouter({ auth, supabase, evolution, log = () 
 
     router.get('/instance/connect/:name', owned, async (req, res) => {
         const number = String(req.query.number || '').replace(/\D/g, '');
+        // The account is locked to the first number that connected it; say so before WhatsApp issues a code.
+        if (number && req.session.account_id) {
+            const { data: account } = await supabase.from('accounts').select('phone_number').eq('id', req.session.account_id).maybeSingle();
+            if (account?.phone_number && account.phone_number !== number.replace(/^0+/, '')) {
+                return res.status(409).json({ message: 'phone_mismatch', expected: account.phone_number });
+            }
+        }
         const query = number ? `?number=${number}` : '';
         try { return res.json(await evolution(`/instance/connect/${encodeURIComponent(req.session.instance_name)}${query}`) ?? {}); }
         catch (error) { return sendEvolutionError(res, error); }
@@ -96,9 +122,9 @@ export function createWhatsAppProxyRouter({ auth, supabase, evolution, log = () 
 
     // Only this business's instances, so one owner can never see another's numbers.
     router.get('/instance/fetchInstances', async (req, res) => {
-        const { data, error } = await supabase.from('whatsapp_sessions').select('instance_name').eq('business_id', req.businessId);
+        const { data, error } = await supabase.from('whatsapp_sessions').select('instance_name, account_id').eq('business_id', req.businessId);
         if (error) return res.status(500).json({ message: 'lookup_failed' });
-        const mine = new Set((data || []).map((row) => row.instance_name).filter(Boolean));
+        const mine = new Set((data || []).filter((row) => inScope(req, row.account_id)).map((row) => row.instance_name).filter(Boolean));
         if (!mine.size) return res.json([]);
         try {
             const all = await evolution('/instance/fetchInstances');

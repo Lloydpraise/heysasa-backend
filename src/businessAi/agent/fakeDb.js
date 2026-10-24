@@ -1,5 +1,5 @@
 // A tiny in-memory stand-in for the Supabase client, just big enough for the agent tools in tests.
-// Supports: select, insert, update, delete, upsert, eq, neq, in, is, lt, lte, gt, gte, order, limit, range,
+// Supports: select, insert, update, delete, upsert, eq, neq, in, or, is, lt, lte, gt, gte, order, limit, range,
 // maybeSingle, single, rpc. Views are just tables you seed.
 
 export function fakeDb(seed = {}) {
@@ -20,6 +20,19 @@ export function fakeDb(seed = {}) {
     eq(col, val) { this.filters.push((r) => same(r[col], val)); return this; }
     neq(col, val) { this.filters.push((r) => !same(r[col], val)); return this; }
     in(col, vals) { this.filters.push((r) => vals.some((v) => same(r[col], v))); return this; }
+    // PostgREST "or" in the forms the account helpers use: "col.eq.v", "col.is.null", "col.in.(a,b)".
+    or(expr) {
+      const parts = String(expr).match(/[^,(]+(\([^)]*\))?/g) || [];
+      const tests = parts.map((p) => {
+        const [c, op, ...rest] = p.split('.'); const v = rest.join('.');
+        if (op === 'eq') return (r) => same(r[c], v);
+        if (op === 'is') return (r) => r[c] === null || r[c] === undefined;
+        if (op === 'in') { const list = v.replace(/[()]/g, '').split(','); return (r) => list.some((x) => same(r[c], x)); }
+        return () => false;
+      });
+      this.filters.push((r) => tests.some((t) => t(r)));
+      return this;
+    }
     is(col, val) { this.filters.push((r) => (val === null ? r[col] === null || r[col] === undefined : r[col] === val)); return this; }
     lt(col, val) { this.filters.push((r) => r[col] != null && r[col] < val); return this; }
     lte(col, val) { this.filters.push((r) => r[col] != null && r[col] <= val); return this; }

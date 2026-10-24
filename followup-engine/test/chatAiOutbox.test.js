@@ -203,3 +203,38 @@ test('typing time grows with the message length and never exceeds five seconds',
   assert.equal(typingDelayMs('x'.repeat(5000), () => 1), 1900)
   assert.ok(typingDelayMs('x'.repeat(5000), () => 1) <= 2000, 'typing never holds a reply back for more than 2 seconds')
 })
+
+// Accounts (one per WhatsApp number): a row of an account goes out on the account's instance, never on another
+// connected number of the business, and not at all while the account is suspended or disconnected.
+function withAccounts(state, accounts, canOperate = () => true) {
+  const { _resetAccountsForTests } = accountsLib
+  _resetAccountsForTests()
+  state.accounts = accounts
+  const db = fakeSupabase(state)
+  db.rpc = async (fn, args) => ({ data: fn === 'account_can_operate' ? canOperate(args.p_account_id) : null, error: null })
+  return db
+}
+const accountsLib = await import('../src/lib/accounts.js')
+
+test('an account row is sent from that account\'s instance', async () => {
+  const { state, sends, deps } = setup([item({ account_id: 'a2' })])
+  state.whatsapp_sessions.push({ business_id: 'b1', account_id: 'a2', status: 'connected', instance_name: 'second_number', updated_at: '2026-10-04T08:00:00Z' })
+  deps.supabase = withAccounts(state, [{ id: 'a2', business_id: 'b1', status: 'connected', instance_name: 'second_number', subscription_status: 'active' }])
+  const r = await processChatAiOutbox(deps)
+  assert.equal(r.sent, 1)
+  assert.equal(sends[0].instance, 'second_number')
+  assert.equal(state.messages[0].account_id, 'a2')
+})
+
+test('a suspended or disconnected account sends nothing', async () => {
+  const s1 = setup([item({ account_id: 'a2' })])
+  s1.deps.supabase = withAccounts(s1.state, [{ id: 'a2', business_id: 'b1', status: 'connected', instance_name: 'second_number', subscription_status: 'suspended' }], () => false)
+  await processChatAiOutbox(s1.deps)
+  assert.equal(s1.sends.length, 0)
+  assert.equal(s1.state.chat_ai_outbox[0].error, 'account_suspended')
+  const s2 = setup([item({ account_id: 'a2' })])
+  s2.deps.supabase = withAccounts(s2.state, [{ id: 'a2', business_id: 'b1', status: 'disconnected', instance_name: 'second_number', subscription_status: 'active' }])
+  await processChatAiOutbox(s2.deps)
+  assert.equal(s2.sends.length, 0)
+  assert.equal(s2.state.chat_ai_outbox[0].error, 'whatsapp_not_connected')
+})

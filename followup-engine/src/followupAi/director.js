@@ -41,7 +41,7 @@ export async function runDirector(supabase, { business, contact, pack, conv, ctx
   ].filter(Boolean).join('\n\n')
 
   const raw = await callBot(supabase, BOTS.director, userContent, DIRECTOR_PROMPT, {
-    json: true, temperature: 0.3, maxTokens: 600, businessId: business.business_id, cacheKey: `fuaidir:${business.business_id}`,
+    json: true, temperature: 0.3, maxTokens: 600, businessId: business.business_id, accountId: business.account_id ?? contact?.account_id ?? null, cacheKey: `fuaidir:${business.business_id}`,
   })
   if (!raw) return { ok: false, reason: 'ai_unavailable' }
   let parsed = null

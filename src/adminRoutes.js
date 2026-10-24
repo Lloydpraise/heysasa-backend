@@ -428,14 +428,33 @@ export function createAdminRouter({ getFollowupPort, isFollowupRunning }) {
         const b = req.body ?? {};
         const amount = Number(b.amount);
         if (!b.business_id || !Number.isFinite(amount) || amount === 0) throw httpError(400, 'business_id and a non-zero amount are required');
+        // account_id: top up that account's own wallet (accounts on separate billing); otherwise the business wallet.
         const out = must(await supabase.rpc('admin_credit_wallet', {
             p_business_id: String(b.business_id), p_currency: String(b.currency || '').toUpperCase(), p_amount: amount, p_note: String(b.note || 'admin credit').slice(0, 200),
+            p_account_id: b.account_id ? String(b.account_id) : null,
         }));
         logEvent({ level: 'info', area: 'admin', event: 'admin.billing_credit', message: `${b.business_id} ${amount} ${b.currency}` });
         return out;
     }));
 
     // ── Overview + manual runs ───────────────────────────────────────────
+    // WhatsApp account access fees (KES 10,000 per number per month). Marked paid by hand until a gateway exists.
+    router.get('/admin/api/accounts/invoices', wrap(async (req) => {
+        let q = supabase.from('account_invoices').select('*, accounts(label, phone_number, billing_mode, subscription_status), businesses(name)')
+            .order('due_at', { ascending: false }).limit(300);
+        if (req.query.status) q = q.eq('status', String(req.query.status));
+        return { invoices: must(await q) };
+    }));
+    router.get('/admin/api/accounts', wrap(async (req) => {
+        let q = supabase.from('accounts').select('id, business_id, label, phone_number, status, billing_mode, subscription_status, paid_until').order('created_at');
+        if (req.query.business_id) q = q.eq('business_id', String(req.query.business_id));
+        return { accounts: must(await q) };
+    }));
+    router.post('/admin/api/accounts/invoices/:id/paid', wrap(async (req) => ({
+        result: must(await supabase.rpc('admin_mark_account_invoice_paid', { p_invoice_id: req.params.id, p_reference: norm(req.body?.reference) })),
+    })));
+    router.post('/admin/api/run/account-billing', wrap(async () => ({ result: must(await supabase.rpc('account_billing_daily')) })));
+
     router.get('/admin/api/auto-campaigns', wrap(async () => {
         const campaigns = must(await supabase.from('campaigns')
             .select('id, business_id, rule_id, status, ai_rewrite_enabled, auto_approve, whatsapp_instance_name, created_at').eq('kind', 'auto'));

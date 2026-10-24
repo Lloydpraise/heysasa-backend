@@ -1,6 +1,9 @@
 import express from 'express';
 import { supabase } from './config/supabase.js';
 import { logEvent } from './services/debugConsole.js';
+import { requireScope } from './middleware/accessScope.js';
+import { loadAccountSettings } from './services/accounts.js';
+import { saveAccountSettings } from './services/accountSettings.js';
 
 // Follow-up preferences (Preferences page in the dashboard).
 //
@@ -10,8 +13,10 @@ import { logEvent } from './services/debugConsole.js';
 // followup-engine/src/api/followupSettingsRoutes.js still exists and is
 // unchanged — keep FIELD_MAP below in sync with it if columns are added.
 //
-// Auth mirrors followup-engine/src/api/authMiddleware.js: Supabase JWT in the
-// Authorization header + X-Business-Id, verified against businesses.user_id.
+// Auth is the shared scope (src/middleware/accessScope.js): owner, admin or a team member, X-Business-Id and
+// the selected WhatsApp account (X-Account-Id). These are per-number settings (ACCOUNTS.md rule 7): an account
+// reads the business default with its own accounts.settings overrides laid over it, and Save from an account of
+// a business with several numbers writes that account's overrides (src/services/accountSettings.js).
 const router = express.Router();
 
 const FIELD_MAP = {
@@ -60,51 +65,21 @@ function toUiPrefs(row) {
     return prefs;
 }
 
-async function requireBusinessAuth(req, res, next) {
+router.get('/settings/followup', requireScope, async (req, res) => {
+    let data;
     try {
-        const authHeader = req.headers.authorization || '';
-        const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : null;
-        if (!token) return res.status(401).json({ error: 'missing_auth_token' });
-
-        const requestedBusinessId = typeof req.headers['x-business-id'] === 'string' ? req.headers['x-business-id'].trim() : '';
-        if (!requestedBusinessId) return res.status(400).json({ error: 'missing_business_id_header' });
-
-        const { data: userData, error: userErr } = await supabase.auth.getUser(token);
-        if (userErr || !userData?.user) return res.status(401).json({ error: 'invalid_auth_token' });
-
-        const { data: business, error: bizErr } = await supabase
-            .from('businesses')
-            .select('business_id')
-            .eq('business_id', requestedBusinessId)
-            .eq('user_id', userData.user.id)
-            .maybeSingle();
-        if (bizErr) return res.status(500).json({ error: bizErr.message });
-        if (!business) return res.status(403).json({ error: 'no_business_for_user' });
-
-        req.businessId = business.business_id;
-        req.userId = userData.user.id;
-        next();
+        data = await loadAccountSettings(supabase, req.accountId, req.businessId);
     } catch (error) {
-        res.status(500).json({ error: error.message });
+        return res.status(500).json({ error: error.message });
     }
-}
-
-router.get('/settings/followup', requireBusinessAuth, async (req, res) => {
-    const allColumns = [...Object.values(FIELD_MAP), ...Object.values(READONLY_FIELD_MAP)];
-    const { data, error } = await supabase
-        .from('businesses')
-        .select(allColumns.join(', '))
-        .eq('business_id', req.businessId)
-        .single();
-
-    if (error || !data) return res.status(500).json({ error: error?.message ?? 'business_not_found' });
+    if (!data) return res.status(500).json({ error: 'business_not_found' });
 
     const prefs = toUiPrefs(data);
     for (const [uiKey, dbCol] of Object.entries(READONLY_FIELD_MAP)) prefs[uiKey] = data[dbCol];
     res.json(prefs);
 });
 
-router.put('/settings/followup', requireBusinessAuth, async (req, res) => {
+router.put('/settings/followup', requireScope, async (req, res) => {
     const prefs = req.body ?? {};
 
     if (prefs.zone_recent_mode && !VALID_MODES.includes(prefs.zone_recent_mode)) return res.status(400).json({ error: 'invalid_zone_recent_mode' });
@@ -132,18 +107,21 @@ router.put('/settings/followup', requireBusinessAuth, async (req, res) => {
     return res.status(400).json({ error: 'invalid_silence_hours' })
   }
 
-  const row = toDbRow(prefs);
-    const { data, error } = await supabase
-        .from('businesses')
-        .update(row)
-        .eq('business_id', req.businessId)
-        .select(Object.values(FIELD_MAP).join(', '))
-        .single();
+    // A team member with several accounts and none selected cannot save "for every account".
+    if (!req.accountId && !req.scope?.isAdmin) return res.status(400).json({ error: 'account_required' });
 
-    if (error) return res.status(500).json({ error: error.message });
+    const row = toDbRow(prefs);
+    let data;
+    let target;
+    try {
+        ({ target } = await saveAccountSettings(supabase, req.scope, row));
+        data = await loadAccountSettings(supabase, req.accountId, req.businessId);
+    } catch (error) {
+        return res.status(error.status || 500).json({ error: error.message });
+    }
 
-    logEvent({ level: 'info', area: 'api', event: 'settings.saved', message: `Follow-up prefs saved for business ${req.businessId}`, business_id: req.businessId });
-    res.json(toUiPrefs(data));
+    logEvent({ level: 'info', area: 'api', event: 'settings.saved', message: `Follow-up prefs saved for ${target === 'account' ? `account ${req.accountId}` : `business ${req.businessId}`}`, business_id: req.businessId, entity_id: req.accountId ?? null });
+    res.json(toUiPrefs(data || {}));
 });
 
 export default router;

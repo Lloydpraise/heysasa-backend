@@ -1,4 +1,4 @@
-import { getContact, getBusiness, getConversation, getMessages, getNextSequenceStep, getPersonaPack } from '../lib/db.js'
+import { getContact, getBusinessForAccount, getConversation, getMessages, getNextSequenceStep, getPersonaPack } from '../lib/db.js'
 import { calculateSendTime, getZonedParts } from '../lib/timing.js'
 import { sendPlatformMessage } from '../sender-baileys/evolutionSender.js'
 import { DEFAULT_QUIET_START, DEFAULT_QUIET_END, DEFAULT_TIMEZONE } from '../config.js'
@@ -29,7 +29,7 @@ export async function runPostSendReconciliation(supabase) {
     try {
       const [contact, business] = await Promise.all([
         getContact(supabase, item.contact_id),
-        getBusiness(supabase, item.business_id)
+        getBusinessForAccount(supabase, item.business_id, item.account_id ?? null)
       ])
       if (!contact || !business) {
         await supabase.from('follow_up_queue').update({ next_step_processed: true }).eq('id', item.id)
@@ -39,7 +39,7 @@ export async function runPostSendReconciliation(supabase) {
       // Quiet hours: business prefs first (Follow-up tab), persona pack
       // as fallback — same source order as worker.js, kept consistent
       // since this runs independently, possibly much later.
-      const pack = await getPersonaPack(supabase, item.business_id)
+      const pack = await getPersonaPack(supabase, item.business_id, item.account_id ?? contact.account_id ?? null)
       const rules = pack?.follow_up_rules ?? {}
       const timeZone = business.timezone || DEFAULT_TIMEZONE
       const quietStart = business.followup_quiet_start
@@ -54,6 +54,7 @@ export async function runPostSendReconciliation(supabase) {
           const nextTime = calculateSendTime(nextStep.delay_hours ?? 48, contact.optimal_contact_hour, quietStart, quietEnd, timeZone)
           await supabase.from('follow_up_queue').insert({
             business_id: item.business_id,
+            ...(item.account_id ? { account_id: item.account_id } : {}),
             contact_id: item.contact_id,
             conversation_id: item.conversation_id,
             sequence_step: nextStep.step_number,

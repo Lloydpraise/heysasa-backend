@@ -4,6 +4,10 @@
 //   BUSINESS_ID=lashesbyshazz node discover-products.js              (real run)
 //   BUSINESS_ID=lashesbyshazz node discover-products.js --dry-run    (reads and reports, writes nothing)
 //   BUSINESS_ID=lashesbyshazz FORCE=1 node discover-products.js       (re-read everything, not just what is new)
+//   BUSINESS_ID=lashesbyshazz ACCOUNT_ID=<uuid> node discover-products.js   (one WhatsApp account only)
+//
+// Products are discovered per WhatsApp account (ACCOUNTS.md): PRODUCT_CONFIG.accountIds (or ACCOUNT_ID) names
+// the accounts; with none given, every account of the business is run one after the other.
 //
 // The analyser also runs this automatically after it has separated customers from everyone else.
 import crypto from 'node:crypto';
@@ -27,6 +31,8 @@ const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY;
 const OPENAI_KEY = process.env.OPENAI_API_KEY || process.env.OPENAI_KEY;
 const BUSINESS_ID = requested.businessId || process.env.BUSINESS_ID || null;
+const REQUESTED_ACCOUNT_IDS = Array.isArray(requested.accountIds) ? requested.accountIds.filter(Boolean)
+  : (process.env.ACCOUNT_ID ? [process.env.ACCOUNT_ID] : []);
 const FORCE = requested.force === true || process.env.FORCE === '1';
 const DRY_RUN = requested.dryRun === true || process.argv.includes('--dry-run');
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4.1-mini';
@@ -53,14 +59,39 @@ const warn = (tag, msg, details) => emit('warn', tag, msg, details);
 const err = (tag, msg, details) => emit('error', tag, msg, details);
 
 // Billed through the shared bill_ai_usage function (prices and multiplier are editable in /admin).
-async function recordUsage({ businessId, model, promptTokens, cachedTokens, completionTokens }) {
-  await billAiUsage(supabase, { businessId, runner: 'product_discovery', model, promptTokens, cachedTokens, completionTokens, runId: crypto.randomUUID() });
+async function recordUsage({ businessId, accountId, model, promptTokens, cachedTokens, completionTokens }) {
+  await billAiUsage(supabase, { businessId, accountId, runner: 'product_discovery', model, promptTokens, cachedTokens, completionTokens, runId: crypto.randomUUID() });
+}
+
+// The accounts to read: the ones asked for, else every account of the business. [null] = no account yet
+// (the whole business, as before accounts existed).
+async function accountsToRun() {
+  if (REQUESTED_ACCOUNT_IDS.length) return REQUESTED_ACCOUNT_IDS;
+  const { data, error } = await supabase.from('accounts').select('id').eq('business_id', BUSINESS_ID).neq('status', 'closed').order('created_at');
+  if (error) throw new Error(`Account lookup failed: ${error.message}`);
+  return data?.length ? data.map((a) => a.id) : [null];
 }
 
 async function main() {
-  log('Products', `${DRY_RUN ? 'Dry run: ' : ''}starting product discovery for ${BUSINESS_ID}${FORCE ? ' (forced: re-reading everything)' : ''}.`);
+  const accountIds = await accountsToRun();
+  let busy = 0;
+  for (const accountId of accountIds) {
+    try {
+      await runForAccount(accountId, accountIds.length > 1);
+    } catch (e) {
+      if (!(e instanceof AlreadyRunningError)) throw e;
+      warn('Products', `${e.message} Skipping this account so two runs do not read the same chats.`);
+      busy++;
+    }
+  }
+  process.exit(busy && busy === accountIds.length ? 3 : 0);
+}
+
+async function runForAccount(accountId, several) {
+  const label = several && accountId ? ` (account ${String(accountId).slice(0, 8)})` : '';
+  log('Products', `${DRY_RUN ? 'Dry run: ' : ''}starting product discovery for ${BUSINESS_ID}${label}${FORCE ? ' (forced: re-reading everything)' : ''}.`);
   const summary = await runProductDiscovery({
-    supabase, businessId: BUSINESS_ID, openaiKey: OPENAI_KEY,
+    supabase, businessId: BUSINESS_ID, accountId, openaiKey: OPENAI_KEY,
     textModel: OPENAI_MODEL, visionModel: process.env.OPENAI_VISION_MODEL || OPENAI_MODEL,
     force: FORCE, dryRun: DRY_RUN, log, warn, err, recordUsage,
     progress: (_runPhase, done, total, phase) => emit('info', 'products.progress', `${phase}: ${done}/${total}`, { phase, done, total }),
@@ -77,7 +108,6 @@ async function main() {
       log('Dry run', bits.join(' | '));
     }
   }
-  process.exit(0);
 }
 
 main().catch((e) => {

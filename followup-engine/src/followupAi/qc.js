@@ -14,7 +14,7 @@ const fmtIssues = (issues) => issues.map(i => (typeof i === 'string' ? i : `${i.
 
 // contextText: the ad text + business facts the message is allowed to draw on (used for the price check).
 // timeline: short text of the conversation (so the reviewer can judge relevance). skipAi: reuse an earlier review.
-export async function qcMessage(supabase, message, { businessId, pack = null, contextText = '', previousMessages = [], timeline = '', skipAi = false } = {}) {
+export async function qcMessage(supabase, message, { businessId, accountId = null, pack = null, contextText = '', previousMessages = [], timeline = '', skipAi = false } = {}) {
   const first = checkServiceStandard(message, { contextText, previousMessages })
   if (first.passed && skipAi) return { passed: true, finalMessage: message, issues: [], warnings: first.warnings, usedAi: false }
 
@@ -25,7 +25,7 @@ export async function qcMessage(supabase, message, { businessId, pack = null, co
     `PREVIOUS MESSAGES WE SENT:\n${previousMessages.map(m => (typeof m === 'string' ? m : m?.content?.text ?? '')).filter(Boolean).join(' | ') || 'None yet'}`,
     first.issues.length ? `CODE CHECKS ALREADY FAILED: ${fmtIssues(first.issues).join('; ')}. Fix them in suggested_fix.` : '',
     `MESSAGE TO CHECK:\n${message}`,
-  ].filter(Boolean).join('\n\n'), QC_PROMPT, { json: true, temperature: 0, maxTokens: 350, businessId, cacheKey: `fuaiqc:${businessId}` })
+  ].filter(Boolean).join('\n\n'), QC_PROMPT, { json: true, temperature: 0, maxTokens: 350, businessId, accountId, cacheKey: `fuaiqc:${businessId}` })
 
   // AI reviewer unavailable: code checks alone decide (never block a message only because the reviewer was down).
   let verdict = null

@@ -24,7 +24,7 @@ export async function writeFollowupMessage(supabase, { business, contact, pack, 
   ].filter(Boolean).join('\n\n')
 
   const text = await callBot(supabase, BOTS.writer, userContent, WRITER_PROMPT, {
-    temperature: 0.6, maxTokens: 300, businessId: business.business_id, cacheKey: `fuaiw:${business.business_id}`,
+    temperature: 0.6, maxTokens: 300, businessId: business.business_id, accountId: business.account_id ?? contact?.account_id ?? null, cacheKey: `fuaiw:${business.business_id}`,
   })
   return text ? text.replace(/^["“]|["”]$/g, '').trim() : null
 }

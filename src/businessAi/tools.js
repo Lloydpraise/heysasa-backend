@@ -61,7 +61,7 @@ export function createToolRunner({ store, notes, embed, state, agent = null, log
     async search_products({ query }) {
       const q = asText(query);
       if (!q) return { error: 'query is required' };
-      const rows = await store.matchProducts(state.businessId, await embed(q, state.businessId), q);
+      const rows = await store.matchProducts(state.businessId, await embed(q, state.businessId), q, state.accountId ?? null);
       if (!rows.length) return { results: [], message: 'No matching products in the catalog.' };
       return {
         results: rows.map((p) => ({

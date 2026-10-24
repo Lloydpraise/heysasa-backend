@@ -17,11 +17,15 @@ import {
     cancelPendingFollowUps,
     recordCampaignStepReply,
     recordCampaignStepReaction,
-    requestStageReview
+    requestStageReview,
+    getOwnerNames,
+    syncWhatsAppContacts
 } from './dbService.js';
+import { sortSyncedContacts, linkFoundContacts, hasRealName } from './contactIdentity.js';
 import { debugLog, logEvent } from './debugConsole.js';
 import { extractReceiptUpdates, describePayloadShape } from './messageReceipts.js';
-import { deleteSessionRecord } from './evolutionConnections.js';
+import { deleteSessionRecord, logoutEvolutionInstanceRemote, fetchInstanceOwnerJid } from './evolutionConnections.js';
+import { resolveInstance, phoneFromJid, checkAccountPhone } from './accounts.js';
 import { scheduleDisconnectNotice } from './disconnectNotice.js';
 import { triggerChatAi } from '../chatAi/index.js';
 
@@ -48,28 +52,44 @@ async function notifyFollowupEngineActivity(contactId, conversationId, campaignS
     }
 }
 
-export async function resolveBusinessId(payload) {
+// Instance -> { businessId, accountId }. Every event is filed under the account (WhatsApp number) it came in on.
+export async function resolveWebhookContext(payload) {
     const instanceName = payload?.instance || payload?.data?.instance;
-    if (!instanceName) throw new Error('evolution_instance_missing');
-
-    const { data: business, error: businessError } = await supabase
-        .from('businesses')
-        .select('business_id')
-        .eq('evolution_instance_id', instanceName)
-        .maybeSingle();
-    if (!businessError && business) return business.business_id;
-
-    const { data: session, error: sessionError } = await supabase
-        .from('whatsapp_sessions')
-        .select('business_id')
-        .eq('instance_name', instanceName)
-        .maybeSingle();
-    if (!sessionError && session) return session.business_id;
-
-    throw new Error(`unknown_evolution_instance:${instanceName}`);
+    const { businessId, accountId } = await resolveInstance(instanceName);
+    return { businessId, accountId, instanceName };
 }
 
-export async function processConnectionUpdate(payload, businessId) {
+export async function resolveBusinessId(payload) {
+    return (await resolveWebhookContext(payload)).businessId;
+}
+
+// The number an instance is logged in with: Evolution puts it in the connection event (wuid) or as the event's sender;
+// failing that, the instance list knows its ownerJid.
+async function connectedPhone(payload, instanceName) {
+    const data = payload?.data || {};
+    const direct = phoneFromJid(data.wuid) || phoneFromJid(data.ownerJid) || phoneFromJid(payload?.sender) || phoneFromJid(data.me?.id);
+    if (direct) return direct;
+    try { return phoneFromJid(await fetchInstanceOwnerJid(instanceName)); } catch { return null; }
+}
+
+// An account is locked to its first number. Another number logging in to it is logged straight out again and the
+// owner is told (accounts.connect_error) to create a new account for that number.
+async function refuseOtherNumber(instanceName, businessId, accountId, check) {
+    try { await logoutEvolutionInstanceRemote(instanceName); } catch { /* already gone */ }
+    await deleteSessionRecord(instanceName, businessId);
+    await supabase.from('accounts').update({
+        connect_error: { code: check.reason, expected: check.expected ?? null, actual: check.actual ?? null, at: new Date().toISOString() },
+    }).eq('id', accountId);
+    logEvent({
+        level: 'warn', area: 'whatsapp', event: 'whatsapp.phone_refused',
+        message: check.reason === 'phone_in_use'
+            ? 'This number already belongs to another HeySasa account'
+            : 'A different number tried to connect to a locked account',
+        business_id: businessId, entity_id: accountId, details: { instanceName, expected: check.expected ?? null, actual: check.actual ?? null },
+    });
+}
+
+export async function processConnectionUpdate(payload, businessId, accountId = null) {
     const data = payload?.data || {};
     const state = String(data.state || data.status || data.connection || '').toLowerCase();
     const isConnected = state === 'open' || state === 'connected';
@@ -80,16 +100,28 @@ export async function processConnectionUpdate(payload, businessId) {
         // Only a number that was actually connected counts as "dropped" (not a QR that timed out).
         const { data: wasConnected } = await supabase.from('whatsapp_sessions').select('id')
             .eq('instance_name', instanceName).eq('status', 'connected').limit(1);
+        // The session goes; the account (and all its data) stays, marked disconnected by the database.
         await deleteSessionRecord(instanceName, businessId);
         console.log(`[Webhook] Removed inactive WhatsApp session ${instanceName}`);
-        if (wasConnected?.length) scheduleDisconnectNotice({ businessId, instanceName });
+        if (wasConnected?.length) scheduleDisconnectNotice({ businessId, accountId, instanceName });
         return;
+    }
+    let phone = null;
+    if (isConnected) {
+        phone = await connectedPhone(payload, instanceName);
+        if (accountId) {
+            const check = await checkAccountPhone(accountId, phone);
+            if (!check.ok) { await refuseOtherNumber(instanceName, businessId, accountId, check); return; }
+            await supabase.from('accounts').update({ connect_error: null }).eq('id', accountId);
+        }
     }
     const sessionStatus = isConnected ? 'connected' : 'pending';
     const incomingQr = data.qrcode?.base64 || data.qrCode || data.base64 || null;
     const incomingPairingCode = data.pairingCode || data.pairing_code || null;
     const values = {
         business_id: businessId,
+        ...(accountId ? { account_id: accountId } : {}),
+        ...(phone ? { phone_number: phone } : {}),
         instance_name: instanceName,
         status: sessionStatus,
         session_data: {
@@ -160,7 +192,7 @@ function parseMessagePayload(rawMessage) {
     };
 }
 
-export async function processLiveMessage(messages, businessId) {
+export async function processLiveMessage(messages, businessId, accountId = null) {
     // Confirmed against a live payload: Evolution sends `data` as a single
     // message object for messages.upsert, not an array. Normalize here so
     // callers can pass either shape without guessing.
@@ -174,7 +206,7 @@ export async function processLiveMessage(messages, businessId) {
             const { jid, pushName, isFromMe, keyId, timestamp, text, type, adAttribution, reactedMessageId } = parsed;
 
             // 1. Resolve Contact safely
-            const contact = await getOrCreateContact(businessId, jid, pushName);
+            const contact = await getOrCreateContact(businessId, jid, pushName, null, accountId);
             if (!contact?.id) {
                 debugLog('error', 'Contact ready', 'Failed to retrieve or build contact ID', { businessId, jid });
                 continue;
@@ -187,7 +219,7 @@ export async function processLiveMessage(messages, businessId) {
 
             // 3. Process Ad Attribution if present
             if (adAttribution) {
-                await recordAdAttribution(businessId, contactId, adAttribution);
+                await recordAdAttribution(businessId, contactId, adAttribution, accountId);
             }
 
             // 4. Update state & cancel follow-ups on incoming user response,
@@ -245,7 +277,7 @@ export async function processLiveMessage(messages, businessId) {
                 // answers; with the switch off it does nothing. Fire-and-forget: it must never slow or break the webhook.
                 if (!isFromMe) {
                     triggerChatAi({
-                        businessId, conversationId, contactId,
+                        businessId, accountId, conversationId, contactId,
                         message: { keyId, jid, text, type, isFromMe: false, isGroupOrBroadcast: false, sentAt: timestamp ? new Date(timestamp * 1000).toISOString() : new Date().toISOString() },
                     });
                 }
@@ -257,7 +289,7 @@ export async function processLiveMessage(messages, businessId) {
     }
 }
 
-export async function processHistorySync(payload, businessIdOverride) {
+export async function processHistorySync(payload, businessIdOverride, accountId = null) {
     const businessId = businessIdOverride;
     // Confirmed against a live payload: for messages.set/MESSAGES_SET,
     // payload.data is a bare array of message objects — payload.data.messages
@@ -279,49 +311,44 @@ export async function processHistorySync(payload, businessIdOverride) {
     // A history sync must never reset a chat we already know: it used to overwrite lead_type, lead_state and
     // is_ad_lead on every contact it saw, which brought back chats the owner had marked as personal and wiped ad
     // attribution. Only brand-new chats get those starting values; known chats just get their name/phone refreshed.
-    const knownIds = new Set();
-    const allIds = validContacts.map(c => c.id);
-    for (let i = 0; i < allIds.length; i += 200) {
-        const { data: rows, error: knownError } = await supabase
-            .from('contacts')
-            .select('social_id')
-            .eq('business_id', businessId)
-            .eq('social_platform', 'whatsapp')
-            .in('social_id', allIds.slice(i, i + 200));
-        if (knownError) {
-            debugLog('error', 'DB history contacts', 'Known-contact lookup failed', { businessId, error: knownError });
-            continue;
-        }
-        (rows || []).forEach(r => knownIds.add(r.social_id));
+    // A chat that belongs to a contact we have under another id or by number (someone the owner imported, or the
+    // other WhatsApp id of a known person) is linked to that contact instead of becoming a second copy.
+    let sorted = { known: [], fresh: [], links: new Map(), found: new Map(), contactIdBySocialId: {} };
+    try {
+        sorted = await sortSyncedContacts(supabase, businessId, validContacts, undefined, accountId);
+        const ownerNames = await getOwnerNames(businessId);
+        const linked = await linkFoundContacts(supabase, sorted.links, { ownerNames });
+        if (linked) debugLog('ok', 'DB history contacts', `Linked ${linked} chats to contacts the business already had`, { businessId });
+    } catch (error) {
+        // Without the lookup every chat would look new and be added again. Skip the bulk contact write instead: the
+        // messages below still find (or create) their contact one by one through getOrCreateContact.
+        debugLog('error', 'DB history contacts', 'Known-contact lookup failed, contacts resolved per message instead', { businessId, error });
     }
 
     const resolvedName = (c) => c.name || c.notify || c.verifiedName || null;
     const baseFor = (c) => ({
         business_id:     businessId,
+        ...(accountId ? { account_id: accountId } : {}),
         social_platform: 'whatsapp',
         social_id:       c.id,
         phone:           extractPhone(c.id)
     });
-    const newPayloads = [];
+    const newPayloads = sorted.fresh.map((c) => ({ ...baseFor(c), name: resolvedName(c) || 'Unknown', lead_state: 'new', lead_type: 'pending_analysis', is_ad_lead: false }));
     const knownNamed = [];
     const knownUnnamed = [];
-    for (const c of validContacts) {
+    for (const c of sorted.known) {
         const name = resolvedName(c);
-        if (!knownIds.has(c.id)) {
-            newPayloads.push({ ...baseFor(c), name: name || 'Unknown', lead_state: 'new', lead_type: 'pending_analysis', is_ad_lead: false });
-        } else if (name) {
-            knownNamed.push({ ...baseFor(c), name });
-        } else {
-            knownUnnamed.push(baseFor(c));
-        }
+        // the owner's name for a customer stays; a WhatsApp profile name only fills a contact that has none
+        if (name && !hasRealName(sorted.found.get(c.id)?.name)) knownNamed.push({ ...baseFor(c), name });
+        else knownUnnamed.push(baseFor(c));
     }
 
-    let contactMap = {};
+    let contactMap = { ...sorted.contactIdBySocialId };
     for (const group of [newPayloads, knownNamed, knownUnnamed]) {
         if (group.length === 0) continue;
         const { data: inserted, error } = await supabase
             .from('contacts')
-            .upsert(group, { onConflict: 'business_id, social_platform, social_id' })
+            .upsert(group, { onConflict: accountId ? 'account_id, social_platform, social_id' : 'business_id, social_platform, social_id' })
             .select('id, social_id');
         if (!error && inserted) {
             inserted.forEach(c => { contactMap[c.social_id] = c.id; });
@@ -335,6 +362,7 @@ export async function processHistorySync(payload, businessIdOverride) {
     const conversationPayloads = validChats
         .map(chat => ({
             business_id:  businessId,
+            ...(accountId ? { account_id: accountId } : {}),
             contact_id:   contactMap[chat.id],
             external_id:  chat.id,
             channel:      'whatsapp',
@@ -350,7 +378,7 @@ export async function processHistorySync(payload, businessIdOverride) {
     if (conversationPayloads.length > 0) {
         const { data: inserted, error } = await supabase
             .from('conversations')
-            .upsert(conversationPayloads, { onConflict: 'business_id, contact_id' })
+            .upsert(conversationPayloads, { onConflict: accountId ? 'account_id, contact_id' : 'business_id, contact_id' })
             .select('id, external_id');
         if (!error && inserted) {
             convoMap = inserted.reduce((acc, c) => { acc[c.external_id] = c.id; return acc; }, {});
@@ -378,7 +406,7 @@ export async function processHistorySync(payload, businessIdOverride) {
         let contactId = contactMap[jid];
         if (!contactId) {
             try {
-                const contact = await getOrCreateContact(businessId, jid, msg?.key?.fromMe === true ? null : msg.pushName);
+                const contact = await getOrCreateContact(businessId, jid, msg?.key?.fromMe === true ? null : msg.pushName, null, accountId);
                 contactId = contact?.id || null;
                 if (contactId) contactMap[jid] = contactId;
             } catch (error) {
@@ -516,7 +544,7 @@ export async function processMessageStatusUpdate(payload, businessIdOverride) {
     return { applied, unmatched };
 }
 
-export async function processPresenceUpdate(payload, businessIdOverride) {
+export async function processPresenceUpdate(payload, businessIdOverride, accountId = null) {
     const businessId = businessIdOverride;
     const data = payload?.data || {};
     const presences = data.presences && typeof data.presences === 'object'
@@ -529,7 +557,7 @@ export async function processPresenceUpdate(payload, businessIdOverride) {
         const presenceStatus = presence?.lastKnownPresence || presence?.presence || presence?.status;
         if (!jid || !presenceStatus || isGroupOrBroadcast(jid)) continue;
 
-        const { error } = await supabase
+        let query = supabase
             .from('contacts')
             .update({
                 presence_status: presenceStatus,
@@ -538,6 +566,8 @@ export async function processPresenceUpdate(payload, businessIdOverride) {
             .eq('business_id', businessId)
             .eq('social_platform', 'whatsapp')
             .eq('social_id', jid);
+        if (accountId) query = query.eq('account_id', accountId);
+        const { error } = await query;
 
         if (error) {
             debugLog('error', 'DB presence update', 'Presence update failed', { businessId, jid, presenceStatus, error });
@@ -552,54 +582,30 @@ export async function processPresenceUpdate(payload, businessIdOverride) {
 // touch lead_state/lead_type/is_ad_lead — those are owned by the lead
 // classification logic in processLiveMessage, and an upsert here should
 // never silently reset a lead someone already worked. Only name/phone move.
-export async function processContactsSync(payload, businessIdOverride) {
+export async function processContactsSync(payload, businessIdOverride, accountId = null) {
     const businessId = businessIdOverride;
     const contacts = (payload.data || []).filter(c => c?.id && !isGroupOrBroadcast(c.id));
     if (contacts.length === 0) return;
-
-    const payloads = contacts.map(c => ({
-        business_id:     businessId,
-        social_platform: 'whatsapp',
-        social_id:       c.id,
-        name:            c.name || c.notify || c.verifiedName || 'Unknown',
-        phone:           extractPhone(c.id),
-        last_seen:       new Date().toISOString(),
-    }));
-
-    const { error } = await supabase
-        .from('contacts')
-        .upsert(payloads, { onConflict: 'business_id, social_platform, social_id' });
-
-    if (error) {
-        debugLog('error', 'DB contacts sync', 'Bulk contacts upsert failed', { businessId, error });
-    } else {
-        debugLog('ok', 'DB contacts sync', `Upserted ${payloads.length} contacts`, { businessId });
-    }
+    await writeSyncedContacts(businessId, contacts, 'DB contacts sync', accountId);
 }
 
-export async function processContactsUpsert(payload, businessIdOverride) {
+export async function processContactsUpsert(payload, businessIdOverride, accountId = null) {
     const businessId = businessIdOverride;
     const raw = Array.isArray(payload.data) ? payload.data : [payload.data];
     const contacts = raw.filter(c => c?.id && !isGroupOrBroadcast(c.id));
     if (contacts.length === 0) return;
+    await writeSyncedContacts(businessId, contacts, 'DB contact upsert', accountId);
+}
 
-    const payloads = contacts.map(c => ({
-        business_id:     businessId,
-        social_platform: 'whatsapp',
-        social_id:       c.id,
-        name:            c.name || c.notify || c.verifiedName || 'Unknown',
-        phone:           extractPhone(c.id),
-        last_seen:       new Date().toISOString(),
-    }));
-
-    const { error } = await supabase
-        .from('contacts')
-        .upsert(payloads, { onConflict: 'business_id, social_platform, social_id' });
-
-    if (error) {
-        debugLog('error', 'DB contact upsert', 'Contact upsert failed', { businessId, error });
-    } else {
-        debugLog('ok', 'DB contact upsert', `Upserted ${payloads.length} contact(s)`, { businessId });
+// Both used to upsert straight on the WhatsApp id: a person the owner had imported got a second contact, a LID's
+// digits were saved as a phone number, and a missing name was written as 'Unknown' over a real one.
+async function writeSyncedContacts(businessId, contacts, step, accountId = null) {
+    try {
+        const { error, linked, written } = await syncWhatsAppContacts(businessId, contacts, accountId);
+        if (error) debugLog('error', step, 'Contacts upsert failed', { businessId, error });
+        else debugLog('ok', step, `Upserted ${written} contact(s), linked ${linked} to contacts the business already had`, { businessId });
+    } catch (error) {
+        debugLog('error', step, 'Contacts sync failed', { businessId, error: error.message });
     }
 }
 
@@ -608,13 +614,13 @@ export async function processContactsUpsert(payload, businessIdOverride) {
 // (i.e. the contact was already created by a message or contacts sync);
 // it does not create conversations on its own, matching how
 // processHistorySync already treats chats as dependent on contacts.
-export async function processChatsSync(payload, businessIdOverride) {
+export async function processChatsSync(payload, businessIdOverride, accountId = null) {
     const businessId = businessIdOverride;
     const chats = (payload.data || []).filter(c => c?.id && !isGroupOrBroadcast(c.id));
     if (chats.length === 0) return;
 
     for (const chat of chats) {
-        const { error } = await supabase
+        let query = supabase
             .from('conversations')
             .update({
                 unread_count: chat.unreadCount || 0,
@@ -622,6 +628,8 @@ export async function processChatsSync(payload, businessIdOverride) {
             })
             .eq('business_id', businessId)
             .eq('external_id', chat.id);
+        if (accountId) query = query.eq('account_id', accountId);
+        const { error } = await query;
 
         if (error) {
             debugLog('error', 'DB chats sync', 'Chat sync update failed', { businessId, chatId: chat.id, error });
@@ -630,14 +638,14 @@ export async function processChatsSync(payload, businessIdOverride) {
     debugLog('ok', 'DB chats sync', `Processed ${chats.length} chat(s)`, { businessId });
 }
 
-export async function processChatsUpsert(payload, businessIdOverride) {
+export async function processChatsUpsert(payload, businessIdOverride, accountId = null) {
     const businessId = businessIdOverride;
     const raw = Array.isArray(payload.data) ? payload.data : [payload.data];
     const chats = raw.filter(c => c?.id && !isGroupOrBroadcast(c.id));
     if (chats.length === 0) return;
 
     for (const chat of chats) {
-        const { error } = await supabase
+        let query = supabase
             .from('conversations')
             .update({
                 unread_count: chat.unreadCount || 0,
@@ -645,6 +653,8 @@ export async function processChatsUpsert(payload, businessIdOverride) {
             })
             .eq('business_id', businessId)
             .eq('external_id', chat.id);
+        if (accountId) query = query.eq('account_id', accountId);
+        const { error } = await query;
 
         if (error) {
             debugLog('error', 'DB chat upsert', 'Chat upsert update failed', { businessId, chatId: chat.id, error });
@@ -654,13 +664,13 @@ export async function processChatsUpsert(payload, businessIdOverride) {
     }
 }
 
-export async function handleConfirmedDisconnect(instanceName, businessId) {
+export async function handleConfirmedDisconnect(instanceName, businessId, accountId = null) {
     if (!instanceName) return;
     try {
         await deleteSessionRecord(instanceName, businessId);
         console.log(`[Webhook] Removed confirmed disconnected WhatsApp session ${instanceName}`);
         if (businessId) {
-            scheduleDisconnectNotice({ businessId, instanceName });
+            scheduleDisconnectNotice({ businessId, accountId, instanceName });
         }
     } catch (error) {
         debugLog('error', 'Connection Reconciler', 'Failed to handle confirmed disconnect', { instanceName, businessId, error: error.message });

@@ -82,7 +82,7 @@ export async function callOpenAI(options) {
           log('error', 'ai', 'ai.unbilled', `OpenAI call without a business id was NOT billed (${options.purpose ?? 'unspecified'})`, { details: { purpose: options.purpose ?? null, promptTokens: usage.prompt_tokens ?? null, completionTokens: usage.completion_tokens ?? null } })
         } else {
           await billAiUsage(billingClient, {
-            businessId: options.businessId, runner: options.purpose ?? 'unspecified', model: body.model,
+            businessId: options.businessId, accountId: options.accountId ?? null, runner: options.purpose ?? 'unspecified', model: body.model,
             promptTokens: usage.prompt_tokens ?? 0, cachedTokens: usage.prompt_tokens_details?.cached_tokens ?? 0,
             completionTokens: usage.completion_tokens ?? 0
           })
@@ -93,6 +93,7 @@ export async function callOpenAI(options) {
         duration_ms: durationMs,
         details: {
           purpose: options.purpose ?? null,
+          accountId: options.accountId ?? null,
           model: body.model,
           promptTokens: usage.prompt_tokens ?? null,
           cachedTokens: usage.prompt_tokens_details?.cached_tokens ?? 0,
@@ -152,6 +153,7 @@ export async function callBot(supabase, botId, userContent, fallbackPrompt, opti
     json: options.json,
     purpose: options.purpose ?? botId,
     businessId: options.businessId ?? null,
+    accountId: options.accountId ?? null,
     skipBilling: options.skipBilling === true,
     cacheKey: options.cacheKey ?? null,
     images: options.images ?? null

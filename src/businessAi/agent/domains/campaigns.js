@@ -3,7 +3,7 @@
 // Launching and editing are ports of the dashboard's own logic (listsCampaignsService.js), done here so the assistant
 // can do the same job from the server. They follow the same rules: one lead can only be in one running campaign,
 // and people who opted out are never enrolled.
-import { ToolError, asText, chunk, clip, fetchAll, must, plural, round1, uniq } from '../helpers.js';
+import { ToolError, accountArg, asText, chunk, clip, fetchAll, must, plural, round1, ruleKey, uniq } from '../helpers.js';
 
 const MAX_STEPS = 6;
 const MAX_STEP_CHARS = 1000;
@@ -406,7 +406,7 @@ const activate_auto_campaign = {
     };
   },
   async execute(ctx, params) {
-    const { data, error } = await ctx.userRpc('activate_auto_campaign', { p_business_id: ctx.businessId, p_rule_id: params.rule_id });
+    const { data, error } = await ctx.userRpc('activate_auto_campaign', { p_business_id: ctx.businessId, p_rule_id: params.rule_id, ...accountArg(ctx) });
     if (error) throw autoError(error);
     const row = await autoRow(ctx, params.rule_id).catch(() => null);
     return { summary: `Started the "${row?.list_name ?? 'auto'}" auto campaign.`, result: { rule_id: params.rule_id, campaign: data ?? null } };
@@ -457,18 +457,18 @@ const set_auto_campaign = {
   async execute(ctx, params) {
     await autoRow(ctx, params.rule_id);
     const old = must(await ctx.db.from('auto_campaign_configs').select('*').eq('business_id', ctx.businessId).eq('rule_id', params.rule_id).maybeSingle(), 'config');
-    const { error } = await ctx.db.from('auto_campaign_configs').upsert({ business_id: ctx.businessId, rule_id: params.rule_id, ...params.patch, updated_at: ctx.now().toISOString() }, { onConflict: 'business_id,rule_id' });
+    const { error } = await ctx.db.from('auto_campaign_configs').upsert({ business_id: ctx.businessId, rule_id: params.rule_id, ...params.patch, updated_at: ctx.now().toISOString() }, { onConflict: ruleKey(ctx) });
     if (error) throw new Error(`save config: ${error.message}`);
-    const applied = await ctx.userRpc('apply_auto_campaign_config', { p_business_id: ctx.businessId, p_rule_id: params.rule_id });
+    const applied = await ctx.userRpc('apply_auto_campaign_config', { p_business_id: ctx.businessId, p_rule_id: params.rule_id, ...accountArg(ctx) });
     if (applied.error) throw autoError(applied.error);
     return { summary: 'Saved the changes to the auto campaign.', result: { rule_id: params.rule_id }, before: { config: old ?? null } };
   },
   async undo(ctx, action) {
     const ruleId = action.result.rule_id;
     const old = action.before?.config;
-    if (old) must(await ctx.db.from('auto_campaign_configs').upsert(old, { onConflict: 'business_id,rule_id' }), 'restore config');
+    if (old) must(await ctx.db.from('auto_campaign_configs').upsert(old, { onConflict: old.account_id ? 'account_id,rule_id' : 'business_id,rule_id' }), 'restore config');
     else must(await ctx.db.from('auto_campaign_configs').update({ objective: null, playbook: null, steps: null, sequence_mode: null, ai_rewrite_enabled: null, auto_approve: null, daily_cap: null }).eq('business_id', ctx.businessId).eq('rule_id', ruleId), 'reset config');
-    const applied = await ctx.userRpc('apply_auto_campaign_config', { p_business_id: ctx.businessId, p_rule_id: ruleId });
+    const applied = await ctx.userRpc('apply_auto_campaign_config', { p_business_id: ctx.businessId, p_rule_id: ruleId, ...accountArg(ctx) });
     if (applied.error) throw autoError(applied.error);
     return { summary: 'Put the auto campaign back as it was.' };
   },

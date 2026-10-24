@@ -7,10 +7,10 @@ const json = (status, body) => new Response(JSON.stringify(body), { status });
 test('the brain is called with the service key and the trigger message, and its outcome is summarised', async () => {
   let seen;
   const call = createBrainCaller({ url: 'https://p.supabase.co/', serviceKey: 'srv', fetchFn: async (u, init) => { seen = { u, init }; return json(200, { status: 'handoff', handoff: { reason: 'refund' }, skip_reason: null }); } });
-  const out = await call({ businessId: 'b1', conversationId: 'c1', contactId: 7, message: { keyId: 'W9' } });
+  const out = await call({ businessId: 'b1', accountId: 'a1', conversationId: 'c1', contactId: 7, message: { keyId: 'W9' } });
   assert.equal(seen.u, 'https://p.supabase.co/functions/v1/sasa-brain');
   assert.equal(seen.init.headers.Authorization, 'Bearer srv');
-  assert.deepEqual(JSON.parse(seen.init.body), { business_id: 'b1', conversation_id: 'c1', contact_id: 7, trigger_message_id: 'W9' });
+  assert.deepEqual(JSON.parse(seen.init.body), { business_id: 'b1', account_id: 'a1', conversation_id: 'c1', contact_id: 7, trigger_message_id: 'W9' }, 'the account goes with every call');
   assert.deepEqual([out.replied, out.brain_status, out.handoff.reason], [true, 'handoff', 'refund']);
 });
 

@@ -10,7 +10,7 @@ function fakeDb(tables) {
     const run = () => {
       requests.push({ table: name, op: q.op, payload: q.payload, filters: q.filters })
       const rows = tables[name] ?? (tables[name] = [])
-      const match = (r) => q.filters.every(([t, c, v]) => (t === 'in' ? v.includes(r[c]) : t === 'lte' ? (r[c] != null && r[c] <= v) : t === 'isnull' ? r[c] == null : r[c] === v))
+      const match = (r) => q.filters.every(([t, c, v]) => (t === 'in' ? v.includes(r[c]) : t === 'lte' ? (r[c] != null && r[c] <= v) : t === 'isnull' ? r[c] == null : t === 'neq' ? r[c] !== v : r[c] === v))
       if (q.op === 'select') return { data: rows.filter(match).slice(0, q.limit ?? 1000), error: null }
       if (q.op === 'update') { const hit = rows.filter(match); hit.forEach(r => Object.assign(r, q.payload)); return { data: hit, error: null } }
       if (q.op === 'insert') {
@@ -27,13 +27,15 @@ function fakeDb(tables) {
       is(c) { q.filters.push(['isnull', c]); return b },
       in(c, v) { q.filters.push(['in', c, v]); return b },
       eq(c, v) { q.filters.push(['eq', c, v]); return b },
+      neq(c, v) { q.filters.push(['neq', c, v]); return b },
+      not() { return b },
       update(p) { q.op = 'update'; q.payload = p; return b },
       insert(p) { q.op = 'insert'; q.payload = p; q.failIf = tables.__failInsert; return b },
       then(res, rej) { return Promise.resolve(run()).then(res, rej) },
     }
     return b
   }
-  return { requests, from, rpc: async (fn, args) => { requests.push({ rpc: fn, args }); return { error: null } } }
+  return { requests, from, rpc: async (fn, args) => { requests.push({ rpc: fn, args }); return { data: tables.__rpc?.[fn]?.(args) ?? null, error: null } } }
 }
 
 function scenario({ contacts = 300 } = {}) {
@@ -111,4 +113,39 @@ test('new (pending) enrollments are served before active ones when the batch is 
   assert.ok(result.queued > 0)
   assert.ok(db.requests.some(r => r.table === 'campaign_enrollments' && r.filters.some(f => f[1] === 'status' && f[2] === 'pending')))
   process.env.CAMPAIGN_BATCH_SIZE = prev
+})
+
+// Accounts (one per WhatsApp number): the instance comes from the account, never from the stored campaign name.
+function accountScenario({ contacts = 5, status = 'connected', canOperate = true } = {}) {
+  const tables = scenario({ contacts })
+  tables.accounts = [{ id: 'acc1', business_id: 'biz', status, instance_name: 'acc-inst', subscription_status: canOperate ? 'active' : 'suspended', billing_mode: 'business', settings: {} }]
+  tables.campaigns[0].account_id = 'acc1'
+  tables.campaigns[0].whatsapp_instance_name = 'stale-name'
+  tables.whatsapp_sessions = [{ business_id: 'biz', account_id: 'acc1', instance_name: 'acc-inst', status: 'connected' }]
+  for (const c of tables.contacts) c.account_id = 'acc1'
+  tables.__rpc = { account_can_operate: () => canOperate }
+  return tables
+}
+
+test('an account campaign queues on the account instance and stamps account_id', async () => {
+  const { _resetAccountsForTests } = await import('../src/lib/accounts.js')
+  _resetAccountsForTests()
+  const tables = accountScenario()
+  const result = await runCampaignScheduler(fakeDb(tables), { seed: false })
+  assert.equal(result.queued, 5)
+  for (const row of tables.follow_up_queue) {
+    assert.equal(row.assigned_instance_name, 'acc-inst')
+    assert.equal(row.account_id, 'acc1')
+  }
+})
+
+test('an account that is disconnected or suspended (access fee unpaid) queues nothing, like a dropped instance', async () => {
+  const { _resetAccountsForTests } = await import('../src/lib/accounts.js')
+  _resetAccountsForTests()
+  const t1 = accountScenario({ status: 'disconnected' })
+  assert.equal((await runCampaignScheduler(fakeDb(t1), { seed: false })).queued, 0)
+  _resetAccountsForTests()
+  const t2 = accountScenario({ canOperate: false })
+  assert.equal((await runCampaignScheduler(fakeDb(t2), { seed: false })).queued, 0)
+  assert.equal(t2.campaigns[0].status, 'active', 'nothing pauses or fails the campaign')
 })

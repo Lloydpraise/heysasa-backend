@@ -42,10 +42,11 @@ export async function applyStageRequest(request, deps) {
   await deps.setStage(conversation.id, field, plan.stage)
   // Same rule as the stage classifier: progress is charged once per lead and stage, so flipping back and forth is free.
   if (!(await deps.billedBefore(request.business_id, request.contact_id, plan.stage))) {
-    await Promise.resolve(deps.charge(request.business_id, request.contact_id, current, plan.stage, business.business_type)).catch(() => {})
+    await Promise.resolve(deps.charge(request.business_id, request.contact_id, current, plan.stage, business.business_type, request.account_id ?? conversation.account_id ?? null)).catch(() => {})
   }
   await deps.audit({
-    business_id: request.business_id, contact_id: request.contact_id, conversation_id: String(conversation.id),
+    business_id: request.business_id, ...((request.account_id ?? conversation.account_id) ? { account_id: request.account_id ?? conversation.account_id } : {}),
+    contact_id: request.contact_id, conversation_id: String(conversation.id),
     from_stage: current, to_stage: plan.stage, actor: request.actor, reason: request.reason, request_id: request.id,
   })
   return deps.finish(request.id, { status: 'applied', from_stage: current })
@@ -57,7 +58,7 @@ async function defaultDeps(supabase) {
     getBusiness: (id) => getBusiness(supabase, id),
     async getConversation(id) {
       const { data } = await supabase.from('conversations')
-        .select('id, business_id, contact_id, lead_stage_ecom, lead_stage_service, is_business_chat').eq('id', id).maybeSingle()
+        .select('id, business_id, account_id, contact_id, lead_stage_ecom, lead_stage_service, is_business_chat').eq('id', id).maybeSingle()
       return data
     },
     async setStage(id, field, stage) {
@@ -69,7 +70,7 @@ async function defaultDeps(supabase) {
         .eq('business_id', businessId).eq('contact_id', contactId).eq('to_stage', stage)
       return Boolean(count)
     },
-    charge: (businessId, contactId, from, to, type) => chargeLeadStageChange(supabase, businessId, contactId, from, to, type),
+    charge: (businessId, contactId, from, to, type, accountId = null) => chargeLeadStageChange(supabase, businessId, contactId, from, to, type, accountId),
     async audit(row) { await supabase.from('lead_stage_changes').insert(row) },
     async finish(id, patch) { await supabase.from('lead_stage_requests').update({ ...patch, processed_at: new Date().toISOString() }).eq('id', id) },
   }

@@ -1,13 +1,14 @@
 import { runWorker } from './worker.js'
 import { isBusinessAwake } from '../lib/timing.js'
 import { log } from '../lib/log.js'
+import { loadAccounts, withAccountSettings } from '../lib/accounts.js'
 
 const WORKER_CONCURRENCY = Math.max(1, parseInt(process.env.SCHEDULER_WORKER_CONCURRENCY ?? '8'))
 
 export async function runScheduler(supabase) {
   const { data: items, error } = await supabase
     .from('follow_up_queue')
-    .select('id, business_id')
+    .select('id, business_id, account_id')
     .eq('status', 'pending')
     .eq('approval_status', 'approved')
     .lte('scheduled_at', new Date().toISOString())
@@ -30,10 +31,19 @@ export async function runScheduler(supabase) {
     .in('business_id', businessIds)
   if (businessError) throw new Error(businessError.message)
 
-  const awakeBusinessIds = new Set(
-    (businesses ?? []).filter(b => isBusinessAwake(b)).map(b => b.business_id)
-  )
-  const awakeItems = items.filter(item => awakeBusinessIds.has(item.business_id))
+  // Quiet hours and active days can be overridden per account (accounts.settings).
+  const businessById = new Map((businesses ?? []).map(b => [b.business_id, b]))
+  const accounts = await loadAccounts(supabase, items.map(item => item.account_id))
+  const awake = new Map()
+  const isAwake = (item) => {
+    const key = `${item.business_id}|${item.account_id ?? ''}`
+    if (!awake.has(key)) {
+      const business = businessById.get(item.business_id)
+      awake.set(key, !!business && isBusinessAwake(item.account_id ? withAccountSettings(business, accounts.get(item.account_id)) : business))
+    }
+    return awake.get(key)
+  }
+  const awakeItems = items.filter(isAwake)
   const asleepCount = items.length - awakeItems.length
   if (asleepCount) log('debug', 'engine', 'scheduler.holding', `Holding ${asleepCount} item(s) — business asleep (quiet hours/inactive day)`, { details: { asleepCount } })
   if (!awakeItems.length) return { processed: 0 }

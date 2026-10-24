@@ -38,7 +38,7 @@ test('apply: sets the stage, charges once, writes the audit row, marks the reque
   await applyStageRequest(req(), w.deps)
   assert.deepEqual(w.log.set, [['c1', 'lead_stage_service', 'negotiation']])
   assert.equal(w.log.charged.length, 1)
-  assert.deepEqual(w.log.charged[0], ['b', 7, 'qualified', 'negotiation', 'salon'])
+  assert.deepEqual(w.log.charged[0], ['b', 7, 'qualified', 'negotiation', 'salon', null])
   assert.equal(w.log.audit[0].reason, 'agreed to the price')
   assert.equal(w.log.audit[0].from_stage, 'qualified')
   assert.deepEqual(w.log.finished[0], [1, { status: 'applied', from_stage: 'qualified' }])

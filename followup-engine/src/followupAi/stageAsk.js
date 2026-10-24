@@ -15,13 +15,14 @@ export function readStageAsk(raw) {
 
 // Writes the ask. Never throws and never blocks a send: a failed ask is logged by the caller and the message goes on.
 // One open ask per conversation, newest wins (same as the chat AI's tool).
-export async function requestStageChange(supabase, { businessId, contact, conv, ask, actor = 'followup_ai' }) {
+export async function requestStageChange(supabase, { businessId, accountId = null, contact, conv, ask, actor = 'followup_ai' }) {
   if (!ask || !conv?.id || !contact?.id) return { ok: false, reason: 'nothing_to_ask' }
   if (conv.is_business_chat === false) return { ok: false, reason: 'not_a_business_chat' }
   try {
     await supabase.from('lead_stage_requests').delete().eq('business_id', businessId).eq('conversation_id', String(conv.id)).eq('status', 'pending')
     const { error } = await supabase.from('lead_stage_requests').insert({
-      business_id: businessId, contact_id: contact.id, conversation_id: String(conv.id),
+      business_id: businessId, ...((accountId ?? contact.account_id) ? { account_id: accountId ?? contact.account_id } : {}),
+      contact_id: contact.id, conversation_id: String(conv.id),
       requested_stage: ask.stage, reason: ask.reason, actor,
     })
     return error ? { ok: false, reason: error.message } : { ok: true }

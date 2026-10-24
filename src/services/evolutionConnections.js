@@ -73,6 +73,14 @@ export function updateEvolutionInstanceSettings(instanceName, settings = {}) {
     });
 }
 
+// The WhatsApp JID an instance is logged in with ("2547...@s.whatsapp.net"), or null.
+export async function fetchInstanceOwnerJid(instanceName) {
+    const instances = await evolutionRequest(`/instance/fetchInstances?instanceName=${encodeURIComponent(instanceName)}`);
+    const list = Array.isArray(instances) ? instances : instances?.value || [instances].filter(Boolean);
+    const match = list.find((i) => i?.name === instanceName || i?.instance?.instanceName === instanceName) || list[0];
+    return match?.ownerJid || match?.instance?.owner || match?.owner || null;
+}
+
 export function logoutEvolutionInstanceRemote(instanceName) {
     return evolutionRequest(`/instance/logout/${encodeURIComponent(instanceName)}`, { method: 'DELETE' });
 }
@@ -170,11 +178,14 @@ export function deleteEvolutionInstanceRemote(instanceName) {
 
 // ─── whatsapp_sessions persistence ────────────────────────────────────────
 
-export async function getConnection(businessId) {
-    const { data, error } = await supabase
+// accountId: that account's connection (one WhatsApp number); without it, the business's latest connection.
+export async function getConnection(businessId, accountId = null) {
+    let query = supabase
         .from('whatsapp_sessions')
         .select('*')
-        .eq('business_id', businessId)
+        .eq('business_id', businessId);
+    if (accountId) query = query.eq('account_id', accountId);
+    const { data, error } = await query
         .order('updated_at', { ascending: false })
         .limit(1)
         .maybeSingle();
@@ -189,8 +200,8 @@ export async function getConnection(businessId) {
     };
 }
 
-export async function saveConnectionState(businessId, updates = {}) {
-    const existing = await getConnection(businessId);
+export async function saveConnectionState(businessId, updates = {}, accountId = null) {
+    const existing = await getConnection(businessId, accountId);
     const instanceName = updates.evolution_instance_id || existing?.instance_name;
     const sessionData = {
         ...(existing?.session_data || {}),
@@ -200,6 +211,7 @@ export async function saveConnectionState(businessId, updates = {}) {
     };
     const payload = {
         business_id: businessId,
+        ...(accountId ? { account_id: accountId } : {}),
         instance_name: instanceName,
         status: updates.status || existing?.status || 'pending',
         phone_number: updates.phone_number ?? existing?.phone_number ?? null,
@@ -221,7 +233,7 @@ export async function saveConnectionState(businessId, updates = {}) {
     };
 }
 
-export async function createEvolutionInstance(businessIdOrInstanceName) {
+export async function createEvolutionInstance(businessIdOrInstanceName, { accountId = null } = {}) {
     const rawValue = String(businessIdOrInstanceName ?? '').trim();
     if (!rawValue) throw new Error('instance_name_required');
 
@@ -229,17 +241,20 @@ export async function createEvolutionInstance(businessIdOrInstanceName) {
     const businessId = rawValue.startsWith('heysasa-') ? rawValue.replace(/^heysasa-/, '') : rawValue;
     const instanceName = isExplicitInstance ? rawValue : generateInstanceName(businessId);
 
-    // Clean up stale pending or disconnected sessions for this business before inserting a new one
-    await supabase
+    // Clean up stale pending or disconnected sessions of this account (never another account's) before inserting
+    let stale = supabase
         .from('whatsapp_sessions')
         .delete()
         .eq('business_id', businessId)
         .in('status', ['pending', 'disconnected']);
+    stale = accountId ? stale.eq('account_id', accountId) : stale.is('account_id', null);
+    await stale;
 
     const { data: session, error } = await supabase
         .from('whatsapp_sessions')
         .insert({
             business_id: businessId,
+            ...(accountId ? { account_id: accountId } : {}),
             instance_name: instanceName,
             status: 'pending',
         })

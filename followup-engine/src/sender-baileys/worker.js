@@ -1,5 +1,6 @@
 import { supabase } from '../supabaseClient.js'
-import { getBusiness, getContact, getConversation } from '../lib/db.js'
+import { getBusinessForAccount, getContact, getConversation } from '../lib/db.js'
+import { loadAccounts, accountCanOperate, laneKey } from '../lib/accounts.js'
 import { sendContentViaEvolution } from './evolutionSender.js'
 import { resolveSendTarget } from '../lib/sendTarget.js'
 import { checkAntiban, recordSend, recordFailedAttempt, primeAntiban } from './antiban.js'
@@ -14,8 +15,11 @@ import { isBusinessAwake } from '../lib/timing.js'
 import { nextAwakeAt } from '../lib/wakeTimes.js'
 
 // How the sender picks work (one pass = one call to processBaileysBatch):
-//   1. Businesses with a connected number are visited one by one, in random order, so a business with
-//      a 900-lead campaign can never sit in front of everyone else's follow-ups.
+//   1. Lanes are visited one by one, in random order, so a number with a 900-lead campaign can never sit in
+//      front of everyone else's follow-ups. A lane is one connected account (one WhatsApp number, sending from
+//      accounts.instance_name); sessions without an account (from before accounts) make one lane per business.
+//      An account that is not connected, or may not operate (access fee unpaid), has no lane: its rows wait.
+//      Antiban timers, the daily cap and the new-number warm-up all count per lane.
 //   2. For each business the cheap, in-memory gates run FIRST (quiet hours, antiban gap/hourly ceiling,
 //      cool-down, daily cap). If any says "not now", the business is skipped with no per-message queries.
 //   3. Only then are its oldest due messages read, and at most ONE of them is attempted: after an attempt
@@ -44,9 +48,10 @@ function nextUtcMidnight() {
   return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1, 0, 0, 30)
 }
 
-async function logSendEvent(businessId, { queueId = null, contactId = null, instanceName = null, eventType, reason = null }) {
+async function logSendEvent(businessId, { queueId = null, contactId = null, instanceName = null, eventType, reason = null, accountId = null }) {
   const { error } = await supabase.from('follow_up_send_events').insert({
     business_id: businessId,
+    ...(accountId ? { account_id: accountId } : {}),
     follow_up_queue_id: queueId,
     contact_id: contactId,
     instance_name: instanceName,
@@ -152,8 +157,10 @@ async function sendTimeCheck(item, contact, business) {
   return null
 }
 
-async function processBusiness(businessId, ctx) {
-  const business = await getBusiness(supabase, businessId)
+async function processLane(lane, ctx) {
+  const { businessId, accountId, key } = lane
+  // Caps, quiet hours and switches are the account's (accounts.settings over the business defaults).
+  const business = await getBusinessForAccount(supabase, businessId, accountId)
   if (!business) {
     logHold(businessId, 'business_missing', `Messages are waiting for ${businessId} but the business record was not found`)
     return 0
@@ -165,8 +172,8 @@ async function processBusiness(businessId, ctx) {
     ctx.wake(nextAwakeAt(business))
     return 0
   }
-  await primeAntiban(supabase, businessId)
-  const gate = checkAntiban(businessId, business.followup_daily_cap)
+  await primeAntiban(supabase, key, { businessId, accountId })
+  const gate = checkAntiban(key, business.followup_daily_cap)
   if (!gate.allowed) {
     if (gate.reason === 'cooldown') logHold(businessId, 'cooldown', `Cooling down ${business.name ?? businessId}: recent sends failed, waiting ${Math.ceil(gate.retryAfterMs / 60_000)} min`, { retryAfterMs: gate.retryAfterMs })
     ctx.wake(Date.now() + gate.retryAfterMs + WAKE_PAD_MS)
@@ -176,8 +183,8 @@ async function processBusiness(businessId, ctx) {
   // The daily cap is checked HERE, at send time, for everything (campaigns included). It used to be checked only at the moment a
   // message was promoted to "ready", when nothing had been sent yet, so a big campaign was waved through whole and then
   // drained at the hourly ceiling regardless of the cap. During a business's first week the slow-start cap applies.
-  const warm = await effectiveDailyCap(supabase, businessId, business.followup_daily_cap)
-  const sentToday = await sentTodayCount(supabase, businessId)
+  const warm = await effectiveDailyCap(supabase, businessId, business.followup_daily_cap, accountId)
+  const sentToday = await sentTodayCount(supabase, businessId, accountId)
   if (sentToday >= warm.cap) {
     if (warm.warmupActive) logWarmupHold(businessId, warm.day, warm.cap)
     else logHold(businessId, 'daily_cap', `Daily cap reached for ${business.name ?? businessId}: ${sentToday}/${warm.cap} sent today, resuming tomorrow`, { sentToday, cap: warm.cap })
@@ -185,13 +192,15 @@ async function processBusiness(businessId, ctx) {
     return 0
   }
 
-  // ── Read this business's oldest due messages ─────────────────────────────────────────────
-  const { data: items, error } = await supabase
+  // ── Read this lane's oldest due messages ─────────────────────────────────────────────────
+  let itemsQuery = supabase
     .from('follow_up_queue')
     .select('*')
     .eq('status', 'ready_to_send')
     .eq('channel', 'baileys')
     .eq('business_id', businessId)
+  if (accountId) itemsQuery = itemsQuery.eq('account_id', accountId)
+  const { data: items, error } = await itemsQuery
     .lte('scheduled_at', new Date().toISOString())
     .order('scheduled_at', { ascending: true })
     .limit(POOL_PER_BUSINESS)
@@ -202,12 +211,11 @@ async function processBusiness(businessId, ctx) {
   }
   if (!items?.length) return 0
 
-  const sessions = ctx.sessionsByBusiness.get(businessId) ?? []
   const lookupWaitCampaigns = new Set()
 
   for (const item of items) {
     try {
-      const outcome = await processItem(item, { business, sessions, ctx, lookupWaitCampaigns })
+      const outcome = await processItem(item, { business, lane, ctx, lookupWaitCampaigns })
       if (outcome === 'sent') return 1
       if (outcome === 'attempted' || outcome === 'hold') return 0
     } catch (e) {
@@ -217,9 +225,9 @@ async function processBusiness(businessId, ctx) {
       })
       // Our own hiccup (database, bug) is not the lead's fault and nothing was sent: put it back a few minutes later without
       // counting an attempt, and slow this business down.
-      recordFailedAttempt(businessId, 'unknown')
+      recordFailedAttempt(key, 'unknown')
       await releaseItem(item, 5 * 60_000, `unexpected: ${String(e.message).slice(0, 150)}`).catch(() => {})
-      await logSendEvent(item.business_id, { queueId: item.id, contactId: item.contact_id, eventType: 'failed', reason: e.message }).catch(() => {})
+      await logSendEvent(item.business_id, { queueId: item.id, accountId: item.account_id ?? null, contactId: item.contact_id, eventType: 'failed', reason: e.message }).catch(() => {})
       ctx.retry = true
       return 0
     }
@@ -231,14 +239,15 @@ async function processBusiness(businessId, ctx) {
 // 'hold'     -> the whole business must wait; stop
 // 'attempted'-> a send was tried and failed; stop (the antiban gap is now closed)
 // 'sent'     -> sent; stop
-async function processItem(item, { business, sessions, ctx, lookupWaitCampaigns }) {
+async function processItem(item, { business, lane, ctx, lookupWaitCampaigns }) {
   const businessId = item.business_id
+  const accountId = lane.accountId
   if (item.campaign_id && lookupWaitCampaigns.has(item.campaign_id)) return 'skipped'
 
   const contact = await getContact(supabase, item.contact_id)
   if (!contact) {
     await recordFailedDispatch(supabase, item, 'contact_or_phone_not_found')
-    await logSendEvent(businessId, { queueId: item.id, contactId: item.contact_id, eventType: 'contact_or_phone_not_found' })
+    await logSendEvent(businessId, { queueId: item.id, accountId: item.account_id ?? null, contactId: item.contact_id, eventType: 'contact_or_phone_not_found' })
     return 'skipped'
   }
 
@@ -246,34 +255,38 @@ async function processItem(item, { business, sessions, ctx, lookupWaitCampaigns 
   const target = resolveSendTarget(contact, contact.country_code)
   if (!target) {
     await recordFailedDispatch(supabase, item, 'no_send_target')
-    await logSendEvent(businessId, { queueId: item.id, contactId: item.contact_id, eventType: 'no_send_target' })
+    await logSendEvent(businessId, { queueId: item.id, accountId: item.account_id ?? null, contactId: item.contact_id, eventType: 'no_send_target' })
     return 'skipped'
   }
 
-  // Campaign items: if the campaign's assigned instance doesn't match what this queue row was stamped with, or the campaign
-  // got paused in the meantime, leave the item for a later pass: nothing here ever fails the campaign itself.
+  // Campaign items: if the campaign got paused in the meantime (or, for a campaign without an account, its assigned
+  // instance doesn't match what this queue row was stamped with), leave the item for a later pass: nothing here ever
+  // fails the campaign itself. Account rows always send from the account's instance, whatever name was stored.
   let campaign = null
   if (item.campaign_id) {
     campaign = ctx.campaigns.get(item.campaign_id)
     if (campaign === undefined) {
-      const { data } = await supabase.from('campaigns').select('whatsapp_instance_name, status').eq('id', item.campaign_id).maybeSingle()
+      const { data } = await supabase.from('campaigns').select('whatsapp_instance_name, status, account_id').eq('id', item.campaign_id).maybeSingle()
       campaign = data ?? null
       ctx.campaigns.set(item.campaign_id, campaign)
     }
-    if (!campaign || campaign.status !== 'active' || !item.assigned_instance_name || campaign.whatsapp_instance_name !== item.assigned_instance_name) return 'skipped'
+    if (!campaign || campaign.status !== 'active') return 'skipped'
+    if (!accountId && (!item.assigned_instance_name || campaign.whatsapp_instance_name !== item.assigned_instance_name)) return 'skipped'
   }
 
   // whatsapp_sessions is the single source of truth for connection state (kept live by Evolution's connection.update webhook).
-  const activeSession = item.campaign_id
-    ? sessions.find(s => s.instance_name === item.assigned_instance_name)
-    : sessions[0]
+  const activeSession = accountId
+    ? { instance_name: lane.instance }
+    : item.campaign_id
+      ? lane.sessions.find(s => s.instance_name === item.assigned_instance_name)
+      : lane.sessions[0]
   if (!activeSession?.instance_name) return 'skipped'   // connection-update events wake the sender when the number reconnects
 
   // Re-check at the moment of sending what may have changed since the message was queued.
   const check = await sendTimeCheck(item, contact, business)
   if (check?.action === 'skip') {
     await skipItemForGood(item, check.reason)
-    await logSendEvent(businessId, { queueId: item.id, contactId: item.contact_id, instanceName: activeSession.instance_name, eventType: 'skipped', reason: check.reason })
+    await logSendEvent(businessId, { queueId: item.id, accountId: item.account_id ?? null, contactId: item.contact_id, instanceName: activeSession.instance_name, eventType: 'skipped', reason: check.reason })
     return 'skipped'
   }
   if (check?.action === 'hold') {
@@ -297,13 +310,14 @@ async function processItem(item, { business, sessions, ctx, lookupWaitCampaigns 
   }
   if (numberCheck.status === 'not_on_whatsapp') {
     await skipItemForGood(item, 'number_not_on_whatsapp', 'not_on_whatsapp')
-    await logSendEvent(businessId, { queueId: item.id, contactId: item.contact_id, instanceName: activeSession.instance_name, eventType: 'skipped', reason: 'number_not_on_whatsapp' })
+    await logSendEvent(businessId, { queueId: item.id, accountId: item.account_id ?? null, contactId: item.contact_id, instanceName: activeSession.instance_name, eventType: 'skipped', reason: 'number_not_on_whatsapp' })
     return 'skipped'
   }
 
   // Funds: checked per message, right before it goes. (It used to be checked only when a message was queued, while the wallet
   // was still full, so a big campaign sent its whole remainder for free once the wallet ran out.)
-  if (!(await checkSendBalance(supabase, businessId))) {
+  // The account's own wallet on separate billing, otherwise the business's.
+  if (!(await checkSendBalance(supabase, businessId, item.account_id ?? accountId))) {
     logHold(businessId, 'no_balance', `Not sending for ${business.name ?? businessId}: balance too low for another message`)
     if (item.campaign_id) {
       await supabase.from('campaigns').update({ status: 'paused', failure_reason: 'insufficient_balance', failed_at: null })
@@ -334,12 +348,12 @@ async function processItem(item, { business, sessions, ctx, lookupWaitCampaigns 
     const decision = await recordFailedDispatch(supabase, item, result.error ?? 'send_failed')
     // A failed attempt still touches WhatsApp: the same gap applies to the next one, and a run of connection-type
     // failures puts the whole business on a growing cool-down instead of working through every lead.
-    const cool = recordFailedAttempt(businessId, decision.failureClass)
+    const cool = recordFailedAttempt(lane.key, decision.failureClass)
     if (['instance_down', 'timeout', 'server_error'].includes(decision.failureClass)) {
       await confirmInstanceAfterFailure(supabase, { instanceName: activeSession.instance_name, businessId })
     }
     await logSendEvent(businessId, {
-      queueId: item.id, contactId: item.contact_id, instanceName: activeSession.instance_name,
+      queueId: item.id, accountId: item.account_id ?? null, contactId: item.contact_id, instanceName: activeSession.instance_name,
       eventType: 'failed', reason: result.error ?? 'send_failed'
     })
     log('warn', 'sender', 'sender.send_failed', `Send failed to ${target.label}: ${result.error ?? 'send_failed'}`, {
@@ -350,8 +364,8 @@ async function processItem(item, { business, sessions, ctx, lookupWaitCampaigns 
     return 'attempted'
   }
 
-  recordSend(businessId)
-  noteSent(businessId)
+  recordSend(lane.key)
+  noteSent(businessId, accountId)
   try {
     await recordSuccessfulSend(supabase, {
       item, contact, business,
@@ -382,12 +396,40 @@ const shuffle = (list) => {
 // Returns { dispatched, retryNeeded, wakeAt }.
 //   wakeAt      = earliest moment (ms) something is expected to become possible (gap over, lookup slot, cap reset, quiet hours end)
 //   retryNeeded = something failed in a way with no known time: try again in a minute
+// The lanes that may send now. An account lane needs the account connected, its instance_name served by a connected
+// session (a session demoted after failed sends stops the lane too) and account_can_operate. Sessions without an
+// account make one lane per business, as before accounts.
+export async function buildLanes(db, sessionRows) {
+  const accountIds = [...new Set((sessionRows ?? []).map(r => r.account_id).filter(Boolean))]
+  const accounts = accountIds.length ? await loadAccounts(db, accountIds) : new Map()
+  const connectedInstances = new Set((sessionRows ?? []).map(r => r.instance_name).filter(Boolean))
+  const lanes = []
+  const held = []
+  const legacy = new Map()
+  for (const id of accountIds) {
+    const account = accounts.get(id)
+    if (!account) continue
+    if (account.status !== 'connected' || !account.instance_name || !connectedInstances.has(account.instance_name)) continue
+    if (!(await accountCanOperate(db, id))) { held.push(account); continue }
+    lanes.push({ key: laneKey(account.business_id, id), businessId: account.business_id, accountId: id, instance: account.instance_name, sessions: [] })
+  }
+  const businessesWithAccountLanes = new Set(lanes.map(l => l.businessId))
+  for (const row of sessionRows ?? []) {
+    if (!row.business_id || !row.instance_name || row.account_id) continue
+    if (businessesWithAccountLanes.has(row.business_id)) continue
+    const lane = legacy.get(row.business_id) ?? { key: row.business_id, businessId: row.business_id, accountId: null, instance: null, sessions: [] }
+    lane.sessions.push(row)
+    legacy.set(row.business_id, lane)
+  }
+  return { lanes: [...lanes, ...legacy.values()], held }
+}
+
 export async function processBaileysBatch() {
   await healDemotedSessions(supabase).catch(() => {})
 
   const { data: sessionRows, error } = await supabase
     .from('whatsapp_sessions')
-    .select('business_id, instance_name, updated_at')
+    .select('business_id, account_id, instance_name, updated_at')
     .eq('status', 'connected')
     .order('updated_at', { ascending: false })
   if (error) {
@@ -395,34 +437,37 @@ export async function processBaileysBatch() {
     return { dispatched: 0, retryNeeded: true, wakeAt: null }
   }
 
-  const sessionsByBusiness = new Map()
-  for (const row of sessionRows ?? []) {
-    if (!row.business_id || !row.instance_name) continue
-    const list = sessionsByBusiness.get(row.business_id) ?? []
-    list.push(row)
-    sessionsByBusiness.set(row.business_id, list)
+  let built
+  try {
+    built = await buildLanes(supabase, sessionRows)
+  } catch (e) {
+    log('error', 'sender', 'sender.fetch_batch_failed', `Failed to read accounts: ${e.message}`, { details: { error: e.message } })
+    return { dispatched: 0, retryNeeded: true, wakeAt: null }
   }
-  if (!sessionsByBusiness.size) return { dispatched: 0, retryNeeded: false, wakeAt: null }
+  for (const account of built.held) {
+    logHold(account.business_id, 'account_suspended', `Not sending for account ${account.id}: the account may not operate (access fee unpaid)`, { accountId: account.id })
+  }
+  const lanes = built.lanes
+  if (!lanes.length) return { dispatched: 0, retryNeeded: false, wakeAt: null }
 
   let wakeAt = null
   const ctx = {
-    sessionsByBusiness,
     campaigns: new Map(),   // per pass: campaign rows are read once, not once per message
     retry: false,
     wake(at) { if (Number.isFinite(at) && (wakeAt === null || at < wakeAt)) wakeAt = at },
   }
 
   let dispatched = 0
-  for (const businessId of shuffle([...sessionsByBusiness.keys()])) {
+  for (const lane of shuffle(lanes)) {
     try {
-      dispatched += await processBusiness(businessId, ctx)
+      dispatched += await processLane(lane, ctx)
     } catch (e) {
-      log('error', 'sender', 'sender.business_pass_failed', `Sender pass failed for ${businessId}: ${e.message}`, { business_id: businessId, details: { error: { name: e.name, message: e.message } } })
+      log('error', 'sender', 'sender.business_pass_failed', `Sender pass failed for ${lane.businessId}${lane.accountId ? ` (account ${lane.accountId})` : ''}: ${e.message}`, { business_id: lane.businessId, details: { accountId: lane.accountId, error: { name: e.name, message: e.message } } })
       ctx.retry = true
     }
   }
 
-  if (dispatched) log('info', 'sender', 'sender.batch_done', `Dispatched ${dispatched} across ${sessionsByBusiness.size} connected business(es)`, { details: { dispatched, businesses: sessionsByBusiness.size } })
+  if (dispatched) log('info', 'sender', 'sender.batch_done', `Dispatched ${dispatched} across ${lanes.length} connected number(s)`, { details: { dispatched, lanes: lanes.length } })
   return { dispatched, retryNeeded: ctx.retry, wakeAt }
 }
 

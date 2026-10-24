@@ -5,7 +5,9 @@
 //   - its own pacing (a few seconds between messages, not the 20-65 seconds campaigns use)
 //   - its own counter (rows of chat_ai_outbox): nothing here touches follow_up_queue, the follow-up daily limit,
 //     the new-number warm-up or the follow-up antiban timers, so the two can never count or hold each other back
-//   - a hard hourly ceiling per business
+//   - a hard hourly ceiling per WhatsApp number (account; per business for rows without one)
+//   - rows of an account go out on the account's instance (accounts.instance_name), only while it is connected and
+//     allowed to operate (account_can_operate); rows without an account use the business's connected session
 // Each message is claimed before it is sent and is never retried: the brain is waiting for the answer and tells
 // the AI honestly whether the customer saw it.
 //
@@ -16,6 +18,7 @@
 
 import { supabase as defaultSupabase } from '../supabaseClient.js'
 import { getContact } from '../lib/db.js'
+import { accountSendState } from '../lib/accounts.js'
 import { resolveSendTarget } from '../lib/sendTarget.js'
 import { sendContentViaEvolution } from './evolutionSender.js'
 import { log } from '../lib/log.js'
@@ -27,9 +30,11 @@ import {
 const BATCH = 30
 const HOUR_MS = 60 * 60_000
 
-const lastSent = new Map()        // business_id -> { at: ms, conversationId }
-const hourCache = new Map()       // business_id -> { count, at }
-const activeLanes = new Set()     // business ids whose lane is running right now
+const lastSent = new Map()        // lane key -> { at: ms, conversationId }
+const hourCache = new Map()       // lane key -> { count, at }
+const activeLanes = new Set()     // lane keys whose lane is running right now
+// One lane per WhatsApp number: the account, or the business for rows without an account.
+const laneOf = (item) => item.account_id ? `acct:${item.account_id}` : String(item.business_id)
 let lastSweepAt = 0
 
 // How long "typing..." shows before a message appears: longer text, longer typing. Short on purpose, because a customer who
@@ -43,15 +48,17 @@ export function messageKind(item) {
   return item.kind === 'image' && item.media?.url ? 'image' : 'text'
 }
 
-async function sentInLastHour(s, businessId, now) {
-  const hit = hourCache.get(businessId)
+async function sentInLastHour(s, item, now) {
+  const key = laneOf(item)
+  const hit = hourCache.get(key)
   if (hit && now - hit.at < 15_000) return hit.count
-  const { count, error } = await s.from('chat_ai_outbox')
+  let query = s.from('chat_ai_outbox')
     .select('id', { count: 'exact', head: true })
-    .eq('business_id', businessId).eq('status', 'sent')
+  query = item.account_id ? query.eq('account_id', item.account_id) : query.eq('business_id', item.business_id)
+  const { count, error } = await query.eq('status', 'sent')
     .gte('sent_at', new Date(now - HOUR_MS).toISOString())
   if (error) throw error
-  hourCache.set(businessId, { count: count ?? 0, at: now })
+  hourCache.set(key, { count: count ?? 0, at: now })
   return count ?? 0
 }
 
@@ -100,7 +107,7 @@ export async function processChatAiOutbox(deps = {}) {
     for (const item of items) {
       try {
         // Pacing for this business's chat AI lane.
-        const last = lastSent.get(item.business_id)
+        const last = lastSent.get(laneOf(item))
         if (last) {
           const sameChat = last.conversationId === item.conversation_id
           const gap = sameChat
@@ -111,7 +118,7 @@ export async function processChatAiOutbox(deps = {}) {
         }
         const now = clock()
 
-        if ((await sentInLastHour(s, item.business_id, now)) >= CHAT_AI_HOURLY_CEILING) {
+        if ((await sentInLastHour(s, item, now)) >= CHAT_AI_HOURLY_CEILING) {
           await fail(item, 'chat_ai_hourly_limit')
           continue
         }
@@ -122,10 +129,17 @@ export async function processChatAiOutbox(deps = {}) {
         const target = resolveSendTarget(contact, contact.country_code)
         if (!target) { await fail(item, 'no_send_target'); continue }
 
-        const { data: sessions } = await s.from('whatsapp_sessions')
-          .select('instance_name').eq('business_id', item.business_id).eq('status', 'connected')
-          .order('updated_at', { ascending: false }).limit(1)
-        const instance = sessions?.[0]?.instance_name
+        let instance = null
+        if (item.account_id) {
+          const route = await accountSendState(s, item.account_id)
+          if (!route.ok) { await fail(item, route.reason === 'account_suspended' ? 'account_suspended' : 'whatsapp_not_connected'); continue }
+          instance = route.instance
+        } else {
+          const { data: sessions } = await s.from('whatsapp_sessions')
+            .select('instance_name').eq('business_id', item.business_id).eq('status', 'connected')
+            .order('updated_at', { ascending: false }).limit(1)
+          instance = sessions?.[0]?.instance_name
+        }
         if (!instance) { await fail(item, 'whatsapp_not_connected'); continue }
 
         const { data: claimed } = await s.from('chat_ai_outbox')
@@ -145,8 +159,8 @@ export async function processChatAiOutbox(deps = {}) {
         if (!sent?.ok) { await fail(item, String(sent?.error ?? 'send_failed').slice(0, 300), { instance }); continue }
 
         const sentAt = new Date(clock()).toISOString()
-        lastSent.set(item.business_id, { at: clock(), conversationId: item.conversation_id })
-        const cached = hourCache.get(item.business_id)
+        lastSent.set(laneOf(item), { at: clock(), conversationId: item.conversation_id })
+        const cached = hourCache.get(laneOf(item))
         if (cached) cached.count += 1
 
         // Both writes happen together: the brain is waiting on the first one, and the second does not depend on it.
@@ -156,7 +170,7 @@ export async function processChatAiOutbox(deps = {}) {
         const saveMessage = sent.messageId
           ? (async () => {
               const { error: messageError } = await s.from('messages').upsert({
-                business_id: item.business_id, conversation_id: item.conversation_id, contact_id: item.contact_id,
+                business_id: item.business_id, ...(item.account_id ? { account_id: item.account_id } : {}), conversation_id: item.conversation_id, contact_id: item.contact_id,
                 whatsapp_message_id: sent.messageId, direction: 'out', role: 'ai', agent_role: 'chat_ai',
                 type: kind, content: kind === 'image' ? { text, type: 'image', url: item.media.url } : { text, type: 'text' },
                 status: 'sent', created_at: sentAt,
@@ -177,21 +191,22 @@ export async function processChatAiOutbox(deps = {}) {
     }
   }
 
-  // One lane per business, started side by side. A business whose lane is still running from an earlier pass is left alone:
+  // One lane per WhatsApp number, started side by side. A lane still running from an earlier pass is left alone:
   // its waiting messages are picked up by the next pass once the lane is done.
   const lanes = new Map()
   for (const item of queued ?? []) {
-    if (!lanes.has(item.business_id)) lanes.set(item.business_id, [])
-    lanes.get(item.business_id).push(item)
+    const key = laneOf(item)
+    if (!lanes.has(key)) lanes.set(key, [])
+    lanes.get(key).push(item)
   }
   const runs = []
-  for (const [businessId, items] of lanes) {
-    if (activeLanes.has(businessId)) continue
-    activeLanes.add(businessId)
+  for (const [key, items] of lanes) {
+    if (activeLanes.has(key)) continue
+    activeLanes.add(key)
     runs.push(
       runLane(items)
-        .catch((e) => log('error', 'sender', 'chat_ai.lane_error', `Chat AI lane failed: ${e.message}`, { business_id: businessId, details: { error: e.message } }))
-        .finally(() => activeLanes.delete(businessId)),
+        .catch((e) => log('error', 'sender', 'chat_ai.lane_error', `Chat AI lane failed: ${e.message}`, { business_id: items[0]?.business_id ?? null, details: { lane: key, error: e.message } }))
+        .finally(() => activeLanes.delete(key)),
     )
   }
   await Promise.all(runs)

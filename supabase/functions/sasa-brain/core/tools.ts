@@ -1,7 +1,7 @@
 // The tool registry and the rules for running a batch of tool calls.
 
 export type ToolRow = {
-  name: string; business_id: string | null; description: string; parameters: Record<string, unknown>;
+  name: string; business_id: string | null; account_id?: string | null; description: string; parameters: Record<string, unknown>;
   kind: 'builtin' | 'rpc' | 'http'; target: string; phase: 'lookup' | 'write' | 'send';
 };
 
@@ -11,14 +11,17 @@ export type ToolResult = { call_id: string; name: string; output: string; ok: bo
 const MAX_OUTPUT_CHARS = 6000;
 const TOOL_TIMEOUT_MS = 20_000;
 
-// A business's own tool replaces a global tool with the same name. Sorted by name so the tool list
-// is byte-identical from turn to turn, which is what lets OpenAI's prompt cache reuse it.
-export function resolveTools(rows: ToolRow[], businessId: string): ToolRow[] {
+// The most specific tool wins for a name: the account's own, then the business's (account_id null, shared by every
+// account), then the global one. Another business's or another account's tool is never offered. Sorted by name so the
+// tool list is byte-identical from turn to turn, which is what lets OpenAI's prompt cache reuse it.
+const rank = (row: ToolRow) => (row.account_id ? 2 : row.business_id ? 1 : 0);
+export function resolveTools(rows: ToolRow[], businessId: string, accountId: string | null = null): ToolRow[] {
   const byName = new Map<string, ToolRow>();
   for (const row of rows) {
     if (row.business_id && row.business_id !== businessId) continue;
+    if (row.account_id && row.account_id !== accountId) continue;
     const existing = byName.get(row.name);
-    if (!existing || (row.business_id && !existing.business_id)) byName.set(row.name, row);
+    if (!existing || rank(row) > rank(existing)) byName.set(row.name, row);
   }
   return [...byName.values()].sort((a, b) => a.name.localeCompare(b.name));
 }

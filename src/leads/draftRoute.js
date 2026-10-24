@@ -2,6 +2,8 @@
 // chat so far, the lead brief and the approved products. The owner sees it in the chat box and decides whether to send.
 // Nothing is sent from here.
 import { Router } from 'express';
+import { forAccount } from '../middleware/accessScope.js';
+import { loadActivePack } from '../personaPack.js';
 
 const HISTORY = 20;
 const MAX_PRODUCTS = 15;
@@ -41,7 +43,10 @@ export function buildDraftPrompt({ businessName, persona, contact, goal, message
     return { system, user };
 }
 
-// deps: { auth, supabase, callModel({ systemPrompt, userContent, businessId }) -> text | null, canAfford(businessId), check(text, ctx) }
+// deps: { auth, supabase, callModel({ systemPrompt, userContent, businessId, accountId }) -> text | null,
+//         canAfford(businessId, accountId), check(text, ctx) }
+// The lead belongs to one WhatsApp account (ACCOUNTS.md): it must be in the request's scope, and the voice (persona
+// pack, falling back to the business-wide pack), products and billing are that account's.
 export function createLeadDraftRouter({ auth, supabase, callModel, canAfford, check = () => ({ passed: true }), log = () => {} }) {
     const router = Router();
     router.post('/leads/:id/draft', auth, async (req, res, next) => {
@@ -50,26 +55,29 @@ export function createLeadDraftRouter({ auth, supabase, callModel, canAfford, ch
             if (!Number.isSafeInteger(leadId) || leadId <= 0) return res.status(400).json({ error: 'invalid_lead' });
             const businessId = req.businessId;
 
-            const { data: contact } = await supabase.from('contacts')
-                .select('id, business_id, name, lead_state, lead_summary, next_action_plan, product_interests, do_not_contact')
-                .eq('id', leadId).eq('business_id', businessId).maybeSingle();
+            const { data: contact } = await forAccount(supabase.from('contacts')
+                .select('id, business_id, account_id, name, lead_state, lead_summary, next_action_plan, product_interests, do_not_contact')
+                .eq('id', leadId).eq('business_id', businessId), req.scope).maybeSingle();
             if (!contact) return res.status(404).json({ error: 'not_found', message: 'That lead no longer exists.' });
             if (contact.do_not_contact) return res.status(409).json({ error: 'do_not_contact', message: 'This person asked not to be contacted.' });
-            if (!(await canAfford(businessId))) return res.status(402).json({ error: 'no_balance', message: 'Your balance is empty. Top up to let HeySasa write for you.' });
+            const accountId = contact.account_id ?? null;
+            if (!(await canAfford(businessId, accountId))) return res.status(402).json({ error: 'no_balance', message: 'Your balance is empty. Top up to let HeySasa write for you.' });
 
-            const [{ data: business }, { data: personaRow }, { data: history }, { data: products }] = await Promise.all([
+            let productsQuery = supabase.from('products').select('title, price').eq('business_id', businessId).eq('status', 'approved');
+            if (accountId) productsQuery = productsQuery.or(`account_id.eq.${accountId},account_id.is.null`);   // the account's own + the shared catalog
+            const [{ data: business }, persona, { data: history }, { data: products }] = await Promise.all([
                 supabase.from('businesses').select('name').eq('business_id', businessId).maybeSingle(),
-                supabase.from('persona_packs').select('pack').eq('business_id', businessId).eq('is_active', true).maybeSingle(),
+                loadActivePack(supabase, businessId, accountId, 'pack').catch(() => ({ pack: null })),
                 supabase.from('messages').select('direction, content, created_at').eq('contact_id', leadId)
                     .order('created_at', { ascending: false }).limit(HISTORY),
-                supabase.from('products').select('title, price').eq('business_id', businessId).eq('status', 'approved')
-                    .order('mention_count', { ascending: false }).limit(MAX_PRODUCTS),
+                productsQuery.order('mention_count', { ascending: false }).limit(MAX_PRODUCTS),
             ]);
+            const personaRow = { pack: persona.pack };
             const messages = [...(history || [])].reverse();
             const goal = req.body?.goal || contact.next_action_plan;
             const { system, user } = buildDraftPrompt({ businessName: business?.name, persona: personaRow?.pack, contact, goal, messages, products: products || [] });
 
-            let text = String(await callModel({ systemPrompt: system, userContent: user, businessId }) || '').trim().replace(/^"(.*)"$/s, '$1');
+            let text = String(await callModel({ systemPrompt: system, userContent: user, businessId, accountId }) || '').trim().replace(/^"(.*)"$/s, '$1');
             if (!text) return res.status(503).json({ error: 'ai_unavailable', message: 'HeySasa could not write this message right now. Try again in a minute.' });
 
             // The same service standard every follow-up passes (no invented prices, no placeholders...). The owner still
@@ -77,7 +85,7 @@ export function createLeadDraftRouter({ auth, supabase, callModel, canAfford, ch
             const contextText = [products?.map((p) => `${p.title} ${p.price ?? ''}`).join('\n'), messages.map((m) => asText(m.content)).join('\n')].join('\n');
             const quality = check(text, { contextText });
             const usedProducts = (products || []).filter((p) => p.title && text.toLowerCase().includes(String(p.title).toLowerCase())).map((p) => p.title);
-            log('info', 'lead.draft_written', { businessId, leadId, passed: quality.passed });
+            log('info', 'lead.draft_written', { businessId, accountId, leadId, passed: quality.passed });
             return res.json({ ok: true, text, usedProducts, quality: { passed: quality.passed, issues: quality.issues || [] } });
         } catch (error) {
             return next(error);

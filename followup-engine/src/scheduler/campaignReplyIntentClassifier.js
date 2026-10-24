@@ -52,9 +52,10 @@ export async function runCampaignReplyIntentClassifier(supabase, onlyEventId = n
   const campaignIds = [...new Set((enrollments ?? []).map(e => e.campaign_id))]
   const { data: campaigns } = await supabase
     .from('campaigns')
-    .select('id, business_id, ai_managed')
+    .select('id, business_id, account_id, ai_managed')
     .in('id', campaignIds)
   const businessIdByCampaign = new Map((campaigns ?? []).map(c => [c.id, c.business_id]))
+  const accountIdByCampaign = new Map((campaigns ?? []).map(c => [c.id, c.account_id ?? null]))
   const aiManagedCampaigns = new Set((campaigns ?? []).filter(c => c.ai_managed).map(c => c.id))
 
   const stepIds = [...new Set(pendingEvents.map(e => e.step_id))]
@@ -102,7 +103,8 @@ export async function runCampaignReplyIntentClassifier(supabase, onlyEventId = n
         temperature: 0,
         maxTokens: 40,
         cacheKey: `reply_intent:${businessId}`,
-        businessId
+        businessId,
+        accountId: accountIdByCampaign.get(enrollment.campaign_id) ?? null
       })
       if (!raw) continue
 
@@ -137,7 +139,7 @@ export async function runCampaignReplyIntentClassifier(supabase, onlyEventId = n
       // Follow-up AI feedback loop: only for campaigns the Follow-up AI manages (manual campaigns stay as they are).
       if (aiManagedCampaigns.has(enrollment.campaign_id) && ['negative', 'opt_out', 'positive', 'action'].includes(label)) {
         await recordFeedback(supabase, {
-          businessId, contactId: enrollment.lead_id, campaignId: enrollment.campaign_id, label, replyText: candidate.content.text,
+          businessId, accountId: accountIdByCampaign.get(enrollment.campaign_id) ?? null, contactId: enrollment.lead_id, campaignId: enrollment.campaign_id, label, replyText: candidate.content.text,
         })
       }
 

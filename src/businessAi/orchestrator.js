@@ -27,6 +27,9 @@ export function createOrchestrator({ store, notes, embed, callModel, canAfford, 
   return async function handleChat(input, emit = () => {}) {
     const started = Date.now();
     const { businessId, userId = null } = input;
+    // The selected WhatsApp account (null = business-wide) and the request scope: tools only see that account.
+    const accountId = input.accountId ?? input.scope?.accountId ?? null;
+    const scope = input.scope ?? null;
     const message = String(input.message ?? '').trim();
     const currentText = String(input.currentText ?? '').trim().slice(0, LIMITS.currentText);
 
@@ -36,7 +39,7 @@ export function createOrchestrator({ store, notes, embed, callModel, canAfford, 
     const def = SURFACES[surface];
     const useAgent = Boolean(agent && def.agent);
 
-    if (!(await canAfford(businessId))) {
+    if (!(await canAfford(businessId, accountId))) {
       throw new UserFacingError('out_of_balance', 'Your balance is empty, so Ask HeySasa is paused. Top up to keep going.');
     }
     log('info', 'Business assistant chat started', {
@@ -61,13 +64,13 @@ export function createOrchestrator({ store, notes, embed, callModel, canAfford, 
         store.loadPreferences(businessId),
         store.loadSkills(businessId),
         notes.pinnedForPrompt(businessId),
-        def.audience === 'customer' ? store.loadPersona(businessId) : Promise.resolve(null),
+        def.audience === 'customer' ? store.loadPersona(businessId, accountId) : Promise.resolve(null),
       ]);
       if (!business) throw new UserFacingError('business_not_found', 'Business not found.');
 
       if (!conversation) {
         conversation = await store.createConversation({
-          business_id: businessId, user_id: userId, surface, context_key: input.contextKey ? String(input.contextKey).slice(0, 200) : null,
+          business_id: businessId, ...(accountId ? { account_id: accountId } : {}), user_id: userId, surface, context_key: input.contextKey ? String(input.contextKey).slice(0, 200) : null,
           context: sanitizeContext(input.context), title: message.slice(0, 60),
         });
       } else if (input.context) {
@@ -102,7 +105,7 @@ export function createOrchestrator({ store, notes, embed, callModel, canAfford, 
       const skillByKey = new Map(skills.map((s) => [s.key, s]));
       const loadedKeys = new Set([...def.skills, ...(conversation.loaded_skills ?? [])].filter((k) => skillByKey.has(k)));
       const state = {
-        businessId, conversationId: conversation.id, currency: business.currency, skills,
+        businessId, accountId, conversationId: conversation.id, currency: business.currency, skills,
         loaded: loadedKeys, newlyLoaded: new Set(), actionIds: [], emit,
         recordNote: async (text) => {
           await store.insertAction({
@@ -111,7 +114,7 @@ export function createOrchestrator({ store, notes, embed, callModel, canAfford, 
           }).catch((error) => log('warn', `note activity failed: ${error.message}`));
         },
       };
-      if (useAgent) state.agentCtx = agent.makeCtx({ businessId, userId, token: input.token ?? null, conversationId: conversation.id, emit });
+      if (useAgent) state.agentCtx = agent.makeCtx({ businessId, accountId, scope, userId, token: input.token ?? null, conversationId: conversation.id, emit });
       const runCalls = createToolRunner({ store, notes, embed, state, agent: useAgent ? agent : null, log });
 
       const loadedSkills = () => [...state.loaded].map((k) => skillByKey.get(k)).filter(Boolean);
@@ -147,7 +150,7 @@ export function createOrchestrator({ store, notes, embed, callModel, canAfford, 
           // Any text before a tool call is thrown away; show what is happening instead.
           emit({ type: 'status', text: TOOL_STATUS[calls[0]?.name] ?? agent?.registry.statusFor(calls[0]?.name) ?? 'Working on it…' });
         },
-        onUsage: (res) => Promise.resolve(billModel({ businessId, model, usage: res?.usage })).catch((error) => log('error', `billing failed: ${error.message}`)),
+        onUsage: (res) => Promise.resolve(billModel({ businessId, accountId, model, usage: res?.usage })).catch((error) => log('error', `billing failed: ${error.message}`)),
       });
       parser.finish();
 

@@ -1,6 +1,7 @@
 import { Router } from 'express'
 import { supabase } from '../supabaseClient.js'
 import { log } from '../lib/log.js'
+import { getBusinessForAccount } from '../lib/db.js'
 
 export const followupSettingsRouter = Router()
 
@@ -57,14 +58,25 @@ function toUiPrefs(row) {
   return prefs
 }
 
-// GET /settings/followup — load current prefs for this business
+// Settings are the business default (businesses columns) with per-account overrides in accounts.settings
+// (ACCOUNTS.md rule 7). With an account selected in a business that has several, Save writes that account's
+// overrides; otherwise (one account, or the business-wide view) it writes the business default.
+const writesAccountOverrides = (scope) => !!scope?.accountId && (scope.accountIds?.length ?? 0) > 1
+
+// GET /settings/followup — load current prefs (the selected account's view of them)
 followupSettingsRouter.get('/settings/followup', async (req, res) => {
   const allColumns = [...Object.values(FIELD_MAP), ...Object.values(READONLY_FIELD_MAP)]
-  const { data, error } = await supabase
-    .from('businesses')
-    .select(allColumns.join(', '))
-    .eq('business_id', req.businessId)
-    .single()
+  let data
+  let error
+  if (req.scope?.accountId) {
+    data = await getBusinessForAccount(supabase, req.businessId, req.scope.accountId)
+  } else {
+    ({ data, error } = await supabase
+      .from('businesses')
+      .select(allColumns.join(', '))
+      .eq('business_id', req.businessId)
+      .single())
+  }
 
   if (error || !data) return res.status(500).json({ error: error?.message ?? 'business_not_found' })
 
@@ -122,6 +134,21 @@ followupSettingsRouter.put('/settings/followup', async (req, res) => {
   }
 
   const row = toDbRow(prefs)
+  const scope = req.scope
+  if (scope && !scope.accountId && !scope.isAdmin) return res.status(400).json({ error: 'account_required' })
+
+  if (writesAccountOverrides(scope)) {
+    const { data: account, error: accountError } = await supabase
+      .from('accounts').select('id, settings').eq('id', scope.accountId).eq('business_id', req.businessId).maybeSingle()
+    if (accountError || !account) return res.status(500).json({ error: accountError?.message ?? 'account_not_found' })
+    const settings = { ...(account.settings && typeof account.settings === 'object' ? account.settings : {}), ...row }
+    const { error } = await supabase.from('accounts').update({ settings }).eq('id', account.id)
+    if (error) return res.status(500).json({ error: error.message })
+    const merged = await getBusinessForAccount(supabase, req.businessId, account.id)
+    log('info', 'api', 'settings.saved', `Follow-up prefs saved for account ${account.id} of business ${req.businessId}`, { business_id: req.businessId, details: { accountId: account.id } })
+    return res.json(toUiPrefs(merged ?? settings))
+  }
+
   const { data, error } = await supabase
     .from('businesses')
     .update(row)
@@ -130,6 +157,16 @@ followupSettingsRouter.put('/settings/followup', async (req, res) => {
     .single()
 
   if (error) return res.status(500).json({ error: error.message })
+
+  // A single-number business edits its default; an override left on its one account would hide the change.
+  if (scope?.accountId) {
+    const { data: account } = await supabase.from('accounts').select('id, settings').eq('id', scope.accountId).maybeSingle()
+    const settings = account?.settings && typeof account.settings === 'object' ? account.settings : {}
+    if (Object.keys(row).some(key => key in settings)) {
+      const cleaned = Object.fromEntries(Object.entries(settings).filter(([key]) => !(key in row)))
+      await supabase.from('accounts').update({ settings: cleaned }).eq('id', account.id)
+    }
+  }
 
   log('info', 'api', 'settings.saved', `Follow-up prefs saved for business ${req.businessId}`, { business_id: req.businessId })
   res.json(toUiPrefs(data))

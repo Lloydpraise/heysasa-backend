@@ -1,3 +1,4 @@
+import '../test-helpers/testEnv.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { RECOMMENDED, hoursToQuiet, followupPrefsFor, validateFollowupPrefs, toColumns, describeFollowups, describeChat, clock, daysText, prefsFromColumns } from './defaults.js';

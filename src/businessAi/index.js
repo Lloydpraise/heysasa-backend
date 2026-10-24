@@ -28,10 +28,10 @@ export function createAssistantRouterForApp() {
     onUsage: ({ businessId, model, promptTokens }) => { billEmbeddingUsage(supabase, { businessId, model, promptTokens }).catch((e) => log('error', `embedding billing failed: ${e.message}`)); },
   });
   const notes = createNotes({ store, embed, log });
-  const agent = createAgent({ supabase, store, canAfford: (businessId) => canAffordAssistant(supabase, businessId), log });
+  const agent = createAgent({ supabase, store, canAfford: (businessId, accountId) => canAffordAssistant(supabase, businessId, accountId), log });
   const handleChat = createOrchestrator({
     store, notes, embed, agent, callModel: makeStreamingModel({ apiKey }),
-    canAfford: (businessId) => canAffordAssistant(supabase, businessId),
+    canAfford: (businessId, accountId) => canAffordAssistant(supabase, businessId, accountId),
     billModel: (args) => billModelUsage(supabase, args),
     model: process.env.BUSINESS_ASSISTANT_MODEL || 'gpt-5-mini',
     effort: process.env.BUSINESS_ASSISTANT_EFFORT || 'low',

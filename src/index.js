@@ -16,9 +16,10 @@ import {
     processChatsSync,
     processChatsUpsert,
     resolveBusinessId,
+    resolveWebhookContext,
 } from './services/webhookHandler.js';
 import { attachDebugClient, debugLog, logEvent, queryLogs, getStreamClientCount } from './services/debugConsole.js';
-import { isDebugTokenValid, requireDebugToken } from './middleware/debugAuth.js';
+import { requireDebugToken } from './middleware/debugAuth.js';
 import { createAdminRouter } from './adminRoutes.js';
 import { startAlerts } from './services/alerts.js';
 // Disabled: the reconciler needs readEvolutionState/withInstanceLock/handleConfirmedDisconnect({info,...}),
@@ -49,6 +50,10 @@ import { callOpenAI } from '../followup-engine/src/lib/ai.js';
 import { checkAiBalance } from '../followup-engine/src/lib/billing.js';
 import { checkServiceStandard } from '../followup-engine/src/followupAi/serviceStandard.js';
 import { requireBusinessAuth } from './middleware/businessAuth.js';
+import { requireScope, requireBusinessAdmin, scopeOrRespond, forAccount } from './middleware/accessScope.js';
+import { scopeOrDebug } from './utils/requestScope.js';
+import { createAccountsRouter } from './accounts/routes.js';
+import * as accountsService from './services/accounts.js';
 import { evolutionRequest } from './services/evolutionConnections.js';
 
 dotenv.config();
@@ -67,7 +72,8 @@ app.use(cors({
     // X-Business-Id is sent by the analyser and persona buttons. Without it here the browser's
     // pre-flight check failed and the call never reached the server (the follow-up API on
     // port 3001 already allowed it, which is why only these buttons broke).
-    allowedHeaders: ['Content-Type', 'Authorization', 'apikey', 'X-Business-Id'],
+    // X-Account-Id: the selected WhatsApp account (ACCOUNTS.md "Requests").
+    allowedHeaders: ['Content-Type', 'Authorization', 'apikey', 'X-Business-Id', 'X-Account-Id'],
 }));
 app.use(express.json({ limit: '50mb' }));
 // CHANGED: 'public' was a path relative to whatever directory the process
@@ -278,14 +284,15 @@ function analysisStatus() {
     : { running: false, businessId: null, contactIds: [] };
 }
 
-// Latest analysis run for one business, from the database. Survives restarts
-// and carries live progress written by run-local.js.
-async function latestAnalysisRun(businessId) {
+// Latest analysis run for one business (or one of its accounts when a scope is given), from the database.
+// Survives restarts and carries live progress written by run-local.js.
+async function latestAnalysisRun(businessId, scope = null) {
     if (!businessId) return null;
-    const { data } = await supabase
+    const query = supabase
         .from('enrichment_runs')
-        .select('id, run_type, status, phase, progress_done, progress_total, started_at, finished_at, heartbeat_at, fatal_error, summary, classify_counts, structural_enriched, nlp_enriched, nlp_errored, nlp_skipped')
-        .eq('business_id', businessId)
+        .select('id, run_type, status, phase, progress_done, progress_total, started_at, finished_at, heartbeat_at, fatal_error, summary, classify_counts, structural_enriched, nlp_enriched, nlp_errored, nlp_skipped, account_id')
+        .eq('business_id', businessId);
+    const { data } = await forAccount(query, scope)
         .order('started_at', { ascending: false })
         .limit(1)
         .maybeSingle();
@@ -300,11 +307,12 @@ async function latestAnalysisRun(businessId) {
     };
 }
 
-async function analysisStatusFor(businessId) {
-    const mine = !!analysisProcess && analysisBusinessId?.businessId === businessId;
-    const run = await latestAnalysisRun(businessId);
+async function analysisStatusFor(businessId, scope = null) {
+    const mine = !!analysisProcess && analysisBusinessId?.businessId === businessId
+        && (!scope?.accountId || !analysisBusinessId?.accountId || analysisBusinessId.accountId === scope.accountId);
+    const run = await latestAnalysisRun(businessId, scope);
     const state = mine ? 'running' : (run?.status === 'completed' ? 'completed' : run?.status === 'failed' ? 'failed' : 'idle');
-    return { state, running: mine, businessId, run };
+    return { state, running: mine, businessId, accountId: scope?.accountId ?? null, run };
 }
 
 app.get('/debug/analysis/status', requireDebugToken, async (req, res, next) => {
@@ -478,48 +486,12 @@ app.post('/debug/evolution/resync/:instanceName', requireDebugToken, async (req,
     }
 });
 
-// Which business is this signed-in user talking about? Uses the one they asked for
-// (body, X-Business-Id header or query) and checks they own it. If they did not ask
-// for one, it only guesses when they own exactly one.
-async function resolveOwnedBusiness(req, email) {
-    const requested = [req.body?.businessId, req.headers['x-business-id'], req.query?.businessId]
-        .find((value) => typeof value === 'string' && value.trim());
-    if (requested) {
-        const { data, error } = await supabase.from('businesses').select('business_id')
-            .eq('business_id', requested.trim()).eq('owner_email', email).maybeSingle();
-        if (error || !data) return { error: 'business_not_owned', status: 403 };
-        return { business: data };
-    }
-    const { data, error } = await supabase.from('businesses').select('business_id').eq('owner_email', email).limit(2);
-    if (error || !data?.length) return { error: 'no_business_for_user', status: 403 };
-    if (data.length > 1) return { error: 'business_id_required', status: 400 };
-    return { business: data[0] };
-}
-
+// Signed-in users go through the shared scope (owner, admin, or a team member on their account; ACCOUNTS.md);
+// the debug console uses DEBUG_TOKEN. The analysis runs on the selected account, or on every account of the
+// business one after the other for the business-wide view (run-local.js does that loop).
 async function startAnalysis(req, res) {
-    const authHeader = req.headers.authorization || '';
-    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : null;
-    const debugAuthorized = isDebugTokenValid(req);
-    if (!token && !debugAuthorized) {
-        res.status(401).json({ ok: false, error: 'missing_auth_token' });
-        return;
-    }
-
-    let ownedBusiness = null;
-    if (!debugAuthorized) {
-        const { data: userData, error: userError } = await supabase.auth.getUser(token);
-        if (userError || !userData?.user?.email) {
-            res.status(401).json({ ok: false, error: 'invalid_auth_token' });
-            return;
-        }
-
-        const resolved = await resolveOwnedBusiness(req, userData.user.email);
-        if (resolved.error) {
-            res.status(resolved.status).json({ ok: false, error: resolved.error });
-            return;
-        }
-        ownedBusiness = resolved.business;
-    }
+    const scope = await scopeOrDebug(req, res);
+    if (!scope) return;
 
     if (analysisProcess) {
         res.status(409).json({ ok: false, message: 'Analysis is already running', ...analysisStatus() });
@@ -527,15 +499,10 @@ async function startAnalysis(req, res) {
     }
 
     const projectRoot = fileURLToPath(new URL('../', import.meta.url));
-    const businessId = typeof req.body?.businessId === 'string' && req.body.businessId.trim()
-        ? req.body.businessId.trim()
-        : ownedBusiness?.business_id;
-    if (!businessId) {
-        res.status(400).json({ ok: false, error: 'missing_business_id' });
-        return;
-    }
-    if (!debugAuthorized && businessId !== ownedBusiness.business_id) {
-        res.status(403).json({ ok: false, error: 'business_not_owned' });
+    const businessId = scope.businessId;
+    const accountId = scope.accountId;
+    if (!scope.isAdmin && !accountId) {
+        res.status(400).json({ ok: false, error: 'account_required' });
         return;
     }
 
@@ -554,11 +521,11 @@ async function startAnalysis(req, res) {
     }
 
     if (contactIds.length > 0) {
-        const { data: contacts, error: contactsError } = await supabase
+        const { data: contacts, error: contactsError } = await forAccount(supabase
             .from('contacts')
             .select('id')
             .eq('business_id', businessId)
-            .in('id', contactIds);
+            .in('id', contactIds), scope);
         if (contactsError) {
             res.status(500).json({ ok: false, error: contactsError.message });
             return;
@@ -570,14 +537,15 @@ async function startAnalysis(req, res) {
         }
     }
 
-    analysisBusinessId = { businessId, contactIds };
-    debugLog('info', 'Analysis worker', 'Starting run-local.js', { projectRoot, businessId, contactIds });
+    analysisBusinessId = { businessId, accountId, contactIds };
+    debugLog('info', 'Analysis worker', 'Starting run-local.js', { projectRoot, businessId, accountId, contactIds });
     analysisProcess = spawn(process.execPath, ['run-local.js'], {
         cwd: projectRoot,
         env: {
             ...process.env,
             ANALYSIS_CONFIG: JSON.stringify({
                 businessId, contactIds,
+                ...(accountId ? { accountId } : {}),
                 // Setup bundles only (booleans, nothing else is forwarded).
                 ...(req.body?.discoverProducts === true ? { discoverProducts: true } : {}),
                 ...(req.body?.productsTextOnly === true ? { productsTextOnly: true } : {}),
@@ -631,22 +599,11 @@ app.post('/analysis/start', (req, res, next) => {
 
 app.get('/analysis/status', async (req, res, next) => {
     try {
-        const token = req.headers.authorization?.startsWith('Bearer ')
-            ? req.headers.authorization.slice(7).trim()
-            : null;
-        if (!token) return res.status(401).json({ ok: false, error: 'missing_auth_token' });
+        const scope = await scopeOrRespond(req, res);
+        if (!scope) return undefined;
 
-        const { data: userData, error: userError } = await supabase.auth.getUser(token);
-        if (userError || !userData?.user?.email) {
-            return res.status(401).json({ ok: false, error: 'invalid_auth_token' });
-        }
-
-        const resolved = await resolveOwnedBusiness(req, userData.user.email);
-        if (resolved.error) return res.status(resolved.status).json({ ok: false, error: resolved.error });
-        const ownedBusiness = resolved.business;
-
-        // Business-level: only ever this owner's business, never another's run.
-        const status = await analysisStatusFor(ownedBusiness.business_id);
+        // Only ever this user's business (and the selected account), never another's run.
+        const status = await analysisStatusFor(scope.businessId, scope);
         return res.json({ ...status, contactIds: status.running ? analysisBusinessId.contactIds : [] });
     } catch (error) {
         return next(error);
@@ -670,10 +627,19 @@ app.use('/handoff', handoff.router);
 app.use(createLeadDraftRouter({
     auth: requireBusinessAuth,
     supabase,
-    callModel: ({ systemPrompt, userContent, businessId }) => callOpenAI({ systemPrompt, userContent, businessId, purpose: 'follow_up_generator', maxTokens: 300, cacheKey: `lead-draft:${businessId}` }),
-    canAfford: (businessId) => checkAiBalance(supabase, businessId),
+    callModel: ({ systemPrompt, userContent, businessId, accountId }) => callOpenAI({ systemPrompt, userContent, businessId, accountId, purpose: 'follow_up_generator', maxTokens: 300, cacheKey: `lead-draft:${businessId}` }),
+    canAfford: (businessId, accountId) => checkAiBalance(supabase, businessId, accountId),
     check: (text, ctx) => checkServiceStandard(text, ctx),
     log: (level, event, details = {}) => logEvent({ level, area: 'leads', event, message: event, business_id: details.businessId ?? null, contact_id: details.leadId ?? null, details }),
+}));
+// Accounts (one per WhatsApp number) and the team: who may open which account. See ACCOUNTS.md.
+app.use(createAccountsRouter({
+    scope: requireScope,
+    admin: requireBusinessAdmin,
+    db: supabase,
+    accounts: accountsService,
+    appUrl: process.env.APP_URL || '',
+    log: (level, event, details = {}) => logEvent({ level, area: 'accounts', event, message: event, business_id: details.businessId ?? null, entity_id: details.accountId ?? null, details }),
 }));
 // WhatsApp (Evolution) calls from the dashboard. The Evolution key stays on the server; owners only reach their own instances.
 app.use('/wa', createWhatsAppProxyRouter({
@@ -855,14 +821,16 @@ app.post('/webhook/evolution', async (req, res) => {
     logEvent({ level: 'info', area: 'webhook', event: 'webhook.received', message: `Evolution event: ${eventType || 'unknown'}`, details: requestMeta });
 
     let businessId;
+    let accountId = null;
     try {
-        businessId = await resolveBusinessId(req.body);
+        ({ businessId, accountId } = await resolveWebhookContext(req.body));
     } catch (error) {
         logEvent({ level: 'error', area: 'webhook', event: 'webhook.unknown_instance', message: error.message, details: requestMeta });
         res.status(400).json({ ok: false, error: error.message });
         return;
     }
     requestMeta.businessId = businessId;
+    requestMeta.accountId = accountId;
     if (normalizedEventType === 'connection.update') {
         // So a failed connection update can be diagnosed from processing_failed alone.
         requestMeta.connectionState = req.body?.data?.state ?? null;
@@ -882,27 +850,27 @@ app.post('/webhook/evolution', async (req, res) => {
             case 'messaging-history.set':
             case 'messaging.history.set':
             case 'messages.set':
-                await processHistorySync(req.body, businessId);
+                await processHistorySync(req.body, businessId, accountId);
                 logEvent({ level: 'ok', area: 'ingest', event: 'webhook.history_sync', message: 'History sync completed', business_id: businessId, duration_ms: Date.now() - startedAt });
                 break;
             case 'messages.upsert':
                 // Evolution sends a single message object as `data` for this
                 // event (confirmed via a live payload) — processLiveMessage
                 // normalizes single-object vs array internally.
-                await processLiveMessage(req.body?.data, businessId);
+                await processLiveMessage(req.body?.data, businessId, accountId);
                 logEvent({ level: 'ok', area: 'ingest', event: 'webhook.live_message', message: 'Live message processed', business_id: businessId, duration_ms: Date.now() - startedAt });
                 break;
             case 'messages.update':
-                await processMessageStatusUpdate(req.body, businessId);
+                await processMessageStatusUpdate(req.body, businessId, accountId);
                 logEvent({ level: 'ok', area: 'ingest', event: 'webhook.message_status', message: 'Message status processed', business_id: businessId, duration_ms: Date.now() - startedAt });
                 break;
             case 'presence.update':
-                await processPresenceUpdate(req.body, businessId);
+                await processPresenceUpdate(req.body, businessId, accountId);
                 logEvent({ level: 'debug', area: 'ingest', event: 'webhook.presence', message: 'Presence processed', business_id: businessId, duration_ms: Date.now() - startedAt });
                 break;
             case 'connection.update':
                 {
-                    const connectionInfo = await processConnectionUpdate(req.body, businessId);
+                    const connectionInfo = await processConnectionUpdate(req.body, businessId, accountId);
                     // A confirmed disconnect is logged (warn, with the reason) inside
                     // processConnectionUpdate, so this ok line is for everything else.
                     if (connectionInfo?.outcome !== 'disconnect') {
@@ -912,19 +880,19 @@ app.post('/webhook/evolution', async (req, res) => {
                 }
                 break;
             case 'contacts.set':
-                await processContactsSync(req.body, businessId);
+                await processContactsSync(req.body, businessId, accountId);
                 logEvent({ level: 'ok', area: 'ingest', event: 'webhook.contacts_sync', message: 'Contacts sync completed', business_id: businessId, duration_ms: Date.now() - startedAt });
                 break;
             case 'contacts.upsert':
-                await processContactsUpsert(req.body, businessId);
+                await processContactsUpsert(req.body, businessId, accountId);
                 logEvent({ level: 'ok', area: 'ingest', event: 'webhook.contact_upsert', message: 'Contact upsert completed', business_id: businessId, duration_ms: Date.now() - startedAt });
                 break;
             case 'chats.set':
-                await processChatsSync(req.body, businessId);
+                await processChatsSync(req.body, businessId, accountId);
                 logEvent({ level: 'ok', area: 'ingest', event: 'webhook.chats_sync', message: 'Chats sync completed', business_id: businessId, duration_ms: Date.now() - startedAt });
                 break;
             case 'chats.upsert':
-                await processChatsUpsert(req.body, businessId);
+                await processChatsUpsert(req.body, businessId, accountId);
                 logEvent({ level: 'ok', area: 'ingest', event: 'webhook.chat_upsert', message: 'Chat upsert completed', business_id: businessId, duration_ms: Date.now() - startedAt });
                 break;
             default:

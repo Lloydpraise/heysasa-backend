@@ -1,5 +1,17 @@
 // Settings: follow-up preferences, business details, and the chat AI switch. Same limits as the Preferences page.
 import { ToolError, asText, must } from '../helpers.js';
+import { loadAccountSettings } from '../../../services/accounts.js';
+import { saveAccountSettings } from '../../../services/accountSettings.js';
+import { loadActivePack } from '../../../personaPack.js';
+
+// Follow-up and chat AI settings are per WhatsApp account (ACCOUNTS.md rule 7): read the account's view (business
+// default + accounts.settings) and save through saveAccountSettings (accounts.settings when the business has several
+// numbers, else the business row). Business details stay on the business, and only owners and admins change them.
+export const readSettings = (ctx) => loadAccountSettings(ctx.db, ctx.accountId ?? null, ctx.businessId);
+// The same, shaped like a query result ({ data, error }) for Promise.all lists that use must().
+export const settingsResult = (ctx) => readSettings(ctx).then((data) => ({ data, error: null }), (error) => ({ data: null, error }));
+const writeSettings = (ctx, row) => saveAccountSettings(ctx.db, ctx.scope?.businessId ? ctx.scope : { businessId: ctx.businessId, accountId: ctx.accountId ?? null }, row);
+const requireAdmin = (ctx) => { if (ctx.scope && ctx.scope.isAdmin === false) throw new ToolError('Only the owner or an admin can change the business details.'); };
 
 // Keep in sync with FIELD_MAP in src/followupSettingsRoutes.js.
 export const FOLLOWUP_FIELDS = {
@@ -62,7 +74,7 @@ const get_settings = {
   description: 'Current settings: follow-up preferences (with what each means), the business details, and the chat AI switch and daily limit.',
   parameters: { type: 'object', properties: {}, additionalProperties: false },
   async run(ctx) {
-    const b = must(await ctx.db.from('businesses').select('*').eq('business_id', ctx.businessId).maybeSingle(), 'business');
+    const b = await readSettings(ctx);
     if (!b) throw new ToolError('I could not load the settings.');
     return {
       followups: Object.fromEntries(Object.entries(FOLLOWUP_FIELDS).map(([k, f]) => [k, { meaning: f.label, value: b[f.col] ?? null }])),
@@ -75,7 +87,7 @@ const get_settings = {
 };
 
 async function currentRow(ctx, cols) {
-  const full = must(await ctx.db.from('businesses').select('*').eq('business_id', ctx.businessId).maybeSingle(), 'business');
+  const full = await readSettings(ctx);
   if (!full) throw new ToolError('I could not load the settings.');
   return Object.fromEntries(cols.map((c) => [c, full[c] ?? null]));
 }
@@ -100,11 +112,11 @@ const set_followup_settings = {
     const changes = cleanFollowup(params.changes);
     const cols = Object.keys(changes).map((k) => FOLLOWUP_FIELDS[k].col);
     const before = await currentRow(ctx, cols);
-    must(await ctx.db.from('businesses').update(Object.fromEntries(Object.entries(changes).map(([k, v]) => [FOLLOWUP_FIELDS[k].col, v]))).eq('business_id', ctx.businessId), 'save settings');
+    await writeSettings(ctx, Object.fromEntries(Object.entries(changes).map(([k, v]) => [FOLLOWUP_FIELDS[k].col, v])));
     return { summary: `Changed ${Object.keys(changes).length === 1 ? FOLLOWUP_FIELDS[Object.keys(changes)[0]].label.toLowerCase() : `${Object.keys(changes).length} follow-up settings`}.`, result: { keys: Object.keys(changes) }, before };
   },
   async undo(ctx, action) {
-    must(await ctx.db.from('businesses').update(action.before).eq('business_id', ctx.businessId), 'undo settings');
+    await writeSettings(ctx, action.before);
     return { summary: 'Put the settings back.' };
   },
 };
@@ -115,6 +127,7 @@ const set_business_info = {
   parameters: { type: 'object', properties: Object.fromEntries(Object.keys(BUSINESS_FIELDS).map((k) => [k, { type: 'string' }])), additionalProperties: false },
   status: 'Getting that ready…',
   async plan(ctx, args) {
+    requireAdmin(ctx);
     const patch = {};
     for (const key of Object.keys(BUSINESS_FIELDS)) if (args[key] !== undefined) patch[key] = asText(args[key]).slice(0, 200);
     if ('name' in patch && patch.name.length < 2) throw new ToolError('The business name is too short.');
@@ -125,6 +138,7 @@ const set_business_info = {
     return { title: 'Change business details', params: { patch: Object.fromEntries(changed) }, preview: { headline: 'Business details', changes: changed.map(([k, v]) => ({ label: BUSINESS_FIELDS[k], from: now[k] || 'not set', to: v })) } };
   },
   async execute(ctx, params) {
+    requireAdmin(ctx);
     const before = await currentRow(ctx, Object.keys(params.patch));
     must(await ctx.db.from('businesses').update(params.patch).eq('business_id', ctx.businessId), 'save business');
     return { summary: 'Updated your business details.', result: { keys: Object.keys(params.patch) }, before };
@@ -149,7 +163,10 @@ const set_chat_ai = {
     const now = await currentRow(ctx, [...Object.keys(patch), 'chat_ai_daily_cap', 'persona_pack_status']);
     const nextCap = patch.chat_ai_daily_cap ?? now.chat_ai_daily_cap ?? 0;
     if (patch.chat_ai_enabled === true && nextCap <= 0) throw new ToolError('The chat AI needs a daily limit above 0 to answer anyone. Tell me a limit, like 30 chats a day.');
-    if (patch.chat_ai_enabled === true && now.persona_pack_status !== 'ready') throw new ToolError('The persona pack is not ready yet, so the AI would not know how to talk like the business. Build that first.');
+    // A pack the account can use (its own, or the business-wide fallback) counts as ready.
+    const hasPack = now.persona_pack_status === 'ready'
+      || (patch.chat_ai_enabled === true && Boolean((await loadActivePack(ctx.db, ctx.businessId, ctx.accountId ?? null, 'id').catch(() => ({ row: null }))).row));
+    if (patch.chat_ai_enabled === true && !hasPack) throw new ToolError('The persona pack is not ready yet, so the AI would not know how to talk like the business. Build that first.');
     const lines = [];
     if ('chat_ai_enabled' in patch) lines.push({ label: 'Answers customers by itself', from: now.chat_ai_enabled ? 'on' : 'off', to: patch.chat_ai_enabled ? 'on' : 'off' });
     if ('chat_ai_daily_cap' in patch) lines.push({ label: 'Chats per day', from: String(now.chat_ai_daily_cap ?? 0), to: String(patch.chat_ai_daily_cap) });
@@ -158,12 +175,12 @@ const set_chat_ai = {
   },
   async execute(ctx, params) {
     const before = await currentRow(ctx, Object.keys(params.patch));
-    must(await ctx.db.from('businesses').update(params.patch).eq('business_id', ctx.businessId), 'save chat ai');
+    await writeSettings(ctx, params.patch);
     const on = params.patch.chat_ai_enabled;
     return { summary: on === true ? 'Turned the chat AI on.' : on === false ? 'Turned the chat AI off.' : 'Updated the chat AI limits.', result: { keys: Object.keys(params.patch) }, before };
   },
   async undo(ctx, action) {
-    must(await ctx.db.from('businesses').update(action.before).eq('business_id', ctx.businessId), 'undo chat ai');
+    await writeSettings(ctx, action.before);
     return { summary: 'Put the chat AI back as it was.' };
   },
 };

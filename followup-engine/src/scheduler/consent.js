@@ -1,4 +1,4 @@
-import { getBusiness, getPersonaPack, getConversation, getMessages } from '../lib/db.js'
+import { getBusinessForAccount, getPersonaPack, getConversation, getMessages } from '../lib/db.js'
 import { callBot } from '../lib/ai.js'
 import { checkSendBalance, checkAiBalance, flagInsufficientFunds } from '../lib/billing.js'
 import { CONSENT_FALLBACK } from './prompts.js'
@@ -23,7 +23,7 @@ export async function runConsent(supabase) {
 
   const { data: contacts } = await supabase
     .from('contacts')
-    .select('id, name, phone, business_id, lead_state')
+    .select('id, name, phone, business_id, account_id, lead_state')
     .eq('follow_up_opted_in', false)
     .eq('do_not_contact', false)
     .is('consent_message_sent_at', null)
@@ -36,16 +36,18 @@ export async function runConsent(supabase) {
   let queued = 0
   for (const contact of contacts) {
     try {
-      const business = await getBusiness(supabase, contact.business_id)
+      // The contact's account: its settings, its wallet (on separate billing) and its persona pack.
+      const accountId = contact.account_id ?? null
+      const business = await getBusinessForAccount(supabase, contact.business_id, accountId)
       if (!business?.followup_ai_enabled || !business?.subscription_active) continue
 
-      // A consent message is AI-written (USD) and then sent (KES): both wallets must be able to pay.
-      if (!(await checkSendBalance(supabase, contact.business_id)) || !(await checkAiBalance(supabase, contact.business_id))) {
-        await flagInsufficientFunds(supabase, contact.business_id)
+      // A consent message is AI-written (USD) and then sent (KES): the wallet must be able to pay for both.
+      if (!(await checkSendBalance(supabase, contact.business_id, accountId)) || !(await checkAiBalance(supabase, contact.business_id, accountId))) {
+        await flagInsufficientFunds(supabase, contact.business_id, accountId)
         continue
       }
 
-      const pack = await getPersonaPack(supabase, contact.business_id)
+      const pack = await getPersonaPack(supabase, contact.business_id, accountId)
       if (!pack) continue
 
       const conv = await getConversation(supabase, contact.id, contact.business_id)
@@ -63,11 +65,12 @@ export async function runConsent(supabase) {
         `Recent conversation:\n${snippet}`
       ].join('\n\n')
 
-      const message = await callBot(supabase, 'consent_generator', userContent, CONSENT_FALLBACK, { businessId: contact.business_id })
+      const message = await callBot(supabase, 'consent_generator', userContent, CONSENT_FALLBACK, { businessId: contact.business_id, accountId })
       if (!message) continue
 
       await supabase.from('follow_up_queue').insert({
         business_id: contact.business_id,
+        ...(accountId ? { account_id: accountId } : {}),
         contact_id: contact.id,
         conversation_id: conv.id,
         sequence_step: 0,

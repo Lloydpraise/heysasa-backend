@@ -17,9 +17,10 @@ const handle = createOrchestrator({
   log: debugLog,
 });
 
-// Called by the webhook after an incoming message is saved. Must never throw into the webhook.
+// Called by the webhook after an incoming message is saved: { businessId, accountId, conversationId, contactId, message }.
+// accountId may be missing (older callers); the orchestrator then takes it from the conversation. Must never throw into the webhook.
 export function triggerChatAi(input) {
   handle(input).catch((error) => {
-    debugLog('error', 'Chat AI', 'Chat AI could not process a message', { businessId: input.businessId, error: error.message });
+    debugLog('error', 'Chat AI', 'Chat AI could not process a message', { businessId: input.businessId, accountId: input.accountId ?? null, error: error.message });
   });
 }

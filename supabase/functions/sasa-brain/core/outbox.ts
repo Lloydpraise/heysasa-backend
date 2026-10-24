@@ -7,7 +7,8 @@
 
 import type { SendItem, SendResult } from './builtin.ts';
 
-export type OutboxTarget = { businessId: string; conversationId: string; contactId: number };
+// accountId: the WhatsApp number the reply goes out on. The sender uses that account's instance (accounts.instance_name).
+export type OutboxTarget = { businessId: string; accountId?: string | null; conversationId: string; contactId: number };
 export type OutboxOptions = { timeoutMs?: number };
 export type Queued = { ids: string[]; idBySeq: Map<number, string>; count: number };
 
@@ -16,7 +17,7 @@ export async function enqueue(
   db: any, target: OutboxTarget, items: SendItem[],
 ): Promise<{ ok: true; queued: Queued } | { ok: false; error: string }> {
   const rows = items.map((item, seq) => ({
-    business_id: target.businessId, conversation_id: target.conversationId, contact_id: target.contactId, seq,
+    business_id: target.businessId, ...(target.accountId ? { account_id: target.accountId } : {}), conversation_id: target.conversationId, contact_id: target.contactId, seq,
     kind: item.media ? 'image' : 'text', text: item.media ? null : (item.text ?? ''), media: item.media ?? null,
   }));
   const { data: inserted, error } = await db.from('chat_ai_outbox').insert(rows).select('id, seq');

@@ -1,3 +1,4 @@
+import '../../test-helpers/testEnv.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createAgent } from './index.js';
@@ -309,8 +310,11 @@ test('set_followup_settings: validated, shows before and after, undo restores', 
 test('set_chat_ai: will not switch on without a daily limit or a ready persona pack', async () => {
   const t = setup();
   await assert.rejects(() => t.propose('set_chat_ai', { enabled: true }), /daily limit above 0/);
+  // Not ready = no 'ready' status AND no active pack the account could use (its own or the business-wide one).
   t.db.tables.businesses[0].persona_pack_status = 'pending';
+  t.db.tables.persona_packs[0].is_active = false;
   await assert.rejects(() => t.propose('set_chat_ai', { enabled: true, daily_cap: 20 }), /persona pack is not ready/);
+  t.db.tables.persona_packs[0].is_active = true;
   t.db.tables.businesses[0].persona_pack_status = 'ready';
   const { action } = await t.propose('set_chat_ai', { enabled: true, daily_cap: 20 });
   await t.agent.engine.approve(t.ctx, action.id);

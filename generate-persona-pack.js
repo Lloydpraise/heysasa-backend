@@ -20,6 +20,8 @@ import {
     squash, redact, isLowValueVoiceMessage, capPerConversation, phraseSupport,
     validateObjectionEntries, cleanTriggers,
 } from './src/personaHelpers.js';
+import { savePackVersion } from './src/personaPack.js';
+import { saveAccountSettings } from './src/services/accountSettings.js';
 
 dotenv.config();
 
@@ -45,6 +47,15 @@ try {
 // (which read it off the request header/body), falling back to a plain env
 // var for manual/local runs (`BUSINESS_ID=lashesbyshazz node generate-persona-pack.js`).
 const BUSINESS_ID = requestedConfig.businessId || process.env.BUSINESS_ID || null;
+// Each WhatsApp account gets its own pack, built from its own chats (ACCOUNTS.md rule 8). PERSONA_CONFIG.accountIds
+// (or ACCOUNT_ID) names the accounts; several are generated one after the other by running this script once per
+// account (see runPerAccount). With none, every account of the business is generated; a business with no account
+// gets a business-wide pack (account_id null), as before.
+const REQUESTED_ACCOUNT_IDS = Array.isArray(requestedConfig.accountIds) ? requestedConfig.accountIds.filter(Boolean)
+    : (requestedConfig.accountId ? [requestedConfig.accountId] : (process.env.ACCOUNT_ID ? [process.env.ACCOUNT_ID] : []));
+let ACCOUNT_ID = REQUESTED_ACCOUNT_IDS.length === 1 ? REQUESTED_ACCOUNT_IDS[0] : null;
+// Narrows a query on an account-scoped table to this run's account.
+const onAccount = (query) => (ACCOUNT_ID ? query.eq('account_id', ACCOUNT_ID) : query);
 const FORCE = requestedConfig.force === true || process.env.PERSONA_FORCE === 'true';
 
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4.1-mini';
@@ -114,13 +125,14 @@ async function startRun() {
     RUN_ID = crypto.randomUUID();
     try {
         const cutoff = new Date(Date.now() - 6 * 3600000).toISOString();
-        await supabase.from('enrichment_runs')
+        await onAccount(supabase.from('enrichment_runs')
             .update({ status: 'failed', finished_at: new Date().toISOString(), fatal_error: 'stale: process ended without finishing' })
-            .eq('run_type', 'persona_pack').eq('business_id', BUSINESS_ID).eq('status', 'running').lt('started_at', cutoff);
+            .eq('run_type', 'persona_pack').eq('business_id', BUSINESS_ID).eq('status', 'running').lt('started_at', cutoff));
         await supabase.from('enrichment_runs').insert({
             id: RUN_ID,
             run_type: 'persona_pack',
             business_id: BUSINESS_ID,
+            ...(ACCOUNT_ID ? { account_id: ACCOUNT_ID } : {}),
             started_at: new Date().toISOString(),
             status: 'running'
         });
@@ -265,7 +277,7 @@ async function callOpenAI(systemPrompt, userPrompt, { json = true, maxTokens = 9
             const usage = body.usage || {};
             // Billed the moment OpenAI answers (a response that later fails to parse is still charged).
             await billAiUsage(supabase, {
-                businessId: BUSINESS_ID, runner: 'persona_pack_generator', runId: RUN_ID,
+                businessId: BUSINESS_ID, accountId: ACCOUNT_ID, runner: 'persona_pack_generator', runId: RUN_ID,
                 model: promptConfig?.model ?? OPENAI_MODEL,
                 promptTokens: usage.prompt_tokens || 0,
                 cachedTokens: usage.prompt_tokens_details?.cached_tokens || 0,
@@ -360,17 +372,23 @@ async function loadBusiness() {
     if (error) throw new Error(`Business lookup failed: ${error.message}`);
     if (!business) throw new Error(`No business found for business_id ${BUSINESS_ID}`);
 
+    // The account's own status (accounts.settings overrides the business column, ACCOUNTS.md rule 7).
+    if (ACCOUNT_ID) {
+        const { data: account } = await supabase.from('accounts').select('settings').eq('id', ACCOUNT_ID).maybeSingle();
+        if (account?.settings && 'persona_pack_status' in account.settings) business.persona_pack_status = account.settings.persona_pack_status;
+    }
+
     if (business.persona_pack_status === 'running' && !FORCE) {
         // Only refuse if another persona run is genuinely alive; a crashed run must not block forever.
-        const { data: others } = await supabase.from('enrichment_runs')
+        const { data: others } = await onAccount(supabase.from('enrichment_runs')
             .select('id, started_at, heartbeat_at')
-            .eq('run_type', 'persona_pack').eq('business_id', BUSINESS_ID).eq('status', 'running').neq('id', RUN_ID);
+            .eq('run_type', 'persona_pack').eq('business_id', BUSINESS_ID).eq('status', 'running').neq('id', RUN_ID));
         const alive = (others || []).find(r => Date.now() - new Date(r.heartbeat_at || r.started_at).getTime() < 15 * 60 * 1000);
         if (alive) throw new Error(`A persona pack run is already in progress for ${BUSINESS_ID}.`);
         warn('System', `persona_pack_status was 'running' but no live run exists (previous run crashed) — continuing.`);
     }
 
-    await supabase.from('businesses').update({ persona_pack_status: 'running' }).eq('business_id', BUSINESS_ID);
+    await saveStatus({ persona_pack_status: 'running' });
     return business;
 }
 
@@ -378,9 +396,9 @@ async function loadBusiness() {
 // The latest COMPLETED full analyser run for this business. Runs from the old
 // analyser have no summary and therefore never count as ready.
 async function getAnalysisReadiness() {
-    const { data: run, error } = await supabase.from('enrichment_runs')
+    const { data: run, error } = await onAccount(supabase.from('enrichment_runs')
         .select('id, finished_at, summary')
-        .eq('business_id', BUSINESS_ID).eq('run_type', 'full_pass').eq('status', 'completed')
+        .eq('business_id', BUSINESS_ID).eq('run_type', 'full_pass').eq('status', 'completed'))
         .not('summary', 'is', null)
         .order('finished_at', { ascending: false }).limit(1).maybeSingle();
     if (error || !run) return { ready: false, reason: 'no_completed_analysis' };
@@ -391,9 +409,9 @@ async function getAnalysisReadiness() {
 }
 
 async function findLiveAnalysisRun() {
-    const { data } = await supabase.from('enrichment_runs')
+    const { data } = await onAccount(supabase.from('enrichment_runs')
         .select('id, started_at, heartbeat_at, phase, progress_done, progress_total')
-        .eq('business_id', BUSINESS_ID).in('run_type', ['full_pass', 'contact_pass']).eq('status', 'running')
+        .eq('business_id', BUSINESS_ID).in('run_type', ['full_pass', 'contact_pass']).eq('status', 'running'))
         .order('started_at', { ascending: false }).limit(5);
     return (data || []).find(r => Date.now() - new Date(r.heartbeat_at || r.started_at).getTime() < LIVE_WINDOW_MS) || null;
 }
@@ -420,7 +438,7 @@ function runAnalyser() {
         const script = fileURLToPath(new URL('./run-local.js', import.meta.url));
         const child = spawn(process.execPath, [script], {
             cwd: path.dirname(script),
-            env: { ...process.env, ANALYSIS_CONFIG: JSON.stringify({ businessId: BUSINESS_ID }) },
+            env: { ...process.env, ANALYSIS_CONFIG: JSON.stringify({ businessId: BUSINESS_ID, ...(ACCOUNT_ID ? { accountId: ACCOUNT_ID } : {}) }) },
             stdio: ['ignore', 'pipe', 'pipe']
         });
         for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, () => { try { child.kill(); } catch {} });
@@ -492,9 +510,9 @@ async function getBusinessScope() {
     if (scopeCache) return scopeCache;
 
     const contacts = await fetchAllPages((from, to) =>
-        supabase.from('contacts')
+        onAccount(supabase.from('contacts')
             .select('id, analysis_version')
-            .eq('business_id', BUSINESS_ID)
+            .eq('business_id', BUSINESS_ID))
             .eq('lead_type', 'business')   // analyser v3: 'business' = a real customer or prospect; vendor/staff/personal/junk are separate types
             .order('id')
             .range(from, to));
@@ -504,9 +522,9 @@ async function getBusinessScope() {
     let businessConvs = [];
     for (const batch of chunk(businessContactIds, 300)) {
         const rows = await fetchAllPages((from, to) =>
-            supabase.from('conversations')
+            onAccount(supabase.from('conversations')
                 .select('id, contact_id')
-                .eq('business_id', BUSINESS_ID)
+                .eq('business_id', BUSINESS_ID))
                 .eq('is_business_chat', true)
                 .in('contact_id', batch)
                 .order('id')
@@ -695,23 +713,26 @@ async function buildPersonaSection(sampledMessages, businessName, corpus, pool =
 // ─── Step 3: business_context — mostly hard facts, not chat-mined ─────────────
 // Only products the owner approved and left visible to the AI. Discovered (unreviewed) and
 // dismissed ones are never used. If the products migration has not been run yet, fall back to the old query.
+// The account's own products plus the business catalog (account_id null).
+const ownOrShared = (query) => (ACCOUNT_ID ? query.or(`account_id.eq.${ACCOUNT_ID},account_id.is.null`) : query);
+
 async function fetchProducts() {
     try {
         return await fetchAllPages((from, to) =>
-            supabase.from('products')
+            ownOrShared(supabase.from('products')
                 .select('title, description_short, price, key_features, aliases, type, category')
                 .eq('business_id', BUSINESS_ID)
                 .eq('status', 'approved')
-                .eq('ai_visible', true)
+                .eq('ai_visible', true))
                 .range(from, to));
     } catch (e) {
         if (!/column .* does not exist|42703/i.test(`${e?.code} ${e?.message}`)) throw e;
         warn('Context', 'products.status / ai_visible not found. Run migration 20261003000000_products_discovery.sql. Using all visible products for now.');
         return fetchAllPages((from, to) =>
-            supabase.from('products')
+            ownOrShared(supabase.from('products')
                 .select('title, description_short, price, key_features')
                 .eq('business_id', BUSINESS_ID)
-                .eq('is_visible', true)
+                .eq('is_visible', true))
                 .range(from, to));
     }
 }
@@ -998,38 +1019,29 @@ function normalizePack(pack) {
 
 // ─── Save + status handling ─────────────────────────────────────────────────────
 async function savePack(pack) {
-    const { data: current } = await supabase
-        .from('persona_packs')
-        .select('id, version')
-        .eq('business_id', BUSINESS_ID)
-        .eq('is_active', true)
-        .maybeSingle();
-
-    const nextVersion = (current?.version || 0) + 1;
-
-    if (current) {
-        await supabase.from('persona_packs').update({ is_active: false }).eq('id', current.id);
-    }
-
-    const { error } = await supabase.from('persona_packs').insert({
-        business_id: BUSINESS_ID,
-        version: nextVersion,
-        pack,
-        is_active: true,
-        generated_by: 'persona_pack_generator',
-        generated_at: new Date().toISOString()
-    });
-    if (error) throw new Error(`Saving persona_packs failed: ${error.message}`);
+    // A new active version of this account's pack (or the business-wide pack when there is no account).
+    const saved = await savePackVersion(supabase, { businessId: BUSINESS_ID, accountId: ACCOUNT_ID, pack, generatedBy: 'persona_pack_generator' })
+        .catch((error) => { throw new Error(`Saving persona_packs failed: ${error.message}`); });
 
     // businesses.persona_pack_status has a CHECK constraint allowing only
     // pending/running/ready/failed — matches the same enum scrape_status
     // already uses. 'ready' is the generated-and-active state.
-    await supabase.from('businesses').update({
+    await saveStatus({
         persona_pack_status: 'ready',
         persona_pack_last_run_at: new Date().toISOString()
-    }).eq('business_id', BUSINESS_ID);
+    });
 
-    return nextVersion;
+    return saved.version;
+}
+
+// Persona status lives on the business row for a single-number business, and in accounts.settings for an
+// account of a business with several numbers (see src/services/accountSettings.js).
+async function saveStatus(row) {
+    try {
+        await saveAccountSettings(supabase, { businessId: BUSINESS_ID, accountId: ACCOUNT_ID }, row);
+    } catch (e) {
+        warn('Status', `Could not save persona status: ${e.message}`);
+    }
 }
 
 // Not enough clean history yet — rather than invent a status value the
@@ -1038,21 +1050,47 @@ async function savePack(pack) {
 // actual reason ("insufficient_data") is recorded on enrichment_runs.status
 // (free text, see finishRun) and in the console/@@LOG output, not here.
 async function saveInsufficientData() {
-    await supabase.from('businesses').update({
+    await saveStatus({
         persona_pack_status: 'pending',
         persona_pack_last_run_at: new Date().toISOString()
-    }).eq('business_id', BUSINESS_ID);
+    });
 }
 
 async function saveFailed() {
-    try {
-        await supabase.from('businesses').update({ persona_pack_status: 'failed' }).eq('business_id', BUSINESS_ID);
-    } catch { /* best effort */ }
+    await saveStatus({ persona_pack_status: 'failed' });
+}
+
+// Several accounts: run this script once per account, one after the other, and exit with the combined result.
+// Returns false when this process should generate itself (one account, or none: the business-wide pack).
+async function runPerAccount() {
+    let ids = REQUESTED_ACCOUNT_IDS;
+    if (!ids.length) {
+        const { data, error } = await supabase.from('accounts').select('id').eq('business_id', BUSINESS_ID).neq('status', 'closed').order('created_at');
+        if (error) throw new Error(`Account lookup failed: ${error.message}`);
+        ids = (data || []).map((a) => a.id);
+    }
+    if (ids.length <= 1) {
+        ACCOUNT_ID = ids[0] ?? null;
+        return false;
+    }
+    log('System', `Business ${BUSINESS_ID} has ${ids.length} WhatsApp accounts; generating one pack per account.`);
+    const script = fileURLToPath(import.meta.url);
+    const codes = [];
+    for (const accountId of ids) {
+        const config = { businessId: BUSINESS_ID, accountIds: [accountId], force: FORCE };
+        codes.push(await new Promise((resolve) => {
+            const child = spawn(process.execPath, [script], { env: { ...process.env, PERSONA_CONFIG: JSON.stringify(config) }, stdio: ['ignore', 'inherit', 'inherit'] });
+            child.on('error', () => resolve(1));
+            child.on('close', (c) => resolve(c ?? 1));
+        }));
+    }
+    process.exit(codes.some((c) => c !== 0) ? 1 : 0);
 }
 
 // ─── Main ───────────────────────────────────────────────────────────────────────
 async function main() {
-    log('System', `Persona Pack Generator — business ${BUSINESS_ID}`);
+    if (await runPerAccount()) return;
+    log('System', `Persona Pack Generator — business ${BUSINESS_ID}${ACCOUNT_ID ? `, account ${ACCOUNT_ID}` : ''}`);
     log('System', 'Starting persona pack generation run.');
 
     await startRun();

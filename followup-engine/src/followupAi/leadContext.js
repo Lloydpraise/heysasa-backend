@@ -21,9 +21,10 @@ async function loadFlow(supabase, contact, conv) {
       if (data) return data
     }
     if (adKey) {
-      const { data } = await supabase.from('chat_flows').select('id, name, goal, instructions')
+      let query = supabase.from('chat_flows').select('id, name, goal, instructions')
         .eq('business_id', contact.business_id).eq('enabled', true).contains('trigger', { ad_ids: [adKey] })
-        .order('priority', { ascending: false }).limit(1).maybeSingle()
+      if (contact.account_id) query = query.eq('account_id', contact.account_id)
+      const { data } = await query.order('priority', { ascending: false }).limit(1).maybeSingle()
       if (data) return data
     }
   } catch { /* a flow is optional context */ }
@@ -35,8 +36,11 @@ async function applyAdOverrides(supabase, contact, ad) {
   const adKey = contact.original_ad_id || contact.ad_id || null
   if (!adKey) return ad
   try {
-    const { data } = await supabase.from('ad_playbooks').select('override_headline, override_body')
-      .eq('business_id', contact.business_id).eq('ad_id', adKey).maybeSingle()
+    // ad_playbooks are per account (account_id, ad_id).
+    let query = supabase.from('ad_playbooks').select('override_headline, override_body')
+      .eq('business_id', contact.business_id).eq('ad_id', adKey)
+    if (contact.account_id) query = query.eq('account_id', contact.account_id)
+    const { data } = await query.limit(1).maybeSingle()
     const headline = String(data?.override_headline ?? '').trim()
     const body = String(data?.override_body ?? '').trim()
     if (!headline && !body) return ad
@@ -44,12 +48,14 @@ async function applyAdOverrides(supabase, contact, ad) {
   } catch { return ad }
 }
 
-async function materialsText(supabase, businessId) {
+// The account's own materials plus the business-level catalog (account_id null).
+async function materialsText(supabase, businessId, accountId = null) {
   try {
-    const { data } = await supabase.from('followup_materials').select('title, content')
+    const { data } = await supabase.from('followup_materials').select('title, content, account_id')
       .eq('business_id', businessId).eq('is_active', true)
-      .or('expires_at.is.null,expires_at.gt.' + new Date().toISOString()).limit(20)
-    return (data ?? []).map(m => `${m.title} ${m.content ?? ''}`).join('\n')
+      .or('expires_at.is.null,expires_at.gt.' + new Date().toISOString()).limit(accountId ? 60 : 20)
+    return (data ?? []).filter(m => !accountId || !m.account_id || m.account_id === accountId).slice(0, 20)
+      .map(m => `${m.title} ${m.content ?? ''}`).join('\n')
   } catch { return '' }
 }
 
@@ -67,13 +73,14 @@ export async function loadLeadContext(supabase, { contact, business, conv }) {
     getAdContext(supabase, contact),
     loadFlow(supabase, contact, conv),
     getLastSentFollowups(supabase, contact.id, 3),
-    materialsText(supabase, contact.business_id),
+    materialsText(supabase, contact.business_id, contact.account_id ?? null),
   ])
   const ad = await applyAdOverrides(supabase, contact, adRaw)
   // Files the owner uploaded for follow-ups: the menu, plus the pieces that best match where this lead is right now.
   const lastInbound = [...messages].reverse().find(m => m.direction === 'in')?.content?.text ?? ''
   const knowledge = await loadFollowupKnowledge(supabase, {
     businessId: contact.business_id,
+    accountId: contact.account_id ?? null,
     queryText: [lastInbound, stateRes?.data?.summary, profile ? JSON.stringify(profile).slice(0, 400) : ''].filter(Boolean).join('\n'),
   })
   return {

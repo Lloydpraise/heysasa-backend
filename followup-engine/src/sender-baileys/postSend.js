@@ -6,6 +6,10 @@ import { advanceAiEnrollment } from '../followupAi/advance.js'
 
 export async function recordSuccessfulSend(supabase, { item, contact, business, finalMessage, whatsappMessageId }) {
   const now = new Date().toISOString()
+  // Everything written here belongs to the row's WhatsApp account, and the send is billed to it
+  // (its own wallet on separate billing).
+  const accountId = item.account_id ?? contact?.account_id ?? null
+  const withAccount = accountId ? { account_id: accountId } : {}
   const messageType = item.media?.type || 'text'
   const messageContent = item.media
     ? { text: finalMessage || item.media.caption || '', type: messageType, media: item.media }
@@ -19,6 +23,7 @@ export async function recordSuccessfulSend(supabase, { item, contact, business, 
     await Promise.all([
       supabase.from('messages').insert({
         business_id: item.business_id,
+        ...withAccount,
         contact_id: item.contact_id,
         conversation_id: item.conversation_id,
         whatsapp_message_id: whatsappMessageId,
@@ -27,7 +32,7 @@ export async function recordSuccessfulSend(supabase, { item, contact, business, 
       }),
       supabase.from('follow_up_queue').update({ status: 'sent', processed_at: now, next_step_processed: true }).eq('id', item.id),
       supabase.from('contacts').update({ consent_message_sent_at: now }).eq('id', item.contact_id),
-      billSend(supabase, item.business_id, { reason: 'consent_message', runner: 'consent_send' })
+      billSend(supabase, item.business_id, { reason: 'consent_message', runner: 'consent_send', accountId })
     ])
     return
   }
@@ -40,6 +45,7 @@ export async function recordSuccessfulSend(supabase, { item, contact, business, 
     // campaign_step_events row below instead of leaving message_id null.
     supabase.from('messages').insert({
       business_id: item.business_id,
+      ...withAccount,
       contact_id: item.contact_id,
       conversation_id: item.conversation_id,
       whatsapp_message_id: whatsappMessageId,
@@ -60,6 +66,7 @@ export async function recordSuccessfulSend(supabase, { item, contact, business, 
     supabase.from('follow_up_outcomes').insert({
       follow_up_queue_id: item.id,
       business_id: item.business_id,
+      ...withAccount,
       contact_id: item.contact_id,
       conversation_id: item.conversation_id,
       follow_up_number: item.sequence_step,
@@ -81,16 +88,19 @@ export async function recordSuccessfulSend(supabase, { item, contact, business, 
       followup_total_sent: (business.followup_total_sent ?? 0) + 1
     }).eq('business_id', item.business_id),
     // Deduct message cost
-    billSend(supabase, item.business_id, { reason: `followup_step_${item.sequence_step}`, runner: item.campaign_id ? 'campaign_send' : 'followup_send' }),
+    billSend(supabase, item.business_id, { reason: `followup_step_${item.sequence_step}`, runner: item.campaign_id ? 'campaign_send' : 'followup_send', accountId }),
     // Daily capacity counter — v_campaign_summary and the dashboard's
     // subscribeToCapacity both read this; nothing wrote to it before.
     // Read-modify-write is fine at this volume; it's a display counter,
-    // not something anything else gates on.
-    supabase.from('daily_send_counters').select('sent_today')
-      .eq('business_id', item.business_id).eq('send_date', sendDate).maybeSingle()
+    // not something anything else gates on. Counted per WhatsApp number
+    // (account_id, send_date); rows without an account keep the old key.
+    (accountId
+      ? supabase.from('daily_send_counters').select('sent_today').eq('account_id', accountId)
+      : supabase.from('daily_send_counters').select('sent_today').eq('business_id', item.business_id))
+      .eq('send_date', sendDate).maybeSingle()
       .then(({ data }) => supabase.from('daily_send_counters').upsert({
-        business_id: item.business_id, send_date: sendDate, sent_today: (data?.sent_today ?? 0) + 1
-      }, { onConflict: 'business_id,send_date' }))
+        business_id: item.business_id, ...withAccount, send_date: sendDate, sent_today: (data?.sent_today ?? 0) + 1
+      }, { onConflict: accountId ? 'account_id,send_date' : 'business_id,send_date' }))
   ])
 
   if (messageInsertResult?.error) {

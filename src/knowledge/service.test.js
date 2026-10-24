@@ -1,3 +1,4 @@
+import '../test-helpers/testEnv.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createKnowledgeService, cleanInput } from './service.js';

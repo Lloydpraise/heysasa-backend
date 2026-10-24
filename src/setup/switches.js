@@ -4,8 +4,9 @@ import { followupPrefsFor, validateFollowupPrefs, toColumns, RECOMMENDED } from 
 import { cleanAudience, DEFAULT_AUDIENCE } from '../chatAi/audience.js';
 import { seedChatAiSkills } from './chatAiSkills.js';
 import { seedChatAiFlows } from './chatAiFlows.js';
-
-const BUSINESS_COLUMNS = 'business_id, business_type, followup_ai_enabled, chat_ai_enabled, chat_ai_daily_cap, chat_ai_settings, persona_pack_status, subscription_active';
+import { loadAccountSettings } from '../services/accounts.js';
+import { saveAccountSettings } from '../services/accountSettings.js';
+import { loadActivePack } from '../personaPack.js';
 
 // Can this business pay for AI? HeySasa's own business is free. null = we could not tell.
 export function hasBalance(business, balanceUsd) {
@@ -64,18 +65,37 @@ export function planSwitches({ business, answers = {}, request = {}, balanceUsd 
     return { patch, warnings: [...new Set(warnings)], applied };
 }
 
-export async function applySwitches({ supabase, store, businessId, request }) {
-    const { data: business, error } = await supabase.from('businesses').select(BUSINESS_COLUMNS).eq('business_id', businessId).maybeSingle();
-    if (error || !business) return { error: 'business_not_found', status: 404 };
-    const setup = await store.get(businessId);
+// scope: the request scope (ACCOUNTS.md). The switches are per WhatsApp account: an account reads the business
+// default with its own overrides (loadAccountSettings) and saves into accounts.settings when the business has
+// several numbers (saveAccountSettings); the business-wide view saves the business default.
+export async function applySwitches({ supabase, store, businessId, request, scope = null }) {
+    const accountId = scope?.accountId ?? null;
+    let business;
+    try {
+        business = await loadAccountSettings(supabase, accountId, businessId);
+    } catch {
+        business = null;
+    }
+    if (!business) return { error: 'business_not_found', status: 404 };
+    // A pack the account can use (its own, or the business-wide fallback) counts as a ready persona.
+    if (business.persona_pack_status !== 'ready' && request?.chat === true) {
+        const active = await loadActivePack(supabase, businessId, accountId, 'id').catch(() => ({ row: null }));
+        if (active.row) business = { ...business, persona_pack_status: 'ready' };
+    }
+    const setup = await store.get(businessId, accountId);
     const plan = planSwitches({ business, answers: setup?.answers || {}, request, balanceUsd: await loadBalance(supabase, businessId) });
     if (plan.error) return plan;
-    const { error: writeError } = await supabase.from('businesses').update(plan.patch).eq('business_id', businessId);
-    if (writeError) return { error: 'could_not_save', status: 500, detail: writeError.message };
+    try {
+        await saveAccountSettings(supabase, scope?.businessId ? scope : { businessId, accountId }, plan.patch);
+    } catch (writeError) {
+        return { error: 'could_not_save', status: 500, detail: writeError.message };
+    }
     const warnings = [...plan.warnings];
     if (plan.applied.chat?.on) {
         // The chat AI needs its skills and the ad-lead flow to give good answers. Both cost nothing and never touch what the owner has edited.
-        try { await seedChatAiSkills(supabase, businessId); await seedChatAiFlows(supabase, businessId); }
+        // Skills and flows belong to an account: the business-wide view seeds every account.
+        const targets = accountId ? [accountId] : (scope?.accountIds?.length ? scope.accountIds : [null]);
+        try { for (const target of targets) { await seedChatAiSkills(supabase, businessId, target); await seedChatAiFlows(supabase, businessId, target); } }
         catch (e) { warnings.push('chat_setup_incomplete'); console.error('[switches] chat skills/flows seed failed:', e.message); }
     }
     return { ok: true, applied: plan.applied, warnings };

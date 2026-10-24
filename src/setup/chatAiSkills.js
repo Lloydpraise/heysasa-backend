@@ -22,17 +22,22 @@ export function planSkillSeed(defaults = [], existing = []) {
 }
 
 // Returns { added, total }. Safe to run twice: existing keys are skipped, and the insert ignores duplicates.
-export async function seedChatAiSkills(supabase, businessId) {
-    const [defaults, own] = await Promise.all([
+// Skills belong to one WhatsApp account (key account_id, key; ACCOUNTS.md). Without an account (a business
+// that has not connected WhatsApp yet) the old business key is used.
+export async function seedChatAiSkills(supabase, businessId, accountId = null) {
+    let own = supabase.from('chat_ai_skills').select('key').eq('business_id', businessId);
+    if (accountId) own = own.eq('account_id', accountId);
+    const [defaults, ownRows] = await Promise.all([
         supabase.from('chat_ai_default_skills').select('key, title, when_to_use, instructions, sort_order'),
-        supabase.from('chat_ai_skills').select('key').eq('business_id', businessId),
+        own,
     ]);
+    own = ownRows;
     if (defaults.error) throw new Error(`chat skill library unreadable: ${defaults.error.message}`);
     if (own.error) throw new Error(`chat skills unreadable: ${own.error.message}`);
 
-    const rows = planSkillSeed(defaults.data, own.data).map((row) => ({ ...row, business_id: businessId }));
+    const rows = planSkillSeed(defaults.data, own.data).map((row) => ({ ...row, business_id: businessId, ...(accountId ? { account_id: accountId } : {}) }));
     if (rows.length) {
-        const { error } = await supabase.from('chat_ai_skills').upsert(rows, { onConflict: 'business_id,key', ignoreDuplicates: true });
+        const { error } = await supabase.from('chat_ai_skills').upsert(rows, { onConflict: accountId ? 'account_id,key' : 'business_id,key', ignoreDuplicates: true });
         if (error) throw new Error(`chat skills not saved: ${error.message}`);
     }
     return { added: rows.length, total: (own.data || []).length + rows.length };

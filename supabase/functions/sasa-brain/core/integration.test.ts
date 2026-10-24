@@ -359,3 +359,131 @@ test('playground: a simulation returns the photos and images that would have gon
   assert.equal(tables.chat_ai_outbox.length, 0);
   assert.equal(tables.handoff_events.length, 0, 'a simulation never alerts anyone');
 });
+
+// ── Accounts: one WhatsApp number each (ACCOUNTS.md) ──
+const A = '11111111-1111-1111-1111-111111111111';
+const B = '22222222-2222-2222-2222-222222222222';
+
+// The same business with two numbers. Account A's chat, plus rows of account B that must never show up.
+function twoAccounts() {
+  const w = world();
+  const { tables } = w;
+  tables.businesses[0].chat_ai_model = 'gpt-5-mini';
+  tables.accounts = [{ id: A, business_id: 'b1', billing_mode: 'business' }, { id: B, business_id: 'b1', billing_mode: 'separate' }];
+  tables.account_balances = [{ account_id: B, balance_usd: 0 }];
+  tables.persona_packs = [
+    { business_id: 'b1', account_id: null, is_active: true, version: 3, pack: { persona: 'BUSINESS-WIDE' } },
+    { business_id: 'b1', account_id: A, is_active: true, version: 1, pack: { persona: 'VOICE-OF-A' } },
+    { business_id: 'b1', account_id: B, is_active: true, version: 9, pack: { persona: 'VOICE-OF-B' } },
+  ];
+  for (const s of tables.chat_ai_skills) s.account_id = A;
+  tables.chat_ai_skills.push({ business_id: 'b1', account_id: B, enabled: true, key: 'b_only', title: 'B only', when_to_use: 'x', instructions: 'SKILL-OF-B' });
+  for (const f of tables.chat_flows) f.account_id = A;
+  tables.chat_flows.push({ id: 'fB', account_id: B, business_id: 'b1', enabled: true, name: 'B flow', priority: 999, trigger: { ad_ids: ['ad9'] }, goal: 'B', instructions: 'FLOW-OF-B', skill_keys: [], created_at: '2026-01-01' });
+  tables.chat_ai_tools.push({ name: 'b_tool', business_id: 'b1', account_id: B, enabled: true, description: 'b', parameters: {}, kind: 'builtin', target: 'search_products', phase: 'lookup' });
+  tables.products = [
+    { id: 'p1', business_id: 'b1', account_id: A, status: 'approved', ai_visible: true, category: 'Lashes' },
+    { id: 'p2', business_id: 'b1', account_id: null, status: 'approved', ai_visible: true, category: 'Catalog' },
+    { id: 'p3', business_id: 'b1', account_id: B, status: 'approved', ai_visible: true, category: 'OnlyB' },
+  ];
+  tables.contacts[0].account_id = A;
+  tables.conversations[0].account_id = A;
+  for (const m of tables.messages) m.account_id = A;
+  tables.messages.push({ whatsapp_message_id: 'WB', conversation_id: 'c1', account_id: B, direction: 'in', type: 'text', content: { text: 'MESSAGE-OF-B' }, created_at: '2026-10-04T09:00:00Z' });
+  const rpcSeen: Array<[string, any]> = [];
+  const baseRpc = w.db.rpc;
+  const overrides: Record<string, (a: any) => any> = {
+    // the account overlay: account A runs its own owner phone; the rest comes from the business row
+    account_settings: (a: any) => (a.p_account_id === A ? { ...tables.businesses[0], owner_phone: '0711000111', account_id: A } : { ...tables.businesses[0], account_id: a.p_account_id }),
+    account_can_operate: (a: any) => a.p_account_id !== 'suspended-account',
+  };
+  (w.db as any).rpc = async (fn: string, args: any) => {
+    rpcSeen.push([fn, args]);
+    return overrides[fn] ? { data: overrides[fn](args), error: null } : baseRpc(fn, args);
+  };
+  return { ...w, rpcSeen };
+}
+
+test('accounts: a live turn on account A sees only A (plus the business catalog), and everything it writes carries A', async () => {
+  const { tables, db, sleep, billed, rpcSeen } = twoAccounts();
+  const bodies: any[] = [];
+  const script = [
+    { id: 'r1', usage, output: [call(1, 'search_products', { query: 'volume set' }), call(2, 'update_profile', { note: 'Asked about the volume set' })] },
+    { id: 'r2', usage, output: [call(3, 'send_products', { product_ids: ['p1'] }), ] },
+    { id: 'r3', usage, output: [call(4, 'handoff', { reason: 'wants a call', urgency: 'normal', summary: 'Call her.' })] },
+    { id: 'r4', usage, output: [message('The volume set is KES 3,500. The owner will call you.')] },
+  ];
+  const fetchFn = (async (url: string, init: any) => {
+    if (String(url).endsWith('/embeddings')) return ok({ data: [{ embedding: [0.1, 0.2] }] });
+    bodies.push(JSON.parse(init.body));
+    return ok(script.shift());
+  }) as unknown as typeof fetch;
+  const input = { business_id: 'b1', account_id: A, conversation_id: 'c1', contact_id: 7, trigger_message_id: 'W1' };
+  const out = await runTurn(buildDeps({ db, openaiKey: 'k', fetch: fetchFn, sleep }, input), input);
+  assert.ok(out.status === 'handoff' || out.status === 'replied', String(out.error));
+
+  // settings, persona, skills, flows, tools, categories and history are A's
+  assert.ok(rpcSeen.some(([fn, a]) => fn === 'account_settings' && a.p_account_id === A), 'settings come from account_settings');
+  const first = bodies[0];
+  assert.match(first.instructions, /VOICE-OF-A/);
+  assert.doesNotMatch(first.instructions, /VOICE-OF-B|BUSINESS-WIDE/, 'the account\'s own persona wins over the business-wide one');
+  assert.match(first.instructions, /Lashes \(1\)/);
+  assert.match(first.instructions, /Catalog \(1\)/, 'business catalog products are shared');
+  assert.doesNotMatch(first.instructions, /OnlyB|b_only/);
+  assert.ok(!first.tools.some((t: any) => t.name === 'b_tool'), 'another account\'s tool is not offered');
+  const inputText = JSON.stringify(first.input);
+  assert.doesNotMatch(inputText, /MESSAGE-OF-B|FLOW-OF-B/);
+  assert.equal(out.flow, 'Lash ad');
+  assert.equal(first.prompt_cache_key, `sasa:b1:${A}`);
+
+  // searches and billing are for A
+  assert.equal(rpcSeen.find(([fn]) => fn === 'match_products_v8')![1].filter_account_id, A);
+  assert.ok(billed.length >= 4 && billed.every((b) => b.p_account_id === A), 'every charge is tagged with the account');
+
+  // writes carry A
+  assert.ok(tables.chat_ai_outbox.length >= 2 && tables.chat_ai_outbox.every((r) => r.account_id === A));
+  assert.equal(tables.chat_ai_turns[0].account_id, A);
+  assert.equal(tables.handoff_events[0].account_id, A);
+  assert.deepEqual(tables.handoff_events[0].recipients, [{ name: 'Owner', phone: '254711000111' }], 'the owner phone comes from the account overlay');
+  assert.equal(tables.customer_notes[0].account_id, A);
+});
+
+test('accounts: file search passes the account so A sees its own files and the business files', async () => {
+  const { tables, db, sleep, rpcSeen } = twoAccounts();
+  tables.chat_ai_tools.push(...FILE_TOOLS);
+  tables.knowledge_sources.push(
+    { id: 'k1', business_id: 'b1', account_id: null, title: 'Refund SOP', use_case: 'refunds', file_type: 'pdf', used_by: 'chat', is_active: true, status: 'ready', created_at: '1' },
+    { id: 'kB', business_id: 'b1', account_id: B, title: 'B secrets', use_case: 'x', file_type: 'pdf', used_by: 'chat', is_active: true, status: 'ready', created_at: '2' },
+  );
+  const bodies: any[] = [];
+  const script = [{ id: 'r1', usage, output: [call(1, 'file_search', { query: 'refunds' })] }, { id: 'r2', usage, output: [message('Refunds are paid within 3 days after the item is returned.')] }];
+  const fetchFn = (async (url: string, init: any) => {
+    if (String(url).endsWith('/embeddings')) return ok({ data: [{ embedding: [0.1] }] });
+    bodies.push(JSON.parse(init.body));
+    return ok(script.shift());
+  }) as unknown as typeof fetch;
+  const input = { business_id: 'b1', account_id: A, conversation_id: 'c1', contact_id: 7, trigger_message_id: 'W1' };
+  await runTurn(buildDeps({ db, openaiKey: 'k', fetch: fetchFn, sleep }, input), input);
+  assert.match(bodies[0].instructions, /Refund SOP/);
+  assert.doesNotMatch(bodies[0].instructions, /B secrets/);
+  assert.equal(rpcSeen.find(([fn]) => fn === 'match_knowledge_chunks')![1].p_account_id, A);
+});
+
+test('accounts: a suspended account is refused before any model call, like the switch being off', async () => {
+  const { tables, db, sleep } = twoAccounts();
+  let modelCalls = 0;
+  const fetchFn = (async () => { modelCalls++; return ok({}); }) as unknown as typeof fetch;
+  const input = { business_id: 'b1', account_id: 'suspended-account', conversation_id: 'c1', contact_id: 7, trigger_message_id: 'W1' };
+  const out = await runTurn(buildDeps({ db, openaiKey: 'k', fetch: fetchFn, sleep }, input), input);
+  assert.deepEqual([out.status, out.skip_reason, modelCalls], ['skipped', 'account_suspended', 0]);
+  assert.equal(tables.chat_ai_turns[0].skip_reason, 'account_suspended');
+  assert.equal(tables.chat_ai_outbox.length, 0);
+});
+
+test('accounts: the wallet is the account\'s own on separate billing, else the business\'s', async () => {
+  const { db } = twoAccounts();
+  const deps = buildDeps({ db, openaiKey: 'k', fetch, sleep: async () => {} }, { business_id: 'b1' });
+  assert.equal(await deps.canAfford!('b1', A), true, 'A spends from the business wallet (5 USD)');
+  assert.equal(await deps.canAfford!('b1', B), false, 'B is billed separately and its own wallet is empty');
+  assert.equal(await deps.canAfford!('b1', null), true);
+});

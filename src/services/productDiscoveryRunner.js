@@ -63,8 +63,11 @@ function chunk(list, size) {
 }
 
 // ─── Entry point ─────────────────────────────────────────────────────────────
-// ctx: { supabase, businessId, openaiKey, textModel, visionModel, force, dryRun,
+// ctx: { supabase, businessId, accountId, openaiKey, textModel, visionModel, force, dryRun,
 //        log, warn, err, progress, recordUsage }
+// accountId: the WhatsApp account whose chats are read (ACCOUNTS.md). Products found there belong to that
+// account; they are matched against the account's own products plus the business catalog (account_id null).
+// Without it (a business with no account yet) the whole business is read, as before.
 export async function runProductDiscovery(ctx) {
   const {
     supabase, businessId, openaiKey, force = false, dryRun = false,
@@ -90,8 +93,8 @@ export async function runProductDiscovery(ctx) {
     log('Products', 'Loading business, existing products and customer chats.');
     await setProgress(ctx, run, 'loading', 0, 1);
     const business = await loadBusiness(supabase, businessId);
-    const products = await loadProducts(supabase, businessId);
-    const contactIds = await loadCustomerContactIds(supabase, businessId);
+    const products = await loadProducts(supabase, businessId, ctx.accountId);
+    const contactIds = await loadCustomerContactIds(supabase, businessId, ctx.accountId);
     summary.customer_chats = contactIds.size;
     log('Products', `Loaded business "${business.name}", ${products.length} products and ${contactIds.size} customer chats.`);
     if (!contactIds.size) {
@@ -101,10 +104,10 @@ export async function runProductDiscovery(ctx) {
       await finishRun(ctx, run, 'insufficient_data', summary);
       return summary;
     }
-    const since = force ? null : await lastCompletedRunStart(supabase, businessId);
+    const since = force ? null : await lastCompletedRunStart(supabase, businessId, ctx.accountId);
     log('Products', `${contactIds.size} customer chats, ${products.length} products on file${since ? `, reading messages since ${since}` : ', reading all messages'}.`);
 
-    const messages = await loadMessages(supabase, businessId, contactIds, false);
+    const messages = await loadMessages(supabase, businessId, contactIds, false, ctx.accountId);
     const byContact = groupByContact(messages);
     log('Products', `Loaded ${messages.length} customer-chat messages across ${byContact.size} chats.`);
 
@@ -167,26 +170,30 @@ export async function runProductDiscovery(ctx) {
   }
 }
 
-// ─── Run tracking (enrichment_runs, run_type = product_discovery) ────────────
+// Narrows a query to one account's rows when the run is for an account.
+const onAccount = (query, accountId) => (accountId ? query.eq('account_id', accountId) : query);
+
+// ─── Run tracking (enrichment_runs, run_type = product_discovery, one per account) ─
 async function startRun(ctx) {
-  const { supabase, businessId, dryRun, warn = () => {} } = ctx;
+  const { supabase, businessId, accountId = null, dryRun, warn = () => {} } = ctx;
   if (dryRun) return { id: null };
   const ago = (ms) => new Date(Date.now() - ms).toISOString();
   try {
-    await supabase.from('enrichment_runs')
+    await onAccount(supabase.from('enrichment_runs')
       .update({ status: 'failed', finished_at: new Date().toISOString(), fatal_error: 'stale: process ended without finishing' })
-      .eq('run_type', RUN_TYPE).eq('business_id', businessId).eq('status', 'running')
+      .eq('run_type', RUN_TYPE).eq('business_id', businessId).eq('status', 'running'), accountId)
       .or(`heartbeat_at.lt.${ago(DEAD_AFTER_MS)},and(heartbeat_at.is.null,started_at.lt.${ago(DEAD_AFTER_MS)})`);
   } catch (e) { warn('Products', `Stale-run sweep failed: ${e.message}`); }
 
-  const { data: running } = await supabase.from('enrichment_runs')
-    .select('id, started_at, heartbeat_at').eq('run_type', RUN_TYPE).eq('business_id', businessId).eq('status', 'running');
+  const { data: running } = await onAccount(supabase.from('enrichment_runs')
+    .select('id, started_at, heartbeat_at').eq('run_type', RUN_TYPE).eq('business_id', businessId).eq('status', 'running'), accountId);
   const live = (running || []).find((r) => Date.now() - new Date(r.heartbeat_at || r.started_at).getTime() < LIVE_WINDOW_MS);
   if (live) throw new AlreadyRunningError(`Product discovery is already running for ${businessId} (run ${String(live.id).slice(0, 8)}).`);
 
   const id = crypto.randomUUID();
   const { error } = await supabase.from('enrichment_runs').insert({
-    id, run_type: RUN_TYPE, business_id: businessId, started_at: new Date().toISOString(), status: 'running', phase: 'loading',
+    id, run_type: RUN_TYPE, business_id: businessId, ...(accountId ? { account_id: accountId } : {}),
+    started_at: new Date().toISOString(), status: 'running', phase: 'loading',
     heartbeat_at: new Date().toISOString(),
   });
   if (error) warn('Products', `Could not create run record: ${error.message}`);
@@ -234,9 +241,9 @@ async function failRun(ctx, run, e) {
   }
 }
 
-async function lastCompletedRunStart(supabase, businessId) {
-  const { data } = await supabase.from('enrichment_runs').select('started_at')
-    .eq('run_type', RUN_TYPE).eq('business_id', businessId).eq('status', 'completed')
+async function lastCompletedRunStart(supabase, businessId, accountId = null) {
+  const { data } = await onAccount(supabase.from('enrichment_runs').select('started_at')
+    .eq('run_type', RUN_TYPE).eq('business_id', businessId).eq('status', 'completed'), accountId)
     .order('started_at', { ascending: false }).limit(1).maybeSingle();
   return data?.started_at || null;
 }
@@ -262,24 +269,30 @@ async function loadBusiness(supabase, businessId) {
   return data;
 }
 
-async function loadProducts(supabase, businessId) {
-  return fetchAllPages((from, to) => supabase.from('products')
-    .select('id, title, aliases, status, price, price_source, type, images, observed_prices, mention_count, discovery_confidence, category, category_source, description_short')
-    .eq('business_id', businessId).order('id').range(from, to));
+// The account's own products plus the business catalog (account_id null), so a product the business already
+// lists is matched instead of discovered again.
+async function loadProducts(supabase, businessId, accountId = null) {
+  return fetchAllPages((from, to) => {
+    let q = supabase.from('products')
+      .select('id, title, aliases, status, price, price_source, type, images, observed_prices, mention_count, discovery_confidence, category, category_source, description_short, account_id')
+      .eq('business_id', businessId);
+    if (accountId) q = q.or(`account_id.eq.${accountId},account_id.is.null`);
+    return q.order('id').range(from, to);
+  });
 }
 
-async function loadCustomerContactIds(supabase, businessId) {
-  const rows = await fetchAllPages((from, to) => supabase.from('contacts')
-    .select('id').eq('business_id', businessId).eq('lead_type', 'business').order('id').range(from, to));
+async function loadCustomerContactIds(supabase, businessId, accountId = null) {
+  const rows = await fetchAllPages((from, to) => onAccount(supabase.from('contacts')
+    .select('id').eq('business_id', businessId).eq('lead_type', 'business'), accountId).order('id').range(from, to));
   return new Set(rows.map((r) => r.id));
 }
 
-async function loadMessages(supabase, businessId, contactIds, withRaw) {
+async function loadMessages(supabase, businessId, contactIds, withRaw, accountId = null) {
   const columns = withRaw
     ? 'id, contact_id, direction, agent_role, type, content, raw_payload, created_at'
     : 'id, contact_id, direction, agent_role, type, content, created_at';
   const rows = await fetchAllPages((from, to) => {
-    let q = supabase.from('messages').select(columns).eq('business_id', businessId);
+    let q = onAccount(supabase.from('messages').select(columns).eq('business_id', businessId), accountId);
     if (withRaw) q = q.eq('type', 'image').in('direction', ['out', 'outbound']);
     return q.order('created_at', { ascending: true }).order('id').range(from, to);
   });
@@ -397,7 +410,7 @@ async function mineImages(ctx, run, state, business, byContact, contactIds, mode
   const { supabase, businessId, force, dryRun, log = () => {}, warn = () => {} } = ctx;
   const out = { candidates: [], imageUploads: new Map() };
 
-  const imageMessages = await loadMessages(supabase, businessId, contactIds, true);
+  const imageMessages = await loadMessages(supabase, businessId, contactIds, true, ctx.accountId);
   summary.images_seen = imageMessages.length;
   if (!imageMessages.length) {
     log('Products', 'No owner-sent images were found in customer chats.');
@@ -761,7 +774,9 @@ function planWrites(clusters, products, summary) {
 async function writePlan(ctx, run, businessId, plan, imageUploads) {
   const { supabase, log = () => {} } = ctx;
   const runId = run.id;
-  const productBatches = chunk(plan.newProducts.map((r) => ({ ...r, business_id: businessId, discovery_run_id: runId })), 50);
+  // Discovered products belong to the account whose chats they came from.
+  const accountRow = ctx.accountId ? { account_id: ctx.accountId } : {};
+  const productBatches = chunk(plan.newProducts.map((r) => ({ ...r, business_id: businessId, ...accountRow, discovery_run_id: runId })), 50);
 
   for (let i = 0; i < productBatches.length; i++) {
     const rows = productBatches[i];
@@ -780,7 +795,7 @@ async function writePlan(ctx, run, businessId, plan, imageUploads) {
     if (seen.has(dedupe)) continue;
     seen.add(dedupe);
     mentionRows.push({
-      business_id: businessId, product_id: m.productId, run_id: runId, kind: s.kind, source_ref: String(s.ref),
+      business_id: businessId, ...accountRow, product_id: m.productId, run_id: runId, kind: s.kind, source_ref: String(s.ref),
       message_id: s.kind === 'text' ? s.messageId : null, contact_id: s.contactId || null,
       quote: s.quote ? redact(s.quote).slice(0, 240) : null, observed_name: String(m.name || '').slice(0, 120),
       observed_price: s.price ?? null, image_url: s.imageUrl || imageUploads.get(s.ref) || null,
@@ -902,7 +917,7 @@ async function callOpenAiJson(ctx, state, { promptId, model, user, maxTokens, in
         const u = body.usage || {};
         try {
           await ctx.recordUsage({
-            businessId, botId: promptId, model: resolvedModel, inputType,
+            businessId, accountId: ctx.accountId ?? null, botId: promptId, model: resolvedModel, inputType,
             promptTokens: u.prompt_tokens || 0, cachedTokens: u.prompt_tokens_details?.cached_tokens || 0,
             completionTokens: u.completion_tokens || 0,
           });

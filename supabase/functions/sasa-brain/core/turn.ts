@@ -8,7 +8,8 @@ import { runLoop, type ModelCall, type Usage } from './loop.ts';
 import { queueHandoffAlert, runRegistryTool, settlePending, type Deps, type QueueResult, type SendItem, type SendResult, type TurnState } from './builtin.ts';
 
 export type TurnInput = {
-  business_id: string; conversation_id?: string | null; contact_id?: number | null; trigger_message_id?: string | null;
+  // account_id: the WhatsApp number (ACCOUNTS.md). Null only for a business from before accounts.
+  business_id: string; account_id?: string | null; conversation_id?: string | null; contact_id?: number | null; trigger_message_id?: string | null;
   simulate?: boolean; message?: string; history?: HistoryMessage[]; contact?: Partial<CustomerFile> & { ad_id?: string | null; list_ids?: string[] };
 };
 
@@ -51,7 +52,9 @@ export type TurnDeps = {
   sleep: (ms: number) => Promise<void>;
   // Optional, supplied by the real wiring (deps.ts). Without them a turn is free and costs are estimated.
   turnId?: string;
-  canAfford?: (businessId: string) => Promise<boolean>;
+  canAfford?: (businessId: string, accountId?: string | null) => Promise<boolean>;
+  // Optional. False when the account is suspended or closed (account_can_operate): the turn is refused like the switch being off.
+  canOperate?: (input: TurnInput) => Promise<boolean>;
   spend?: () => { base: number; billed: number };
 };
 
@@ -86,19 +89,22 @@ export async function runTurn(deps: TurnDeps, input: TurnInput): Promise<TurnOut
   // The wallet check and the settings read do not depend on each other, so they run together. Nothing goes to the model
   // until both are back: an empty wallet still stops the turn before any OpenAI call.
   // Chat AI is paid for per use. An empty wallet pauses it, in live chats and in the Playground alike.
-  const [affordable, settings] = await Promise.all([
-    deps.canAfford ? deps.canAfford(input.business_id) : Promise.resolve(true),
+  // A suspended or closed WhatsApp number (account) is refused the same way, before anything else.
+  const [affordable, operating, settings] = await Promise.all([
+    deps.canAfford ? deps.canAfford(input.business_id, input.account_id ?? null) : Promise.resolve(true),
+    deps.canOperate ? deps.canOperate(input) : Promise.resolve(true),
     simulate ? Promise.resolve(null) : (deps.loadSettings ? deps.loadSettings(input) : deps.loadContext(input).then((c) => c.settings)),
   ]);
   lap('prep_ms');
-  if (!affordable) {
+  const refusal = !operating ? 'account_suspended' : !affordable ? 'no_balance' : null;
+  if (refusal) {
     await deps.logTurn({
-      id: turnId, business_id: input.business_id, conversation_id: input.conversation_id ?? null, contact_id: input.contact_id ?? null,
-      trigger_message_id: input.trigger_message_id ?? null, mode: simulate ? 'simulation' : 'live', status: 'skipped', skip_reason: 'no_balance',
+      id: turnId, business_id: input.business_id, account_id: input.account_id ?? null, conversation_id: input.conversation_id ?? null, contact_id: input.contact_id ?? null,
+      trigger_message_id: input.trigger_message_id ?? null, mode: simulate ? 'simulation' : 'live', status: 'skipped', skip_reason: refusal,
       input: { customer_message: input.message ?? null },
     }).catch(() => {});
     return {
-      status: 'skipped', reply: null, skip_reason: 'no_balance', handoff: null, steps: [], thoughts: '', flow: null, flow_id: null,
+      status: 'skipped', reply: null, skip_reason: refusal, handoff: null, steps: [], thoughts: '', flow: null, flow_id: null,
       skills_loaded: [], holding_message: null, usage: { input: 0, cached: 0, output: 0 }, reruns: 0,
     };
   }
@@ -170,7 +176,7 @@ export async function runTurn(deps: TurnDeps, input: TurnInput): Promise<TurnOut
   const cost = deps.spend ? deps.spend().base : estimate;
 
   await deps.logTurn({
-    id: turnId, business_id: input.business_id, conversation_id: input.conversation_id ?? null, contact_id: input.contact_id ?? null,
+    id: turnId, business_id: input.business_id, account_id: input.account_id ?? null, conversation_id: input.conversation_id ?? null, contact_id: input.contact_id ?? null,
     trigger_message_id: input.trigger_message_id ?? null, mode: simulate ? 'simulation' : 'live',
     status: result.status, skip_reason: result.skip_reason ?? null, model: ctx.business.model,
     flow_id: result.flow_id, skills_loaded: result.skills_loaded,
@@ -213,14 +219,14 @@ async function attempt(
   timings: Record<string, number>,
 ): Promise<TurnOutcome> {
   const send = io.send;
-  const tools = resolveTools(ctx.toolRows, input.business_id);
+  const tools = resolveTools(ctx.toolRows, input.business_id, input.account_id ?? null);
 
   const flow = pickFlow(ctx.flows, { stickyFlowId: ctx.stickyFlowId, adIds: ctx.adIds, listIds: ctx.listIds });
   if (flow && !simulate && flow.id !== ctx.stickyFlowId) await deps.rememberFlow(input, flow.id).catch(() => {});
 
   const skillByKey = new Map(ctx.skills.map((s) => [s.key, s]));
   const state: TurnState = {
-    businessId: input.business_id, contactId: input.contact_id ?? null, conversationId: input.conversation_id ?? null,
+    businessId: input.business_id, accountId: input.account_id ?? null, contactId: input.contact_id ?? null, conversationId: input.conversation_id ?? null,
     currency: ctx.business.currency, simulate, seenProducts: new Map(), skills: skillByKey, skillsLoaded: new Set(),
     productsSent: [], handoff: null, corpus: [],
     knowledge: (ctx.knowledge ?? []).map((k) => ({ id: k.id, title: k.title, file_type: k.file_type })),
@@ -257,7 +263,7 @@ async function attempt(
 
   const common = {
     callModel: deps.callModel, model: ctx.business.model, instructions, tools: toModelTools(tools),
-    effort: isReasoningModel(ctx.business.model) ? ctx.settings.effort : undefined, cacheKey: `sasa:${input.business_id}`,
+    effort: isReasoningModel(ctx.business.model) ? ctx.settings.effort : undefined, cacheKey: input.account_id ? `sasa:${input.business_id}:${input.account_id}` : `sasa:${input.business_id}`,
   };
   const loop = await runLoop({
     ...common, input: input_items, executeCalls, maxRounds: ctx.settings.maxRounds,

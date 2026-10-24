@@ -25,14 +25,16 @@ export function planFlowSeed(existing = [], skillKeys = []) {
         .map((flow) => ({ ...flow, skill_keys: flow.skill_keys.filter((k) => keys.has(k)), enabled: true, created_via: 'setup' }));
 }
 
-export async function seedChatAiFlows(supabase, businessId) {
+// Flows and skills belong to one WhatsApp account (ACCOUNTS.md); accountId narrows both and is stamped on new rows.
+export async function seedChatAiFlows(supabase, businessId, accountId = null) {
+    const onAccount = (query) => (accountId ? query.eq('account_id', accountId) : query);
     const [flows, skills] = await Promise.all([
-        supabase.from('chat_flows').select('name, created_via').eq('business_id', businessId),
-        supabase.from('chat_ai_skills').select('key').eq('business_id', businessId).eq('enabled', true),
+        onAccount(supabase.from('chat_flows').select('name, created_via').eq('business_id', businessId)),
+        onAccount(supabase.from('chat_ai_skills').select('key').eq('business_id', businessId).eq('enabled', true)),
     ]);
     if (flows.error) throw new Error(`chat flows unreadable: ${flows.error.message}`);
     if (skills.error) throw new Error(`chat skills unreadable: ${skills.error.message}`);
-    const rows = planFlowSeed(flows.data, (skills.data || []).map((s) => s.key)).map((row) => ({ ...row, business_id: businessId }));
+    const rows = planFlowSeed(flows.data, (skills.data || []).map((s) => s.key)).map((row) => ({ ...row, business_id: businessId, ...(accountId ? { account_id: accountId } : {}) }));
     if (rows.length) {
         const { error } = await supabase.from('chat_flows').insert(rows);
         if (error) throw new Error(`chat flows not saved: ${error.message}`);

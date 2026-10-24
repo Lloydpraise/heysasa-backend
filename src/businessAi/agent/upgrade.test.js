@@ -1,3 +1,4 @@
+import '../../test-helpers/testEnv.js';
 // Tests for the Oct 14 upgrade: reading leads and chats, analytics by period, opt-out sync, flows and skills, and the fixes from the audit.
 import test from 'node:test';
 import assert from 'node:assert/strict';

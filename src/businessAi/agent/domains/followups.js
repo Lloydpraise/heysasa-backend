@@ -1,6 +1,7 @@
 // Follow-up approvals: messages the follow-up AI drafted that wait for the owner's OK before they are sent to a customer.
 // Ported from followup-engine/src/api/queueRoutes.js, which stays the source of truth for the rules.
 import { ToolError, asText, clip, fetchAll, must, plural, uniq } from '../helpers.js';
+import { settingsResult } from './settings.js';
 
 const MAX_BATCH = 50;
 
@@ -65,7 +66,7 @@ const approve_followups = {
     };
   },
   async execute(ctx, params) {
-    const business = must(await ctx.db.from('businesses').select('whatsapp_channel').eq('business_id', ctx.businessId).maybeSingle(), 'business');
+    const business = must(await settingsResult(ctx), 'business');
     const rows = await pendingRows(ctx, params.item_ids);
     if (!rows.length) throw new ToolError('Those messages are no longer waiting, so nothing was sent.');
     let done = 0;

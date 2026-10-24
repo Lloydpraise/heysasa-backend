@@ -20,8 +20,9 @@ app.use(cors({
     const isConfiguredOrigin = !origin || CORS_ORIGINS.includes(origin)
     callback(null, isLocalDevelopmentOrigin || isConfiguredOrigin)
   },
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Authorization', 'Content-Type', 'X-Business-Id'],
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  // X-Account-Id: the WhatsApp account selected in the dashboard (see ACCOUNTS.md).
+  allowedHeaders: ['Authorization', 'Content-Type', 'X-Business-Id', 'X-Account-Id'],
 }))
 app.use(express.json())
 

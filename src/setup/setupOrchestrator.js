@@ -5,6 +5,10 @@
 //
 // Everything outside the logic (database, the analyser, the clock) comes in through `deps`, so the whole flow
 // can be tested without a database. The real deps live in setupDeps.js.
+//
+// Setup runs per WhatsApp account (ACCOUNTS.md): business_setup has one row per account, and the analyser,
+// persona pack and product discovery read that account's chats. accountId is passed to every dep as a trailing
+// argument (null for a business that has no account yet, which behaves exactly as before).
 import { planBundles, historySettled, FIRST_BUNDLE, NEXT_BUNDLE } from './bundlePlan.js';
 
 const iso = (ms) => new Date(ms).toISOString();
@@ -26,14 +30,14 @@ export function createOrchestrator(deps, options = {}) {
     const active = new Set();
     const log = deps.log || (() => {});
 
-    async function waitForHistory(businessId) {
+    async function waitForHistory(businessId, accountId) {
         const t0 = deps.now();
         const samples = [];
         // History that landed long before the button was pressed does not need a quiet period.
-        const newest = await deps.newestContactCreatedAt?.(businessId).catch(() => null);
+        const newest = await deps.newestContactCreatedAt?.(businessId, accountId).catch(() => null);
         const alreadyQuiet = newest ? t0 - new Date(newest).getTime() >= cfg.quietMs : false;
         for (;;) {
-            const count = await deps.countContacts(businessId);
+            const count = await deps.countContacts(businessId, accountId);
             const now = deps.now();
             samples.push({ at: now, count });
             if (count > 0 && alreadyQuiet) return { count };
@@ -44,7 +48,7 @@ export function createOrchestrator(deps, options = {}) {
     }
 
     // Starts one analyser run and waits for it to finish. Returns { ok, error? }.
-    async function runBundle(businessId, body) {
+    async function runBundle(businessId, body, accountId) {
         const sinceIso = iso(deps.now() - 5_000);
         let launched = false;
         for (let attempt = 0; attempt <= cfg.maxBusyRetries && !launched; attempt++) {
@@ -58,7 +62,7 @@ export function createOrchestrator(deps, options = {}) {
         const t0 = deps.now();
         for (;;) {
             await deps.sleep(cfg.runPollMs);
-            const run = await deps.latestRun(businessId, sinceIso);
+            const run = await deps.latestRun(businessId, sinceIso, accountId);
             if (run && run.status === 'completed') return { ok: true, run };
             if (run && run.status === 'failed') return { ok: false, error: String(run.fatal_error || 'analysis_failed').slice(0, 300) };
             const waited = deps.now() - t0;
@@ -71,84 +75,87 @@ export function createOrchestrator(deps, options = {}) {
         try { await fn(); } catch (error) { log('warn', `setup.${label}_failed`, { error: String(error?.message || error) }); }
     }
 
-    async function run(businessId, existing) {
+    async function run(businessId, existing, accountId) {
         const { store } = deps;
+        const put = (patch) => store.upsert(businessId, patch, accountId);
         const resumeFrom = existing && ['running', 'home_ready', 'finishing', 'failed'].includes(existing.status)
             ? Number(existing.bundles_done || 0) : 0;
         // Where the time goes, so we know which stage to speed up. Kept in business_setup.timings and shown by GET /setup/status.
         const began = deps.now();
         const timings = resumeFrom > 0 ? { ...(existing?.timings || {}) } : { bundles: [] };
         timings.bundles = timings.bundles || [];
-        await store.upsert(businessId, {
+        await put({
             status: resumeFrom > 0 ? 'home_ready' : 'waiting_history', error: null, thin: false,
             started_at: existing?.started_at || iso(deps.now()),
         });
 
         if (resumeFrom === 0) {
             // Optional one-time starter balance (off unless SETUP_STARTER_CREDIT_USD is set). It never stops setup.
-            await background('starter_credit', async () => { const r = await deps.grantStarterCredit?.(businessId); if (r?.grant) log('info', 'setup.starter_credit_granted', { businessId, amountUsd: r.amountUsd }); });
+            await background('starter_credit', async () => { const r = await deps.grantStarterCredit?.(businessId, accountId); if (r?.grant) log('info', 'setup.starter_credit_granted', { businessId, amountUsd: r.amountUsd }); });
             const waitedFrom = deps.now();
-            const { count } = await waitForHistory(businessId);
+            const { count } = await waitForHistory(businessId, accountId);
             timings.history_wait_ms = deps.now() - waitedFrom;
             if (count === 0) {   // a new number with no chats: nothing to analyse, Home switches to "get your first leads in"
-                await store.upsert(businessId, {
+                await put({
                     status: 'done', thin: true, home_ready_at: iso(deps.now()), finished_at: iso(deps.now()), timings,
                 });
                 return;
             }
         }
 
-        const ids = await deps.listContactIdsNewestFirst(businessId);
+        const ids = await deps.listContactIdsNewestFirst(businessId, accountId);
         const bundles = planBundles(ids, { first: cfg.firstBundle, rest: cfg.nextBundle });
-        await store.upsert(businessId, {
+        await put({
             status: resumeFrom > 0 ? 'home_ready' : 'running',
             bundles_total: bundles.length, contacts_total: ids.length,
         });
 
         for (let i = resumeFrom; i < bundles.length; i++) {
             const first = i === 0;
-            const body = { businessId, contactIds: bundles[i], ...(first ? { discoverProducts: true, productsTextOnly: true } : {}) };
+            const body = { businessId, ...(accountId ? { accountId } : {}), contactIds: bundles[i], ...(first ? { discoverProducts: true, productsTextOnly: true } : {}) };
             const bundleStart = deps.now();
-            const result = await runBundle(businessId, body);
+            const result = await runBundle(businessId, body, accountId);
             timings.bundles[i] = { size: bundles[i].length, ms: deps.now() - bundleStart, ok: result.ok, discovery_text_only: first || undefined };
-            if (!result.ok) { await store.upsert(businessId, { status: 'failed', error: result.error, timings }); return; }
+            if (!result.ok) { await put({ status: 'failed', error: result.error, timings }); return; }
 
             if (first) {
                 timings.home_ready_ms = deps.now() - began;
-                await store.upsert(businessId, { bundles_done: 1, status: 'home_ready', home_ready_at: iso(deps.now()), timings });
+                await put({ bundles_done: 1, status: 'home_ready', home_ready_at: iso(deps.now()), timings });
                 // Not waited for: the owner already has value. Persona = the brand voice, images = the rest of the products.
-                void background('persona', () => deps.kickPersona(businessId, { force: false }));
-                void background('product_images', () => deps.kickProductImages(businessId));
+                void background('persona', () => deps.kickPersona(businessId, { force: false, ...(accountId ? { accountId } : {}) }));
+                void background('product_images', () => deps.kickProductImages(businessId, accountId));
                 // The chat AI's starting skills, copied from the shared library. Free, and never overwrites the owner's own.
                 void background('chat_skills', async () => {
-                    const r = await deps.seedChatAiSkills?.(businessId);
+                    const r = await deps.seedChatAiSkills?.(businessId, accountId);
                     if (r?.added) log('info', 'setup.chat_skills_added', { businessId, added: r.added });
                 });
             } else {
-                await store.upsert(businessId, { bundles_done: i + 1, timings });
+                await put({ bundles_done: i + 1, timings });
             }
         }
 
-        await store.upsert(businessId, { status: 'finishing' });
-        if (bundles.length > 1) void background('persona_refresh', () => deps.kickPersona(businessId, { force: true }));
+        await put({ status: 'finishing' });
+        if (bundles.length > 1) void background('persona_refresh', () => deps.kickPersona(businessId, { force: true, ...(accountId ? { accountId } : {}) }));
         timings.total_ms = deps.now() - began;
-        await store.upsert(businessId, { status: 'done', finished_at: iso(deps.now()), timings });
+        await put({ status: 'done', finished_at: iso(deps.now()), timings });
     }
 
     // Returns { started, reason?, done? }. `done` resolves when the whole setup has finished (tests use it).
-    async function start(businessId, { restart = false } = {}) {
-        if (active.has(businessId)) return { started: false, reason: 'already_running' };
-        const existing = await deps.store.get(businessId);
+    const keyOf = (businessId, accountId) => (accountId ? `${businessId}|${accountId}` : businessId);
+    async function start(businessId, { restart = false, accountId = null } = {}) {
+        const key = keyOf(businessId, accountId);
+        if (active.has(key)) return { started: false, reason: 'already_running' };
+        const existing = await deps.store.get(businessId, accountId);
         if (existing?.status === 'done' && !restart) return { started: false, reason: 'already_done' };
-        active.add(businessId);
-        const done = run(businessId, restart ? null : existing)
+        active.add(key);
+        const done = run(businessId, restart ? null : existing, accountId)
             .catch(async (error) => {
-                log('error', 'setup.crashed', { businessId, error: String(error?.message || error) });
-                await deps.store.upsert(businessId, { status: 'failed', error: String(error?.message || error).slice(0, 300) }).catch(() => {});
+                log('error', 'setup.crashed', { businessId, accountId, error: String(error?.message || error) });
+                await deps.store.upsert(businessId, { status: 'failed', error: String(error?.message || error).slice(0, 300) }, accountId).catch(() => {});
             })
-            .finally(() => active.delete(businessId));
+            .finally(() => active.delete(key));
         return { started: true, done };
     }
 
-    return { start, isActive: (businessId) => active.has(businessId) };
+    return { start, isActive: (businessId, accountId = null) => active.has(keyOf(businessId, accountId)) };
 }

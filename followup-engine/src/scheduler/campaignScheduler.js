@@ -1,4 +1,5 @@
-import { getBusiness, getContactsByIds, getConversationsByContactIds } from '../lib/db.js'
+import { getBusinessForAccount, getContactsByIds, getConversationsByContactIds } from '../lib/db.js'
+import { loadAccounts, accountCanOperate, accountOverrides, withAccountSettings } from '../lib/accounts.js'
 import { resolveMediaMergeFields, resolveMergeFields } from '../lib/mergeFields.js'
 import { isBusinessAwake } from '../lib/timing.js'
 import { log } from '../lib/log.js'
@@ -28,8 +29,10 @@ async function pauseCampaign(supabase, campaignId, reason) {
 // Nothing here fails a campaign anymore — an instance/session problem
 // just means its items wait (see the whatsapp_sessions check inline
 // below and in worker.js). The only thing that actively pauses a
-// campaign now is the business's own follow-up toggle, see
-// syncCampaignsWithFollowupToggle.
+// campaign now is the follow-up toggle, see
+// syncCampaignsWithFollowupToggle. The toggle is the business default
+// (businesses.followup_ai_enabled) unless an account overrides it in
+// accounts.settings.
 async function syncCampaignsWithFollowupToggle(supabase) {
   const { data: businesses, error } = await supabase
     .from('businesses')
@@ -41,31 +44,46 @@ async function syncCampaignsWithFollowupToggle(supabase) {
 
   const disabledIds = (businesses ?? []).filter(b => !b.followup_ai_enabled).map(b => b.business_id)
   const enabledIds = (businesses ?? []).filter(b => b.followup_ai_enabled).map(b => b.business_id)
+  const overrides = await accountOverrides(supabase, 'followup_ai_enabled')
+  // Campaigns of these accounts follow the account's own switch, not the business default.
+  const notOverridden = (ids) => ids.size ? `account_id.is.null,account_id.not.in.(${[...ids].join(',')})` : null
+  const exceptAccounts = (query, ids) => { const f = notOverridden(ids); return f ? query.or(f) : query }
 
-  if (disabledIds.length) {
-    const { data: paused } = await supabase
+  const pauseCampaigns = async (scope) => {
+    const { data: paused } = await scope(supabase
       .from('campaigns')
-      .update({ status: 'paused', failure_reason: 'followup_ai_disabled', failed_at: null })
-      .in('business_id', disabledIds)
+      .update({ status: 'paused', failure_reason: 'followup_ai_disabled', failed_at: null }))
       .eq('status', 'active')
       .select('id')
     if (paused?.length) log('info', 'engine', 'campaign_scheduler.paused', `Paused ${paused.length} campaign(s) — follow-ups disabled`, { details: { count: paused.length, campaignIds: paused.map(p => p.id) } })
   }
-
-  if (enabledIds.length) {
-    const { data: resumed } = await supabase
+  const resumeCampaigns = async (scope) => {
+    const { data: resumed } = await scope(supabase
       .from('campaigns')
-      .update({ status: 'active', failure_reason: null, failed_at: null })
-      .in('business_id', enabledIds)
+      .update({ status: 'active', failure_reason: null, failed_at: null }))
       .eq('status', 'paused')
       .eq('failure_reason', 'followup_ai_disabled')
       .select('id')
     if (resumed?.length) log('info', 'engine', 'campaign_scheduler.resumed', `Resumed ${resumed.length} campaign(s) — follow-ups re-enabled`, { details: { count: resumed.length, campaignIds: resumed.map(r => r.id) } })
-    // Campaigns the sender paused because the wallet ran out come back by themselves once there is money for a send.
-    const { data: lowFunds } = await supabase.from('campaigns').select('id, business_id')
-      .in('business_id', enabledIds).eq('status', 'paused').eq('failure_reason', 'insufficient_balance')
+  }
+
+  if (disabledIds.length) await pauseCampaigns(q => exceptAccounts(q.in('business_id', disabledIds), overrides.on))
+  if (overrides.off.size) await pauseCampaigns(q => q.in('account_id', [...overrides.off]))
+  if (enabledIds.length) await resumeCampaigns(q => exceptAccounts(q.in('business_id', enabledIds), overrides.off))
+  if (overrides.on.size) await resumeCampaigns(q => q.in('account_id', [...overrides.on]))
+
+  if (enabledIds.length || overrides.on.size) {
+    // Campaigns the sender paused because the wallet ran out come back by themselves once there is money for a send
+    // (the account's own wallet on separate billing).
+    const { data: lowFunds } = await supabase.from('campaigns').select('id, business_id, account_id')
+      .eq('status', 'paused').eq('failure_reason', 'insufficient_balance')
+    const enabled = new Set(enabledIds)
     for (const row of lowFunds ?? []) {
-      if (!(await checkSendBalance(supabase, row.business_id))) continue
+      const on = row.account_id && overrides.on.has(row.account_id) ? true
+        : row.account_id && overrides.off.has(row.account_id) ? false
+          : enabled.has(row.business_id)
+      if (!on) continue
+      if (!(await checkSendBalance(supabase, row.business_id, row.account_id ?? null))) continue
       await supabase.from('campaigns').update({ status: 'active', failure_reason: null, failed_at: null })
         .eq('id', row.id).eq('status', 'paused').eq('failure_reason', 'insufficient_balance')
       log('info', 'engine', 'campaign_scheduler.resumed_funds', `Resumed campaign ${row.id}: balance topped up`, { business_id: row.business_id, entity_id: row.id })
@@ -81,22 +99,28 @@ async function syncCampaignsWithFollowupToggle(supabase) {
 async function seedCampaignEnrollments(supabase) {
   const { data: campaigns, error: campaignError } = await supabase
     .from('campaigns')
-    .select('id, business_id, list_id, whatsapp_instance_name, status')
+    .select('id, business_id, account_id, list_id, whatsapp_instance_name, status')
     .in('status', ['active', 'paused'])
     .not('list_id', 'is', null)
     .order('created_at', { ascending: true })
 
   if (campaignError) throw new Error(`Active campaign lookup failed: ${campaignError.message}`)
 
+  const seedAccounts = await loadAccounts(supabase, (campaigns ?? []).map(c => c.account_id))
   let enrolled = 0
   for (const campaign of campaigns ?? []) {
     if (campaign.status === 'paused') {
       continue
     }
-    // whatsapp_sessions is the source of truth — no live Evolution ping.
-    // No connected session yet just means wait, nothing pauses or fails
-    // the campaign over it.
-    if (campaign.whatsapp_instance_name) {
+    // A campaign of an account waits while the account is not connected or may not operate (access fee unpaid).
+    if (campaign.account_id) {
+      const account = seedAccounts.get(campaign.account_id)
+      if (!account || account.status !== 'connected' || !account.instance_name) continue
+      if (!(await accountCanOperate(supabase, campaign.account_id))) continue
+    } else if (campaign.whatsapp_instance_name) {
+      // whatsapp_sessions is the source of truth — no live Evolution ping.
+      // No connected session yet just means wait, nothing pauses or fails
+      // the campaign over it.
       const { data: connectedSession } = await supabase
         .from('whatsapp_sessions')
         .select('instance_name')
@@ -130,7 +154,7 @@ async function seedCampaignEnrollments(supabase) {
     let hereError = null
     for (const ids of chunked(leadIds, IN_CHUNK)) {
       const [c, o, h] = await Promise.all([
-        supabase.from('contacts').select('id, business_id, do_not_contact, wa_exists, lead_type').in('id', ids),
+        supabase.from('contacts').select('id, business_id, account_id, do_not_contact, wa_exists, lead_type').in('id', ids),
         supabase.from('campaign_enrollments').select('lead_id, campaign_id')
           .in('lead_id', ids).in('status', ['pending', 'active', 'awaiting_opt_in']),
         // Any status, this campaign only: a completed/exited enrollment still
@@ -163,9 +187,12 @@ async function seedCampaignEnrollments(supabase) {
     for (const leadId of leadIds) {
       const contact = contactsById.get(leadId)
       // Personal chats, suppliers, staff and spam are never enrolled, even if they ended up on a list.
+      // A campaign only reaches the people of its own WhatsApp number.
+      if (campaign.account_id && contact?.account_id && contact.account_id !== campaign.account_id) continue
       if (!contact || contact.business_id !== campaign.business_id || contact.do_not_contact || contact.wa_exists === false || NON_CUSTOMER_TYPES.has(contact.lead_type) || existingByLead.has(leadId)) continue
       rows.push({
         campaign_id: campaign.id,
+        ...(campaign.account_id ? { account_id: campaign.account_id } : {}),
         lead_id: leadId,
         status: 'pending',
         current_step: 0,
@@ -258,7 +285,7 @@ export async function runCampaignScheduler(supabase, { seed = true } = {}) {
   for (const ids of chunked(campaignIds, IN_CHUNK)) {
     const { data, error: campaignError } = await supabase
       .from('campaigns')
-      .select('id, business_id, status, whatsapp_instance_name, ai_managed, min_gap_hours')
+      .select('id, business_id, account_id, status, whatsapp_instance_name, ai_managed, min_gap_hours')
       .in('id', ids)
     if (campaignError) {
       log('error', 'engine', 'campaign_scheduler.campaign_lookup_failed', `Campaign lookup failed: ${campaignError.message}`, { details: { error: campaignError.message } })
@@ -276,20 +303,34 @@ export async function runCampaignScheduler(supabase, { seed = true } = {}) {
   if (!activeCampaigns.length) return { queued: 0 }
   const businessIds = [...new Set(activeCampaigns.map(c => c.business_id))]
 
-  // Sleep mode — a business in quiet hours (or on an inactive day) just has its due items left alone this cycle.
-  const awakeByBusiness = new Map()
+  // Accounts of these campaigns: their instance, state and settings overrides (quiet hours are per account).
+  const accountsById = await loadAccounts(supabase, activeCampaigns.map(c => c.account_id))
+  const canOperate = new Map()
+  for (const id of accountsById.keys()) canOperate.set(id, await accountCanOperate(supabase, id))
+
+  // Sleep mode — a business (or account) in quiet hours, or on an inactive day, just has its due items left alone this cycle.
+  const businessRows = new Map()
   for (const ids of chunked(businessIds, IN_CHUNK)) {
     const { data } = await supabase
       .from('businesses')
       .select('business_id, timezone, followup_quiet_start, followup_quiet_end, followup_active_days')
       .in('business_id', ids)
-    for (const business of data ?? []) awakeByBusiness.set(business.business_id, isBusinessAwake(business))
+    for (const business of data ?? []) businessRows.set(business.business_id, business)
   }
-  const isAwake = (businessId) => awakeByBusiness.get(businessId) ?? true
+  const isAwake = (campaign) => {
+    const business = businessRows.get(campaign.business_id)
+    if (!business) return true
+    return isBusinessAwake(campaign.account_id ? withAccountSettings(business, accountsById.get(campaign.account_id)) : business)
+  }
+
+  // The instance of an account campaign is the account's; the stored name only counts for campaigns without one.
+  const instanceOf = (campaign) => campaign.account_id
+    ? accountsById.get(campaign.account_id)?.instance_name ?? null
+    : campaign.whatsapp_instance_name
 
   // whatsapp_sessions is the source of truth — no live Evolution ping, nothing pauses or fails the campaign over it.
   const connected = new Set()
-  if (activeCampaigns.some(c => c.whatsapp_instance_name)) {
+  if (activeCampaigns.some(c => instanceOf(c))) {
     for (const ids of chunked(businessIds, IN_CHUNK)) {
       const { data } = await supabase
         .from('whatsapp_sessions')
@@ -303,8 +344,15 @@ export async function runCampaignScheduler(supabase, { seed = true } = {}) {
   const eligible = due.filter((enrollment) => {
     const campaign = campaignsById.get(enrollment.campaign_id)
     if (!campaign || campaign.status !== 'active') return false
-    if (!isAwake(campaign.business_id)) return false
-    if (campaign.whatsapp_instance_name && !connected.has(`${campaign.business_id}|${campaign.whatsapp_instance_name}`)) return false
+    if (!isAwake(campaign)) return false
+    if (campaign.account_id) {
+      // Same as a disconnected instance: wait while the account is not connected or is suspended.
+      const account = accountsById.get(campaign.account_id)
+      if (!account || account.status !== 'connected' || !account.instance_name) return false
+      if (canOperate.get(campaign.account_id) === false) return false
+    }
+    const instance = instanceOf(campaign)
+    if (instance && !connected.has(`${campaign.business_id}|${instance}`)) return false
     return true
   })
   if (!eligible.length) return { queued: 0 }
@@ -332,8 +380,9 @@ export async function runCampaignScheduler(supabase, { seed = true } = {}) {
     let step
     let nextStepNumber = (enrollment.current_step ?? 0) + 1
     if (campaign.ai_managed) {
-      let business = businessCache.get(campaign.business_id)
-      if (!business) { business = await getBusiness(supabase, campaign.business_id); businessCache.set(campaign.business_id, business) }
+      const cacheKey = `${campaign.business_id}|${campaign.account_id ?? ''}`
+      let business = businessCache.get(cacheKey)
+      if (!business) { business = await getBusinessForAccount(supabase, campaign.business_id, campaign.account_id ?? null); businessCache.set(cacheKey, business) }
       if (!business) continue
       const planned = await planAiEnrollment(supabase, { enrollment, campaign, business })
       if (planned.action === 'wait') continue
@@ -418,6 +467,7 @@ export async function runCampaignScheduler(supabase, { seed = true } = {}) {
         enrollment,
         row: {
           business_id: campaign.business_id,
+          ...((campaign.account_id ?? contact.account_id) ? { account_id: campaign.account_id ?? contact.account_id } : {}),
           contact_id: enrollment.lead_id,
           conversation_id: conv?.id ?? null,
           campaign_id: enrollment.campaign_id,
@@ -427,7 +477,7 @@ export async function runCampaignScheduler(supabase, { seed = true } = {}) {
           klt_phase: campaign.ai_managed ? (step.klt_phase ?? 'know') : 'know',
           final_message: resolveMergeFields(step.content, contact),
           media: resolveMediaMergeFields(step.media, contact),
-          assigned_instance_name: campaign.whatsapp_instance_name,
+          assigned_instance_name: instanceOf(campaign),
           approval_status: 'approved',
           status: 'pending',
           scheduled_at: now

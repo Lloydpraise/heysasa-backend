@@ -9,12 +9,13 @@ import { logTurn } from './turns.js'
 const HOLD_AFTER_NEGATIVES = 2
 const HOLD_DAYS = 14
 
-export async function recordFeedback(supabase, { businessId, contactId, campaignId = null, label, stepNumber = null, replyText = null }) {
+// lead_ai_state keeps its (business_id, contact_id) key: a contact belongs to one account anyway.
+export async function recordFeedback(supabase, { businessId, accountId = null, contactId, campaignId = null, label, stepNumber = null, replyText = null }) {
   if (!businessId || !contactId || !label) return
   const { data: state } = await supabase.from('lead_ai_state').select('negative_count, hold_until')
     .eq('business_id', businessId).eq('contact_id', contactId).maybeSingle()
 
-  const patch = { business_id: businessId, contact_id: contactId, last_feedback: label, updated_at: new Date().toISOString() }
+  const patch = { business_id: businessId, ...(accountId ? { account_id: accountId } : {}), contact_id: contactId, last_feedback: label, updated_at: new Date().toISOString() }
   let held = false
   if (label === 'negative') {
     patch.negative_count = (state?.negative_count ?? 0) + 1
@@ -29,7 +30,7 @@ export async function recordFeedback(supabase, { businessId, contactId, campaign
   await supabase.from('lead_ai_state').upsert(patch, { onConflict: 'business_id,contact_id' })
 
   await logTurn(supabase, {
-    businessId, contactId, campaignId, kind: 'feedback', decision: label, stepNumber,
+    businessId, accountId, contactId, campaignId, kind: 'feedback', decision: label, stepNumber,
     reason: replyText ? String(replyText).slice(0, 200) : null, details: { held },
   })
 }

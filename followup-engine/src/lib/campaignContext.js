@@ -13,10 +13,13 @@ export async function getCustomerProfile(supabase, contactId) {
   } catch { return null }
 }
 
-export async function getAutoCampaignContext(supabase, businessId, ruleId) {
+// Auto-campaign configs are per account (account_id, rule_id); without an account, the business's only one.
+export async function getAutoCampaignContext(supabase, businessId, ruleId, accountId = null) {
   try {
+    let cfgQuery = supabase.from('auto_campaign_configs').select('objective, playbook').eq('business_id', businessId).eq('rule_id', ruleId)
+    if (accountId) cfgQuery = cfgQuery.eq('account_id', accountId)
     const [{ data: cfg }, { data: def }] = await Promise.all([
-      supabase.from('auto_campaign_configs').select('objective, playbook').eq('business_id', businessId).eq('rule_id', ruleId).maybeSingle(),
+      cfgQuery.limit(1).maybeSingle(),
       supabase.rpc('resolve_auto_campaign_default', { p_business_id: businessId, p_rule_id: ruleId }).maybeSingle()
     ])
     return {

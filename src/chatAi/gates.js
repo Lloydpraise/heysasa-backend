@@ -15,6 +15,7 @@ export const SKIP_MESSAGES = {
   empty_message: 'The message had no text.',
   stale_message: 'The message is too old to answer naturally.',
   switch_off: 'Chat AI is switched off for this business.',
+  account_suspended: 'This WhatsApp number is suspended (access fee unpaid or account closed).',
   subscription_inactive: 'The subscription is not active.',
   cap_zero: 'The daily chat limit is 0.',
   chat_paused: 'The AI is paused for this chat.',
@@ -46,6 +47,8 @@ export function evaluateMessageGates({ message, business, now = new Date() }) {
   if (sentAt && now.getTime() - sentAt.getTime() > STALE_MESSAGE_MINUTES * 60_000) return { allow: false, reason: 'stale_message' };
 
   if (!business || business.chat_ai_enabled !== true) return { allow: false, reason: 'switch_off' };
+  // A suspended or closed account (see account_can_operate) is treated like the switch being off: nothing is answered.
+  if (business.account_can_operate === false) return { allow: false, reason: 'account_suspended' };
   if (business.subscription_active === false) return { allow: false, reason: 'subscription_inactive' };
   if (!(Number(business.chat_ai_daily_cap) > 0)) return { allow: false, reason: 'cap_zero' };
   return { allow: true };

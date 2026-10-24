@@ -207,6 +207,16 @@
     </div>
 
     <div class="card">
+      <div class="row" style="align-items:center">
+        <strong>WhatsApp account access fees (KES 10,000 per number per month)</strong>
+        <select id="inv-status" style="flex:0 0 130px"><option value="due" selected>Unpaid</option><option value="paid">Paid</option><option value="">All</option></select>
+        <button class="btn" id="inv-run" style="flex:0 0 150px">Issue due invoices</button>
+      </div>
+      <div style="overflow-x:auto;margin-top:8px"><div id="inv-table">Loading…</div></div>
+      <p class="hint">Invoices are issued 3 days before an account's paid period ends, every night. Mark one paid when the money arrives: the account's paid-until date moves forward a month. Accounts are only suspended for non-payment when "Enforce access fee" is 1 under Pricing.</p>
+    </div>
+
+    <div class="card">
       <strong>Pricing — change anything we charge for (no code)</strong>
       <div id="b-prices" style="margin-top:8px">Loading…</div>
     </div>
@@ -234,6 +244,7 @@
       <strong>Add / remove credit</strong>
       <div class="row" style="align-items:flex-end">
         <div style="flex:2"><label>Business</label><select id="cr-biz"></select></div>
+        <div style="flex:2"><label>Pay into</label><select id="cr-acct"><option value="">Business wallet</option></select></div>
         <div><label>Wallet</label><select id="cr-cur"><option value="KES">KES (what the customer paid)</option><option value="USD">USD</option></select></div>
         <div><label>Amount (negative removes)</label><input id="cr-amt" type="number" step="any" placeholder="500"></div>
         <div style="flex:2"><label>Note</label><input id="cr-note" placeholder="M-Pesa top-up"></div>
@@ -608,8 +619,33 @@ async function loadBilling() {
     flash('Model prices saved.'); await loadBilling();
   })));
 
+  await loadInvoices();
   $('cr-biz').innerHTML = o.businesses.map((b) => `<option value="${esc(b.business_id)}">${esc(b.name || b.business_id)}</option>`).join('');
+  await loadCreditAccounts();
 }
+async function loadInvoices() {
+  const { invoices } = await api('/accounts/invoices' + ($('inv-status').value ? '?status=' + $('inv-status').value : ''));
+  $('inv-table').innerHTML = invoices.length ? `<table style="width:100%;border-collapse:collapse"><thead><tr style="text-align:left;color:var(--mute)"><th>Business</th><th>Account</th><th>Billed to</th><th>Period</th><th>Amount</th><th>Due</th><th>Status</th><th></th></tr></thead><tbody>` +
+    invoices.map((i) => `<tr data-i="${esc(i.id)}" style="border-top:1px solid var(--line)"><td>${esc(i.businesses?.name || i.business_id)}</td>
+      <td>${esc(i.accounts?.label || '')}<small class="hint" style="display:block;margin:0">${esc(i.accounts?.phone_number ? '+' + i.accounts.phone_number : 'no number yet')} · ${esc(i.accounts?.subscription_status || '')}</small></td>
+      <td>${esc(i.bill_to)}</td><td>${esc(i.period_start)} to ${esc(i.period_end)}</td><td>${kes(i.amount_kes)}</td><td>${new Date(i.due_at).toLocaleDateString()}</td>
+      <td>${i.status === 'paid' ? '<span class="pill">paid</span>' : esc(i.status)}</td>
+      <td>${i.status === 'due' ? '<input class="inv-ref" placeholder="M-Pesa ref" style="width:110px"> <button class="btn inv-paid">Mark paid</button>' : esc(i.reference || '')}</td></tr>`).join('') + '</tbody></table>'
+    : '<div class="hint">No invoices.</div>';
+  $('inv-table').querySelectorAll('tr[data-i]').forEach((tr) => { const b = tr.querySelector('.inv-paid'); if (b) b.onclick = guard(async () => {
+    await api(`/accounts/invoices/${tr.dataset.i}/paid`, { method: 'POST', body: { reference: tr.querySelector('.inv-ref').value } });
+    flash('Invoice marked paid.'); await loadInvoices();
+  }); });
+}
+$('inv-status').onchange = guard(loadInvoices);
+// Accounts on separate billing have their own wallet; list them for the chosen business.
+async function loadCreditAccounts() {
+  const { accounts } = await api('/accounts?business_id=' + encodeURIComponent($('cr-biz').value));
+  $('cr-acct').innerHTML = '<option value="">Business wallet</option>' + accounts.filter((a) => a.billing_mode === 'separate')
+    .map((a) => `<option value="${esc(a.id)}">${esc(a.label || 'Account')} (own wallet)</option>`).join('');
+}
+$('cr-biz').onchange = guard(loadCreditAccounts);
+$('inv-run').onclick = guard(async () => { const { result } = await api('/run/account-billing', { method: 'POST' }); flash(`Issued ${result.issued}, past due ${result.past_due}, suspended ${result.suspended}.`); await loadInvoices(); });
 $('b-refresh').onclick = guard(loadBilling);
 $('b-days').onchange = guard(loadBilling);
 $('nr-add').onclick = guard(async () => {
@@ -619,7 +655,7 @@ $('nr-add').onclick = guard(async () => {
   flash('Runner added. Have it call bill_ai_usage with this id.'); await loadBilling();
 });
 $('cr-go').onclick = guard(async () => {
-  const r = await api('/billing/credit', { method: 'POST', body: { business_id: $('cr-biz').value, currency: $('cr-cur').value, amount: $('cr-amt').value, note: $('cr-note').value } });
+  const r = await api('/billing/credit', { method: 'POST', body: { business_id: $('cr-biz').value, account_id: $('cr-acct').value || null, currency: $('cr-cur').value, amount: $('cr-amt').value, note: $('cr-note').value } });
   flash(`Done. New balance: ${usd(r.new_balance, 2)} (${kes(r.new_balance_kes)})`); $('cr-amt').value = ''; await loadBilling();
 });
 

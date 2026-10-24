@@ -1,6 +1,7 @@
 // The business at a glance, and the setup steps that get an owner to value fastest.
 import { fetchAll, isCustomerLead, isWaiting, must, plural, round1 } from '../helpers.js';
 import { loadLeads } from './leads.js';
+import { settingsResult } from './settings.js';
 
 export const SETUP_ORDER = ['whatsapp', 'chats_loaded', 'chats_studied', 'persona', 'products', 'followups', 'auto_lists', 'auto_campaigns', 'chat_ai'];
 
@@ -24,7 +25,7 @@ const get_business_snapshot = {
   parameters: { type: 'object', properties: {}, additionalProperties: false },
   async run(ctx) {
     const [business, sessions, leads, rules, autos, campaigns, products, pending, balance] = await Promise.all([
-      ctx.db.from('businesses').select('*').eq('business_id', ctx.businessId).maybeSingle(),
+      settingsResult(ctx),   // the account's view of the settings
       ctx.db.from('whatsapp_sessions').select('instance_name, status').eq('business_id', ctx.businessId),
       loadLeads(ctx.db, ctx.businessId),
       ctx.db.from('segmentation_rules').select('rule_id, enabled').eq('business_id', ctx.businessId),

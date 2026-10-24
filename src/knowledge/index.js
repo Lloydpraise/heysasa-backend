@@ -31,11 +31,11 @@ export function createKnowledgeForApp() {
     const service = createKnowledgeService({
         supabase, log,
         canAfford: (businessId) => canAffordAssistant(supabase, businessId),
-        makeAi(businessId) {
+        makeAi(businessId, accountId = null) {
             const ai = createFileAi({
                 apiKey,
                 onUsage: ({ model, promptTokens, cachedTokens, completionTokens }) => {
-                    billAiUsage(supabase, { businessId, runner: KNOWLEDGE_RUNNER, model, promptTokens, cachedTokens, completionTokens })
+                    billAiUsage(supabase, { businessId, accountId, runner: KNOWLEDGE_RUNNER, model, promptTokens, cachedTokens, completionTokens })
                         .catch((e) => log('error', `knowledge billing failed: ${e.message}`, { businessId }));
                 },
             });

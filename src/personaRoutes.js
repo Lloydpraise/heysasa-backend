@@ -2,8 +2,10 @@ import express from 'express';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { supabase } from './config/supabase.js';
-import { isDebugTokenValid } from './middleware/debugAuth.js';
 import { logEvent } from './services/debugConsole.js';
+import { scopeOrDebug } from './utils/requestScope.js';
+import { forAccount } from './middleware/accessScope.js';
+import { loadActivePack, packGaps, mergeAnswers, savePackVersion } from './personaPack.js';
 
 // Mirrors the analysisProcess spawn pattern in index.js exactly (same
 // child-process shape, same @@LOG forwarding convention) so this shows up
@@ -14,6 +16,7 @@ const router = express.Router();
 
 let personaProcess = null;
 let personaBusinessId = null;
+let personaAccountIds = [];
 
 function forwardPersonaLine(line, fallbackLevel) {
     if (!line) return;
@@ -30,61 +33,29 @@ function forwardPersonaLine(line, fallbackLevel) {
 
 function personaStatus() {
     return personaProcess
-        ? { running: true, pid: personaProcess.pid, businessId: personaBusinessId }
-        : { running: false, businessId: null };
+        ? { running: true, pid: personaProcess.pid, businessId: personaBusinessId, accountIds: personaAccountIds }
+        : { running: false, businessId: null, accountIds: [] };
 }
 
-// businessId is the key for this whole flow. Read it from the X-Business-Id
-// header first — same convention followup-engine/src/api/authMiddleware.js
-// already uses — falling back to the JSON body for callers that prefer that.
-// Ownership check mirrors src/index.js's existing startAnalysis handler
-// (owner_email off the Supabase auth JWT), so this behaves the same way as
-// the analyser trigger the frontend already calls.
-async function resolveBusinessId(req, res) {
-    const headerBusinessId = typeof req.headers['x-business-id'] === 'string' ? req.headers['x-business-id'].trim() : null;
-    const bodyBusinessId = typeof req.body?.businessId === 'string' ? req.body.businessId.trim() : null;
-    const requestedBusinessId = headerBusinessId || bodyBusinessId;
+// Who may run or read the persona: the shared scope (owner, admin or a team member on their account), or the
+// debug token. See src/utils/requestScope.js and ACCOUNTS.md.
+async function resolveScopeFor(req, res, opts) {
+    return scopeOrDebug(req, res, opts);
+}
 
-    if (!requestedBusinessId) {
-        res.status(400).json({ ok: false, error: 'missing_business_id' });
-        return null;
-    }
-
-    if (isDebugTokenValid(req)) {
-        return requestedBusinessId;
-    }
-
-    const authHeader = req.headers.authorization || '';
-    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : null;
-    if (!token) {
-        res.status(401).json({ ok: false, error: 'missing_auth_token' });
-        return null;
-    }
-
-    const { data: userData, error: userError } = await supabase.auth.getUser(token);
-    if (userError || !userData?.user?.email) {
-        res.status(401).json({ ok: false, error: 'invalid_auth_token' });
-        return null;
-    }
-
-    const { data: ownedBusiness, error: businessError } = await supabase
-        .from('businesses')
-        .select('business_id')
-        .eq('business_id', requestedBusinessId)
-        .eq('owner_email', userData.user.email)
-        .maybeSingle();
-    if (businessError || !ownedBusiness) {
-        res.status(403).json({ ok: false, error: 'business_not_owned' });
-        return null;
-    }
-
-    return ownedBusiness.business_id;
+// Each account generates its own pack from its own chats. A business-wide request generates one pack per
+// account, one after the other (accountIds in PERSONA_CONFIG); the generator handles the loop.
+async function accountsToGenerate(scope) {
+    if (scope.accountId) return [scope.accountId];
+    return scope.accountIds?.length ? scope.accountIds : [];
 }
 
 router.post(['/persona/generate', '/debug/persona/generate'], async (req, res, next) => {
     try {
-        const businessId = await resolveBusinessId(req, res);
-        if (!businessId) return; // response already sent by resolveBusinessId
+        const scope = await resolveScopeFor(req, res);
+        if (!scope) return; // response already sent
+        const businessId = scope.businessId;
+        const accountIds = await accountsToGenerate(scope);
 
         if (personaProcess) {
             res.status(409).json({ ok: false, message: 'Persona generation is already running', ...personaStatus() });
@@ -97,15 +68,16 @@ router.post(['/persona/generate', '/debug/persona/generate'], async (req, res, n
         const projectRoot = fileURLToPath(new URL('../', import.meta.url));
 
         personaBusinessId = businessId;
+        personaAccountIds = accountIds;
         logEvent({
             level: 'info', area: 'persona', event: 'persona.spawn',
-            message: `Starting generate-persona-pack.js for ${businessId}`,
-            business_id: businessId
+            message: `Starting generate-persona-pack.js for ${businessId}${accountIds.length ? ` (${accountIds.length} account${accountIds.length === 1 ? '' : 's'})` : ''}`,
+            business_id: businessId, details: { accountIds }
         });
 
         personaProcess = spawn(process.execPath, ['generate-persona-pack.js'], {
             cwd: projectRoot,
-            env: { ...process.env, PERSONA_CONFIG: JSON.stringify({ businessId, force }) },
+            env: { ...process.env, PERSONA_CONFIG: JSON.stringify({ businessId, accountIds, force }) },
             stdio: ['ignore', 'pipe', 'pipe']
         });
 
@@ -131,6 +103,7 @@ router.post(['/persona/generate', '/debug/persona/generate'], async (req, res, n
             });
             personaProcess = null;
             personaBusinessId = null;
+            personaAccountIds = [];
         });
         personaProcess.on('close', (code, signal) => {
             if (stdoutPending.trim()) forwardPersonaLine(stdoutPending, 'info');
@@ -142,6 +115,7 @@ router.post(['/persona/generate', '/debug/persona/generate'], async (req, res, n
             });
             personaProcess = null;
             personaBusinessId = null;
+            personaAccountIds = [];
         });
 
         res.status(202).json({ ok: true, message: 'Persona pack generation started', ...personaStatus() });
@@ -152,12 +126,14 @@ router.post(['/persona/generate', '/debug/persona/generate'], async (req, res, n
 
 // Latest run of a type for one business, straight from the database, so status
 // survives restarts and shows the current phase (e.g. waiting_for_analysis).
-async function latestRun(businessId, runTypes) {
-    const { data } = await supabase
+// Runs belong to an account (enrichment_runs.account_id); the business-wide view sees the latest of any account.
+async function latestRun(scope, runTypes) {
+    const query = supabase
         .from('enrichment_runs')
-        .select('id, run_type, status, phase, progress_done, progress_total, started_at, finished_at, heartbeat_at, fatal_error, summary')
-        .eq('business_id', businessId)
-        .in('run_type', runTypes)
+        .select('id, run_type, status, phase, progress_done, progress_total, started_at, finished_at, heartbeat_at, fatal_error, summary, account_id')
+        .eq('business_id', scope.businessId)
+        .in('run_type', runTypes);
+    const { data } = await forAccount(query, scope)
         .order('started_at', { ascending: false })
         .limit(1)
         .maybeSingle();
@@ -166,13 +142,16 @@ async function latestRun(businessId, runTypes) {
 
 router.get('/persona/status', async (req, res, next) => {
     try {
-        const businessId = await resolveBusinessId(req, res);
-        if (!businessId) return;
+        const scope = await resolveScopeFor(req, res);
+        if (!scope) return;
+        const businessId = scope.businessId;
 
-        const mine = !!personaProcess && personaBusinessId === businessId;
-        const [run, analysis] = await Promise.all([
-            latestRun(businessId, ['persona_pack']),
-            latestRun(businessId, ['full_pass', 'contact_pass']),
+        const mine = !!personaProcess && personaBusinessId === businessId
+            && (!scope.accountId || personaAccountIds.includes(scope.accountId));
+        const [run, analysis, active] = await Promise.all([
+            latestRun(scope, ['persona_pack']),
+            latestRun(scope, ['full_pass', 'contact_pass']),
+            loadActivePack(supabase, businessId, scope.accountId, 'id, version, pack, account_id'),
         ]);
         const state = mine ? 'running'
             : run?.status === 'completed' ? 'ready'
@@ -183,8 +162,71 @@ router.get('/persona/status', async (req, res, next) => {
             state,
             running: mine,
             businessId,
+            accountId: scope.accountId,
             run,        // phase, summary.reason (why nothing was generated), funnel counts
             analysis,   // the analyser run this pack depends on
+            source: active.source,          // 'account' (its own pack), 'business' (the business-wide fallback) or null
+            version: active.row?.version ?? null,
+            gaps: packGaps(active.pack),    // key fields still empty: the persona screen asks the owner these
+        });
+    } catch (error) {
+        next(error);
+    }
+});
+
+// The pack the selected account uses, where it comes from, and what is still missing.
+//   GET  /persona          -> { pack, source: 'account'|'business'|null, version, gaps: [{ key, question }] }
+//   POST /persona/answers  { answers: { tone, greeting, products, customers, pricing, delivery, faqs, handoff } }
+//        merges the owner's answers into the account's pack (starting from the business-wide one when the account
+//        has none yet) and saves it as a new active version of the account's pack.
+router.get('/persona', async (req, res, next) => {
+    try {
+        const scope = await resolveScopeFor(req, res);
+        if (!scope) return;
+        const active = await loadActivePack(supabase, scope.businessId, scope.accountId);
+        res.json({
+            ok: true,
+            businessId: scope.businessId,
+            accountId: scope.accountId,
+            source: active.source,
+            version: active.row?.version ?? null,
+            pack: active.pack,
+            gaps: packGaps(active.pack),
+        });
+    } catch (error) {
+        next(error);
+    }
+});
+
+router.post('/persona/answers', async (req, res, next) => {
+    try {
+        // Answers go into one account's pack. The business-wide view (several accounts) writes the business pack.
+        const scope = await resolveScopeFor(req, res);
+        if (!scope) return;
+        const answers = req.body?.answers;
+        if (!answers || typeof answers !== 'object' || Array.isArray(answers)) {
+            res.status(400).json({ ok: false, error: 'answers_required' });
+            return;
+        }
+        if (!scope.accountId && !scope.isAdmin) {
+            res.status(400).json({ ok: false, error: 'account_required' });
+            return;
+        }
+        const active = await loadActivePack(supabase, scope.businessId, scope.accountId);
+        const { pack, applied } = mergeAnswers(active.pack, answers);
+        if (!applied.length) {
+            res.status(400).json({ ok: false, error: 'no_answers' });
+            return;
+        }
+        const saved = await savePackVersion(supabase, { businessId: scope.businessId, accountId: scope.accountId, pack, generatedBy: 'owner_answers' });
+        logEvent({
+            level: 'info', area: 'persona', event: 'persona.answers_saved',
+            message: `Owner answered ${applied.join(', ')}`, business_id: scope.businessId, details: { accountId: scope.accountId, version: saved.version },
+        });
+        res.json({
+            ok: true, applied, version: saved.version,
+            source: scope.accountId ? 'account' : 'business',
+            pack, gaps: packGaps(pack),
         });
     } catch (error) {
         next(error);

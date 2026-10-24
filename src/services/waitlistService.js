@@ -149,34 +149,46 @@ export async function getWaitlistCount() {
 // 5-minute campaign seeder would do, so the welcome goes out within about a minute
 // instead of up to 15. If the list or campaign is not switched on yet, it simply
 // stops here and the sweep picks the person up later. Each person starts at message 1.
+//
+// Waitlist people belong to HeySasa's own WhatsApp account: HEYSASA_ACCOUNT_ID when set, else the HeySasa
+// business's primary account (ACCOUNTS.md). With no account at all it behaves as before.
+async function heysasaAccountId() {
+    if (process.env.HEYSASA_ACCOUNT_ID) return process.env.HEYSASA_ACCOUNT_ID;
+    const { data } = await supabase.from('accounts').select('id, is_primary')
+        .eq('business_id', HEYSASA_BUSINESS_ID).neq('status', 'closed').order('is_primary', { ascending: false }).order('created_at').limit(1).maybeSingle();
+    return data?.id ?? null;
+}
+
 async function attachContactAndEnroll(leadId, { name, phone }) {
     const plusPhone = `+${phone}`;
-    let { data: contact, error: findError } = await supabase
+    const accountId = await heysasaAccountId();
+    const onAccount = (query) => (accountId ? query.eq('account_id', accountId) : query);
+    let { data: contact, error: findError } = await onAccount(supabase
         .from('contacts').select('id')
-        .eq('business_id', HEYSASA_BUSINESS_ID).in('phone', [phone, plusPhone]).limit(1).maybeSingle();
+        .eq('business_id', HEYSASA_BUSINESS_ID).in('phone', [phone, plusPhone])).limit(1).maybeSingle();
     if (findError) throw new Error(`contact lookup failed: ${findError.message}`);
 
     if (!contact) {
         const { data: created, error: createError } = await supabase
             .from('contacts')
-            .insert({ business_id: HEYSASA_BUSINESS_ID, name, phone: plusPhone, country_code: '254', lead_state: 'new' })
+            .insert({ business_id: HEYSASA_BUSINESS_ID, ...(accountId ? { account_id: accountId } : {}), name, phone: plusPhone, country_code: '254', lead_state: 'new' })
             .select('id').single();
         if (createError) throw new Error(`contact create failed: ${createError.message}`);
         contact = created;
     }
 
-    const { error: linkError } = await supabase.from('waitlist_leads').update({ contact_id: contact.id }).eq('id', leadId);
+    const { error: linkError } = await supabase.from('waitlist_leads').update({ contact_id: contact.id, ...(accountId ? { account_id: accountId } : {}) }).eq('id', leadId);
     if (linkError) throw new Error(`waitlist link failed: ${linkError.message}`);
 
-    const { data: list } = await supabase.from('lists').select('id')
-        .eq('business_id', HEYSASA_BUSINESS_ID).eq('rule_id', WAITLIST_RULE_ID).eq('type', 'auto').eq('archived', false).maybeSingle();
+    const { data: list } = await onAccount(supabase.from('lists').select('id')
+        .eq('business_id', HEYSASA_BUSINESS_ID).eq('rule_id', WAITLIST_RULE_ID).eq('type', 'auto').eq('archived', false)).maybeSingle();
     if (!list) return;
 
     const member = await supabase.from('list_members').insert({ list_id: list.id, lead_id: contact.id });
     if (member.error && member.error.code !== '23505') throw new Error(`list member failed: ${member.error.message}`);
 
-    const { data: campaign } = await supabase.from('campaigns').select('id')
-        .eq('business_id', HEYSASA_BUSINESS_ID).eq('list_id', list.id).eq('kind', 'auto').eq('status', 'active').maybeSingle();
+    const { data: campaign } = await onAccount(supabase.from('campaigns').select('id')
+        .eq('business_id', HEYSASA_BUSINESS_ID).eq('list_id', list.id).eq('kind', 'auto').eq('status', 'active')).maybeSingle();
     if (!campaign) return;
 
     const enrol = await supabase.from('campaign_enrollments')

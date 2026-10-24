@@ -1,5 +1,6 @@
 // Chat AI setup: flows (special instructions for chats from an ad or a list) and skills (how it handles situations).
 import { ToolError, asText, clip, isUuid, must, uniq } from '../helpers.js';
+import { settingsResult } from './settings.js';
 
 const MAX_INSTRUCTIONS = 4000;
 
@@ -32,7 +33,7 @@ const get_chat_ai_setup = {
     const [flows, skills, business, targets] = await Promise.all([
       ctx.db.from('chat_flows').select('*').eq('business_id', ctx.businessId).order('priority', { ascending: false }),
       ctx.db.from('chat_ai_skills').select('id, key, title, when_to_use, instructions, enabled').eq('business_id', ctx.businessId),
-      ctx.db.from('businesses').select('*').eq('business_id', ctx.businessId).maybeSingle(),
+      settingsResult(ctx),   // the account's view of the settings
       targetsFor(ctx),
     ]);
     const b = must(business, 'business') ?? {};

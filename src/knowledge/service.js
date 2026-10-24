@@ -7,6 +7,7 @@
 
 import { chunkPages } from './chunker.js';
 import { FAILURE_TEXT, FILE_TYPES, inferFileType } from './extract.js';
+import { forAccountOrShared } from '../middleware/accessScope.js';
 
 export const BUCKET = 'business-knowledge';
 export const KINDS = ['procedure', 'catalogue', 'policy', 'product_info', 'faq', 'other'];
@@ -26,7 +27,12 @@ export function cleanInput(raw = {}) {
     };
 }
 
-// makeAi(businessId) -> { ai, extractor }: built per source so every AI call is billed to the business that owns the file.
+// makeAi(businessId, accountId) -> { ai, extractor }: built per source so every AI call is billed to the business
+// (and the account, when the file belongs to one) that owns the file.
+//
+// Knowledge is part of the business catalog (ACCOUNTS.md rule 6): a source with account_id null is shared by every
+// WhatsApp account; one added while an account was selected belongs to that account. Every method takes the
+// request `scope` (optional): reads and changes then see the account's own sources plus the shared ones.
 export function createKnowledgeService({ supabase, makeAi, canAfford, log = () => {}, now = () => new Date() }) {
     const fail = (id, code, detail) => supabase.from('knowledge_sources').update({
         status: 'failed', status_detail: detail || FAILURE_TEXT[code] || 'This file could not be analysed.', updated_at: now().toISOString(),
@@ -45,7 +51,7 @@ export function createKnowledgeService({ supabase, makeAi, canAfford, log = () =
         try {
             if (canAfford && !(await canAfford(source.business_id))) { await fail(sourceId, 'no_balance'); return { ok: false, error: 'no_balance' }; }
 
-            const { ai, extractor } = makeAi(source.business_id);
+            const { ai, extractor } = makeAi(source.business_id, source.account_id ?? null);
             let buffer = null;
             if (source.file_type !== 'text' || !source.raw_text) buffer = await download(source.storage_path);
             const { pages, method } = await extractor.extract({
@@ -62,7 +68,7 @@ export function createKnowledgeService({ supabase, makeAi, canAfford, log = () =
             // Replace the old pieces (a retry or an edited note) only after the new ones are ready to go in.
             await supabase.from('knowledge_chunks').delete().eq('source_id', sourceId);
             const rows = chunks.map((c, i) => ({
-                source_id: sourceId, business_id: source.business_id, chunk_index: c.index, page: c.page, content: c.content, embedding: vectors[i],
+                source_id: sourceId, business_id: source.business_id, account_id: source.account_id ?? null, chunk_index: c.index, page: c.page, content: c.content, embedding: vectors[i],
             }));
             for (let i = 0; i < rows.length; i += 50) {
                 const { error: insertError } = await supabase.from('knowledge_chunks').insert(rows.slice(i, i + 50));
@@ -87,17 +93,19 @@ export function createKnowledgeService({ supabase, makeAi, canAfford, log = () =
     return {
         process: analyse,
 
-        async list(businessId) {
-            const { data, error } = await supabase.from('knowledge_sources')
-                .select('id, title, use_case, kind, file_type, used_by, is_active, status, status_detail, file_name, mime_type, size_bytes, summary, chunk_count, content_chars, raw_text, created_at, updated_at, processed_at')
-                .eq('business_id', businessId).order('created_at', { ascending: false });
+        async list(businessId, scope = null) {
+            const { data, error } = await forAccountOrShared(supabase.from('knowledge_sources')
+                .select('id, title, use_case, kind, file_type, used_by, is_active, status, status_detail, file_name, mime_type, size_bytes, summary, chunk_count, content_chars, raw_text, created_at, updated_at, processed_at, account_id')
+                .eq('business_id', businessId), scope).order('created_at', { ascending: false });
             if (error) throw new Error(error.message);
             return data ?? [];
         },
 
         // input: { title, use_case, kind, used_by, is_active } plus either { text } (a typed note) or
         // { storage_path, file_name, mime_type, size_bytes, file_type? } (a file the browser already uploaded).
-        async create({ businessId, userId = null, input }) {
+        // accountId: the account the dashboard had selected when the file was added (it then belongs to that account);
+        // null keeps it in the shared business catalog.
+        async create({ businessId, userId = null, input, accountId = null }) {
             const base = cleanInput(input);
             if (!base.title) return { ok: false, status: 400, error: 'title_required' };
 
@@ -119,14 +127,14 @@ export function createKnowledgeService({ supabase, makeAi, canAfford, log = () =
                 };
             }
             const { data, error } = await supabase.from('knowledge_sources')
-                .insert({ ...row, business_id: businessId, created_by: userId, status: 'processing' }).select('id').single();
+                .insert({ ...row, business_id: businessId, account_id: accountId, created_by: userId, status: 'processing' }).select('id').single();
             if (error) return { ok: false, status: 500, error: 'could_not_save' };
             setImmediate(() => { analyse(data.id).catch((e) => log('error', `knowledge analysis crashed: ${e.message}`)); });
             return { ok: true, id: data.id };
         },
 
-        async update({ businessId, id, patch }) {
-            const { data: source } = await supabase.from('knowledge_sources').select('id, file_type, raw_text').eq('id', id).eq('business_id', businessId).maybeSingle();
+        async update({ businessId, id, patch, scope = null }) {
+            const { data: source } = await forAccountOrShared(supabase.from('knowledge_sources').select('id, file_type, raw_text').eq('id', id).eq('business_id', businessId), scope).maybeSingle();
             if (!source) return { ok: false, status: 404, error: 'not_found' };
             const update = { updated_at: now().toISOString() };
             const clean = cleanInput({ ...source, ...patch });
@@ -148,16 +156,16 @@ export function createKnowledgeService({ supabase, makeAi, canAfford, log = () =
             return { ok: true };
         },
 
-        async retry({ businessId, id }) {
-            const { data: source } = await supabase.from('knowledge_sources').select('id').eq('id', id).eq('business_id', businessId).maybeSingle();
+        async retry({ businessId, id, scope = null }) {
+            const { data: source } = await forAccountOrShared(supabase.from('knowledge_sources').select('id').eq('id', id).eq('business_id', businessId), scope).maybeSingle();
             if (!source) return { ok: false, status: 404, error: 'not_found' };
             await supabase.from('knowledge_sources').update({ status: 'processing', status_detail: null, updated_at: now().toISOString() }).eq('id', id);
             setImmediate(() => { analyse(id).catch(() => {}); });
             return { ok: true };
         },
 
-        async remove({ businessId, id }) {
-            const { data: source } = await supabase.from('knowledge_sources').select('id, storage_path').eq('id', id).eq('business_id', businessId).maybeSingle();
+        async remove({ businessId, id, scope = null }) {
+            const { data: source } = await forAccountOrShared(supabase.from('knowledge_sources').select('id, storage_path').eq('id', id).eq('business_id', businessId), scope).maybeSingle();
             if (!source) return { ok: false, status: 404, error: 'not_found' };
             const { error } = await supabase.from('knowledge_sources').delete().eq('id', id).eq('business_id', businessId);   // pieces go with it
             if (error) return { ok: false, status: 500, error: 'could_not_delete' };
@@ -166,8 +174,8 @@ export function createKnowledgeService({ supabase, makeAi, canAfford, log = () =
         },
 
         // A link to the original file that works for ten minutes.
-        async signedUrl({ businessId, id }) {
-            const { data: source } = await supabase.from('knowledge_sources').select('storage_path, file_name').eq('id', id).eq('business_id', businessId).maybeSingle();
+        async signedUrl({ businessId, id, scope = null }) {
+            const { data: source } = await forAccountOrShared(supabase.from('knowledge_sources').select('storage_path, file_name').eq('id', id).eq('business_id', businessId), scope).maybeSingle();
             if (!source?.storage_path) return { ok: false, status: 404, error: 'not_found' };
             const { data, error } = await supabase.storage.from(BUCKET).createSignedUrl(source.storage_path, 600, { download: source.file_name || true });
             if (error || !data?.signedUrl) return { ok: false, status: 500, error: 'could_not_sign' };

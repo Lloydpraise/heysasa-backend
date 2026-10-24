@@ -1,9 +1,11 @@
 // sasa-brain: the chat AI. The backend calls this after its gates pass (switch on, cap not used up, chat not busy...).
-// POST { business_id, conversation_id, contact_id, trigger_message_id }                 -> a live turn: replies to the customer
-// POST { business_id, simulate: true, message, history?, contact? }                      -> a dry run for the Playground: nothing is sent
+// POST { business_id, account_id?, conversation_id, contact_id, trigger_message_id }    -> a live turn: replies to the customer
+// POST { business_id, account_id?, simulate: true, message, history?, contact? }         -> a dry run for the Playground: nothing is sent
+// account_id is the WhatsApp number (ACCOUNTS.md). A live turn takes it from the conversation when it is missing.
 // Auth: Authorization: Bearer <service role key> for everything.
-//   The Playground (browser) may instead send the signed-in user's own login token, but ONLY for simulate:true,
-//   and only for a business that user owns. A login token can never trigger a live turn.
+//   The Playground (browser) may instead send the signed-in user's own login token, but ONLY for simulate:true, and only
+//   for a business the user owns or is an active team member of (members: only their assigned accounts). The account comes
+//   from the x-account-id header or the body. A login token can never trigger a live turn.
 //
 // Secrets this function needs: OPENAI_API_KEY (already set for your other functions), SUPABASE_URL and
 // SUPABASE_SERVICE_ROLE_KEY (set by Supabase). Optional: SASA_TOOL_SECRET, sent to your own http tools.
@@ -12,6 +14,7 @@ import { createClient } from 'npm:@supabase/supabase-js@2';
 import { runTurn, type TurnInput } from './core/turn.ts';
 import { buildDeps } from './core/deps.ts';
 import { createContextCache } from './core/context.ts';
+import { resolveLiveAccount, resolveUserAccess } from './core/access.ts';
 
 const allowedOrigins = new Set([
   'https://heysasa.co.ke',
@@ -22,11 +25,11 @@ const originAllowed = (origin: string | null) => Boolean(origin) && (
 );
 const corsHeaders = (origin: string | null) => ({
   ...(origin && originAllowed(origin) ? { 'Access-Control-Allow-Origin': origin } : {}),
-  'Access-Control-Allow-Headers': 'authorization, apikey, x-client-info, content-type',
+  'Access-Control-Allow-Headers': 'authorization, apikey, x-client-info, content-type, x-business-id, x-account-id',
   'Access-Control-Allow-Methods': 'POST, OPTIONS',
   'Vary': 'Origin',
 });
-const BUILD = 'chat-live-2026-10-17';
+const BUILD = 'chat-accounts-2026-10-24';
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 // Lives as long as this function instance does. Holds persona, skills, tools, flows and product categories for a short
 // while (30 seconds; categories 5 minutes), so a busy chat does not re-read them on every message. The Playground skips it.
@@ -71,21 +74,24 @@ Deno.serve(async (req) => {
   const db = createClient(url, serviceKey, { auth: { persistSession: false } });
 
   if (!isService) {
-    // A signed-in user (the Playground). Simulations only, and only for a business they own.
+    // A signed-in user (the Playground). Simulations only, for a business they own or work in, on an account they may use.
     if (!input.simulate) return json({ error: 'unauthorized' }, 401);
     const { data: authData, error: authError } = await db.auth.getUser(userToken);
     const userId = authData?.user?.id;
     if (authError || !userId) return json({ error: 'unauthorized' }, 401);
-    const { data: owned, error: ownedError } = await db.from('businesses').select('business_id')
-      .eq('business_id', input.business_id).eq('user_id', userId).maybeSingle();
-    if (ownedError) return json({ error: 'Could not check access to this business.' }, 500);
-    if (!owned) return json({ error: 'forbidden' }, 403);
+    const access = await resolveUserAccess(db, { userId, businessId: input.business_id, accountId: req.headers.get('x-account-id') || input.account_id || null });
+    if (!access.ok) return json({ error: access.error }, access.status);
+    input.account_id = access.accountId;
+  } else if (!input.simulate) {
+    const live = await resolveLiveAccount(db, input);
+    if (!live.ok) return json({ error: live.error }, live.status);
+    input.account_id = live.accountId;
   }
 
   const deps = buildDeps({ db, openaiKey, fetch, sleep, toolSecret: Deno.env.get('SASA_TOOL_SECRET') ?? undefined, contextCache }, input);
 
   const startedAt = Date.now();
-  const tag = { mode: input.simulate ? 'simulate' : 'live', business_id: input.business_id, conversation_id: input.conversation_id ?? null };
+  const tag = { mode: input.simulate ? 'simulate' : 'live', business_id: input.business_id, account_id: input.account_id ?? null, conversation_id: input.conversation_id ?? null };
   console.log(JSON.stringify({ event: 'sasa-brain.start', build: BUILD, ...tag }));
   try {
     const run = runTurn(deps, input);

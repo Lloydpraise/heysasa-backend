@@ -13,21 +13,25 @@ import { groupApprovals } from './homeApprovals.js';
 import { cleanAudience } from '../chatAi/audience.js';
 import { applySwitches, hasBalance, loadBalance } from './switches.js';
 import { shapeHomeSummary } from './homeSummary.js';
-import { RECOMMENDED, followupPrefsFor, prefsFromColumns, describeFollowups, describeChat, FOLLOWUP_COLUMNS } from './defaults.js';
+import { RECOMMENDED, followupPrefsFor, prefsFromColumns, describeFollowups, describeChat } from './defaults.js';
+import { forAccount, forAccountOrShared } from '../middleware/accessScope.js';
+import { loadAccountSettings } from '../services/accounts.js';
 
 const router = express.Router();
 const { store } = buildSetupDeps();
 const head = { count: 'exact', head: true };
 const cnt = async (query) => { const { count, error } = await query; return error ? 0 : (count || 0); };
 
+// Everything here is per WhatsApp account (ACCOUNTS.md): reads use forAccount(req.scope); settings are the
+// account's view (business default + accounts.settings). The business-wide view sees every account's numbers.
+
 router.get('/setup/defaults', async (req, res, next) => {
     try {
         const businessId = await resolveBusinessId(req, res);
         if (!businessId) return;
-        const columns = ['business_type', 'followup_ai_enabled', 'chat_ai_enabled', 'chat_ai_daily_cap', 'chat_ai_settings', 'persona_pack_status', 'subscription_active', ...Object.values(FOLLOWUP_COLUMNS)].join(', ');
-        const { data: business } = await supabase.from('businesses').select(columns).eq('business_id', businessId).maybeSingle();
+        const business = await loadAccountSettings(supabase, req.accountId, businessId);
         if (!business) return res.status(404).json({ ok: false, error: 'business_not_found' });
-        const setup = await store.get(businessId);
+        const setup = await store.get(businessId, req.accountId);
 
         const followupsOn = business.followup_ai_enabled === true;
         const prefs = followupsOn ? prefsFromColumns(business) : followupPrefsFor(setup?.answers || {});
@@ -48,18 +52,19 @@ router.post('/setup/switches', async (req, res, next) => {
     try {
         const businessId = await resolveBusinessId(req, res);
         if (!businessId) return;
+        if (!req.accountId && !req.scope?.isAdmin) return res.status(400).json({ ok: false, error: 'account_required' });
         const { followups, chat, overrides } = req.body || {};
-        const result = await applySwitches({ supabase, store, businessId, request: { followups, chat, overrides } });
+        const result = await applySwitches({ supabase, store, businessId, request: { followups, chat, overrides }, scope: req.scope });
         if (result.error) return res.status(result.status || 400).json({ ok: false, error: result.error });
         return res.json(result);
     } catch (error) { return next(error); }
 });
 
-async function loadApprovals(businessId) {
+async function loadApprovals(businessId, scope) {
     const [{ data: messages }, { data: playbooks }] = await Promise.all([
-        supabase.from('follow_up_queue').select('id, campaign_id, draft_message, qc_passed, scheduled_at')
-            .eq('business_id', businessId).eq('approval_status', 'awaiting_approval').order('scheduled_at', { ascending: true }).limit(2000),
-        supabase.from('ad_playbooks').select('id, ad_id, auto_headline, override_headline').eq('business_id', businessId).eq('status', 'review'),
+        forAccount(supabase.from('follow_up_queue').select('id, campaign_id, draft_message, qc_passed, scheduled_at')
+            .eq('business_id', businessId).eq('approval_status', 'awaiting_approval'), scope).order('scheduled_at', { ascending: true }).limit(2000),
+        forAccount(supabase.from('ad_playbooks').select('id, ad_id, auto_headline, override_headline').eq('business_id', businessId).eq('status', 'review'), scope),
     ]);
     const campaignIds = [...new Set((messages || []).map((m) => m.campaign_id).filter(Boolean))];
     const { data: campaigns } = campaignIds.length ? await supabase.from('campaigns').select('id, name').in('id', campaignIds) : { data: [] };
@@ -70,7 +75,7 @@ router.get('/home/approvals', async (req, res, next) => {
     try {
         const businessId = await resolveBusinessId(req, res);
         if (!businessId) return;
-        return res.json({ ok: true, ...(await loadApprovals(businessId)) });
+        return res.json({ ok: true, ...(await loadApprovals(businessId, req.scope)) });
     } catch (error) { return next(error); }
 });
 
@@ -83,9 +88,9 @@ router.post('/home/approvals/messages/approve', async (req, res, next) => {
         const campaignId = req.body?.campaignId;
         if (typeof campaignId !== 'string' || !campaignId.trim()) return res.status(400).json({ ok: false, error: 'campaign_required' });
 
-        const { data: business } = await supabase.from('businesses').select('whatsapp_channel').eq('business_id', businessId).maybeSingle();
-        let query = supabase.from('follow_up_queue').select('id, draft_message, media, qc_passed')
-            .eq('business_id', businessId).eq('approval_status', 'awaiting_approval').limit(2000);
+        const business = await loadAccountSettings(supabase, req.accountId, businessId);
+        let query = forAccount(supabase.from('follow_up_queue').select('id, draft_message, media, qc_passed')
+            .eq('business_id', businessId).eq('approval_status', 'awaiting_approval'), req.scope).limit(2000);
         query = campaignId === 'other' ? query.is('campaign_id', null) : query.eq('campaign_id', campaignId);
         const { data: rows, error } = await query;
         if (error) return res.status(500).json({ ok: false, error: 'could_not_load' });
@@ -115,36 +120,38 @@ router.get('/home/summary', async (req, res, next) => {
     try {
         const businessId = await resolveBusinessId(req, res);
         if (!businessId) return;
-        res.json({ ok: true, ...shapeHomeSummary(await countHomeSummary(supabase, businessId)) });
+        res.json({ ok: true, ...shapeHomeSummary(await countHomeSummary(supabase, businessId, Date.now(), req.scope)) });
     } catch (error) { return next(error); }
 });
 
 // The raw counts behind Home. Every count is independent and a failed one becomes 0 (see shapeHomeSummary).
-export async function countHomeSummary(db, businessId, now = Date.now()) {
+// scope (optional): narrows every account-scoped count to the selected account; settings are the account's view.
+export async function countHomeSummary(db, businessId, now = Date.now(), scope = null) {
     const iso = (ms) => new Date(ms).toISOString();
     const since = iso(now - 24 * 3600_000);
-    const customers = () => db.from('contacts').select('id', head).eq('business_id', businessId).eq('lead_type', 'business');
+    const acct = (query) => forAccount(query, scope);
+    const customers = () => acct(db.from('contacts').select('id', head).eq('business_id', businessId).eq('lead_type', 'business'));
     const rows = async (query) => { const { data, error } = await query; return error ? [] : (data || []); };
 
     const [business, balanceUsd, rate, sent24h, hot, messages, playbooks, queuedNow, nextSend, chatTurns, newLeads, handoffs,
         adUntouched, recentInbound, dormant, noPrice] = await Promise.all([
-        db.from('businesses').select('business_type, followup_ai_enabled, chat_ai_enabled, persona_pack_status').eq('business_id', businessId).maybeSingle().then((r) => r.data || {}),
+        loadAccountSettings(db, scope?.accountId ?? null, businessId).then((r) => r || {}, () => ({})),
         loadBalance(db, businessId),
         db.from('billing_prices').select('value').eq('key', 'usd_kes_rate').maybeSingle().then((r) => Number(r.data?.value) || null),
-        cnt(db.from('follow_up_queue').select('id', head).eq('business_id', businessId).eq('status', 'sent').gte('processed_at', since)),
+        cnt(acct(db.from('follow_up_queue').select('id', head).eq('business_id', businessId).eq('status', 'sent').gte('processed_at', since))),
         cnt(customers().gte('intent_score', 70).not('lead_state', 'in', '(won,lost)')),
-        cnt(db.from('follow_up_queue').select('id', head).eq('business_id', businessId).eq('approval_status', 'awaiting_approval')),
-        cnt(db.from('ad_playbooks').select('id', head).eq('business_id', businessId).eq('status', 'review')),
-        cnt(db.from('follow_up_queue').select('id', head).eq('business_id', businessId).eq('status', 'ready_to_send')),
-        rows(db.from('follow_up_queue').select('scheduled_at').eq('business_id', businessId).eq('status', 'ready_to_send').gte('scheduled_at', iso(now)).order('scheduled_at', { ascending: true }).limit(1)),
-        rows(db.from('chat_ai_turns').select('conversation_id').eq('business_id', businessId).eq('mode', 'live').in('status', ['replied', 'handoff']).gte('created_at', since).limit(2000)),
+        cnt(acct(db.from('follow_up_queue').select('id', head).eq('business_id', businessId).eq('approval_status', 'awaiting_approval'))),
+        cnt(acct(db.from('ad_playbooks').select('id', head).eq('business_id', businessId).eq('status', 'review'))),
+        cnt(acct(db.from('follow_up_queue').select('id', head).eq('business_id', businessId).eq('status', 'ready_to_send'))),
+        rows(acct(db.from('follow_up_queue').select('scheduled_at').eq('business_id', businessId).eq('status', 'ready_to_send').gte('scheduled_at', iso(now))).order('scheduled_at', { ascending: true }).limit(1)),
+        rows(acct(db.from('chat_ai_turns').select('conversation_id').eq('business_id', businessId).eq('mode', 'live').in('status', ['replied', 'handoff']).gte('created_at', since)).limit(2000)),
         cnt(customers().gte('created_at', since)),
-        cnt(db.from('conversations').select('id', head).eq('business_id', businessId).eq('handover_flag', true).is('handover_resolved_at', null)),
+        cnt(acct(db.from('conversations').select('id', head).eq('business_id', businessId).eq('handover_flag', true).is('handover_resolved_at', null))),
         cnt(customers().eq('is_ad_lead', true).is('last_outbound_at', null).not('lead_state', 'in', '(won,lost)')),
-        rows(db.from('contacts').select('last_inbound_at, last_outbound_at').eq('business_id', businessId).eq('lead_type', 'business')
-            .lt('last_inbound_at', iso(now - 12 * 3600_000)).gte('last_inbound_at', iso(now - 14 * 86400_000)).limit(2000)),
+        rows(acct(db.from('contacts').select('last_inbound_at, last_outbound_at').eq('business_id', businessId).eq('lead_type', 'business')
+            .lt('last_inbound_at', iso(now - 12 * 3600_000)).gte('last_inbound_at', iso(now - 14 * 86400_000))).limit(2000)),
         cnt(customers().gte('intent_score', 40).lt('last_inbound_at', iso(now - 14 * 86400_000)).not('lead_state', 'in', '(won,lost)')),
-        cnt(db.from('products').select('id', head).eq('business_id', businessId).eq('status', 'approved').is('price', null)),
+        cnt(forAccountOrShared(db.from('products').select('id', head).eq('business_id', businessId).eq('status', 'approved').is('price', null), scope)),
     ]);
 
     // Waiting for a reply: the customer wrote last, more than 12 hours ago.

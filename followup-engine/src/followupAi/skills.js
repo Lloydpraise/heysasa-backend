@@ -1,12 +1,13 @@
 // Loads the skills the Follow-up AI is taught and renders them into a prompt block.
 // Defaults live in defaultSkills.js (synced into followup_ai_default_skills on start so they can be seen and changed in
-// the database too); a business row with the same key overrides the default, enabled = false removes it.
+// the database too); a row of the account (followup_ai_skills is keyed account_id, key) with the same key overrides the
+// default, enabled = false removes it. Rows without an account (from before accounts) apply underneath the account's.
 
 import { DEFAULT_SKILLS } from './defaultSkills.js'
 import { log } from '../lib/log.js'
 
 const TTL_MS = 60_000
-const cache = new Map() // business_id -> { at, skills }
+const cache = new Map() // `${business_id}|${account_id}` -> { at, skills }
 
 export async function ensureDefaultSkills(supabase) {
   const rows = DEFAULT_SKILLS.map(s => ({ ...s, updated_at: new Date().toISOString() }))
@@ -27,17 +28,22 @@ export function mergeSkills(defaults, own) {
   return [...byKey.values()].sort((a, b) => (a.sort_order ?? 100) - (b.sort_order ?? 100) || a.key.localeCompare(b.key))
 }
 
-export async function loadSkills(supabase, businessId, role) {
-  const hit = cache.get(businessId)
+export async function loadSkills(supabase, businessId, role, accountId = null) {
+  const key = `${businessId}|${accountId ?? ''}`
+  const hit = cache.get(key)
   let skills = hit && Date.now() - hit.at < TTL_MS ? hit.skills : null
   if (!skills) {
-    const [{ data: defaults, error: defaultsError }, { data: own }] = await Promise.all([
+    const [{ data: defaults, error: defaultsError }, { data: rows }] = await Promise.all([
       supabase.from('followup_ai_default_skills').select('*').eq('enabled', true),
       supabase.from('followup_ai_skills').select('*').eq('business_id', businessId),
     ])
+    // The account's own rows win over rows without an account; other accounts' rows never apply.
+    const own = accountId
+      ? [...(rows ?? []).filter(r => !r.account_id), ...(rows ?? []).filter(r => r.account_id === accountId)]
+      : rows
     // Database not seeded yet (or unreachable): the shipped defaults are always there.
     skills = mergeSkills(defaultsError || !defaults?.length ? DEFAULT_SKILLS : defaults, own)
-    cache.set(businessId, { at: Date.now(), skills })
+    cache.set(key, { at: Date.now(), skills })
   }
   return skills.filter(s => !role || (s.used_by ?? []).includes(role))
 }

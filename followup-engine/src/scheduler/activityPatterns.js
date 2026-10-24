@@ -7,7 +7,7 @@ export async function runActivityPatterns(supabase, onlyContactId = null) {
 
   let recentQuery = supabase
     .from('messages')
-    .select('contact_id, business_id')
+    .select('contact_id, business_id, account_id')
     .eq('direction', 'in')
     .gte('created_at', cutoff)
   if (onlyContactId) recentQuery = recentQuery.eq('contact_id', onlyContactId)
@@ -55,6 +55,7 @@ export async function runActivityPatterns(supabase, onlyContactId = null) {
       await supabase.from('contact_activity_patterns').upsert({
         contact_id: item.contact_id,
         business_id: item.business_id,
+        ...(item.account_id ? { account_id: item.account_id } : {}),
         active_hours: activeHours,
         total_messages_analysed: allMsgs.length,
         last_calculated_at: new Date().toISOString()

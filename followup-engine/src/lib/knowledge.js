@@ -10,12 +10,12 @@ import { log } from './log.js'
 const EMBED_MODEL = 'text-embedding-3-small'
 const MENU_TTL_MS = 60_000
 const MAX_PIECES = 4
-const menuCache = new Map()   // businessId -> { at, sources }
+const menuCache = new Map()   // `${businessId}|${accountId}` -> { at, sources }
 
 export const KNOWLEDGE_RUNNER = 'knowledge_analysis'
 const clip = (t, n) => String(t ?? '').replace(/\s+/g, ' ').trim().slice(0, n)
 
-async function embedQuery(text, businessId, { fetchFn = fetch, bill = billAiUsage, billing = billingClient } = {}) {
+async function embedQuery(text, businessId, { fetchFn = fetch, bill = billAiUsage, billing = billingClient, accountId = null } = {}) {
   const res = await fetchFn('https://api.openai.com/v1/embeddings', {
     method: 'POST', headers: { Authorization: `Bearer ${OPENAI_KEY}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({ model: EMBED_MODEL, input: clip(text, 2000) }), signal: AbortSignal.timeout(10_000),
@@ -23,38 +23,41 @@ async function embedQuery(text, businessId, { fetchFn = fetch, bill = billAiUsag
   if (!res.ok) throw new Error(`embedding failed: ${res.status}`)
   const data = await res.json()
   const tokens = data?.usage?.prompt_tokens ?? data?.usage?.total_tokens ?? 0
-  if (tokens) bill(billing, { businessId, runner: KNOWLEDGE_RUNNER, model: EMBED_MODEL, promptTokens: tokens }).catch(() => {})
+  if (tokens) bill(billing, { businessId, accountId, runner: KNOWLEDGE_RUNNER, model: EMBED_MODEL, promptTokens: tokens }).catch(() => {})
   return data?.data?.[0]?.embedding ?? null
 }
 
-async function loadMenu(supabase, businessId, now) {
-  const hit = menuCache.get(businessId)
+// An account sees its own files plus the business-level ones (account_id null, the shared catalog).
+async function loadMenu(supabase, businessId, now, accountId = null) {
+  const key = `${businessId}|${accountId ?? ''}`
+  const hit = menuCache.get(key)
   if (hit && now - hit.at < MENU_TTL_MS) return hit.sources
-  const { data, error } = await supabase.from('knowledge_sources').select('id, title, use_case, file_type')
+  let query = supabase.from('knowledge_sources').select('id, title, use_case, file_type')
     .eq('business_id', businessId).eq('is_active', true).eq('status', 'ready').in('used_by', ['followup', 'both'])
-    .order('created_at', { ascending: true }).limit(30)
+  if (accountId) query = query.or(`account_id.eq.${accountId},account_id.is.null`)
+  const { data, error } = await query.order('created_at', { ascending: true }).limit(30)
   if (error) throw new Error(error.message)
-  menuCache.set(businessId, { at: now, sources: data ?? [] })
+  menuCache.set(key, { at: now, sources: data ?? [] })
   return data ?? []
 }
 
 // -> { block, facts }: `block` goes into the prompt; `facts` is everything the message may legitimately quote (for quality control).
-export async function loadFollowupKnowledge(supabase, { businessId, queryText, deps = {} }) {
+export async function loadFollowupKnowledge(supabase, { businessId, accountId = null, queryText, deps = {} }) {
   const none = { block: '', facts: '' }
   try {
     if (!businessId) return none
     const now = (deps.now ?? Date.now)()
-    const sources = await loadMenu(supabase, businessId, now)
+    const sources = await loadMenu(supabase, businessId, now, accountId)
     if (!sources.length) return none
 
     const menu = sources.map(s => `- ${s.title}${s.use_case ? `: ${clip(s.use_case, 240)}` : ''}`).join('\n')
     let pieces = []
     if (clip(queryText, 10)) {
-      const embedding = await (deps.embed ?? embedQuery)(queryText, businessId, deps)
+      const embedding = await (deps.embed ?? embedQuery)(queryText, businessId, { ...deps, accountId })
       if (embedding) {
-        const { data } = await supabase.rpc('match_knowledge_chunks', {
-          p_business_id: businessId, p_embedding: embedding, p_count: MAX_PIECES, p_threshold: 0.3, p_bot: 'followup', p_source_id: null,
-        })
+        const args = { p_business_id: businessId, p_embedding: embedding, p_count: MAX_PIECES, p_threshold: 0.3, p_bot: 'followup', p_source_id: null }
+        if (accountId) args.p_account_id = accountId
+        const { data } = await supabase.rpc('match_knowledge_chunks', args)
         pieces = (data ?? []).map(r => ({ title: r.title ?? r.source_title ?? 'File', text: clip(r.content, 700) })).filter(p => p.text)
       }
     }

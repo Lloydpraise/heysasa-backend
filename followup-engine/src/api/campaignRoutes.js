@@ -1,14 +1,20 @@
 import { Router } from 'express'
 import { supabase } from '../supabaseClient.js'
+import { forAccount } from './authMiddleware.js'
+import { accountSendState } from '../lib/accounts.js'
 
 export const campaignRouter = Router()
 
+const CAMPAIGN_COLUMNS = 'id, business_id, account_id, status, whatsapp_instance_name, failure_reason, failed_at'
+
+// The campaign must belong to the authenticated business and to the selected account (or, business-wide, to an
+// account the user may see).
 async function loadOwnedCampaign(req, res) {
-  const { data: campaign, error } = await supabase
+  const { data: campaign, error } = await forAccount(supabase
     .from('campaigns')
-    .select('id, business_id, status, whatsapp_instance_name, failure_reason, failed_at')
+    .select(CAMPAIGN_COLUMNS)
     .eq('id', req.params.id)
-    .eq('business_id', req.businessId)
+    .eq('business_id', req.businessId), req.scope)
     .maybeSingle()
 
   if (error) {
@@ -45,26 +51,36 @@ campaignRouter.get('/campaigns/:id/feedback', async (req, res) => {
   res.json(feedback ?? [])
 })
 
+// Re-points a campaign at a WhatsApp connection and resumes it if it was failed/paused.
+// A campaign that belongs to an account always sends from that account's number (accounts.instance_name): any
+// instance_name in the body is ignored. Only campaigns without an account (from before accounts) take one.
 campaignRouter.patch('/campaigns/:id/instance', async (req, res) => {
   const campaign = await loadOwnedCampaign(req, res)
   if (!campaign) return
 
-  const instanceName = req.body?.instance_name?.trim()
-  if (!instanceName) return res.status(400).json({ error: 'instance_name_required' })
+  let instanceName
+  if (campaign.account_id) {
+    const route = await accountSendState(supabase, campaign.account_id)
+    if (!route.ok) return res.status(409).json({ error: route.reason === 'account_suspended' ? 'account_suspended' : 'instance_not_connected' })
+    instanceName = route.instance
+  } else {
+    instanceName = req.body?.instance_name?.trim()
+    if (!instanceName) return res.status(400).json({ error: 'instance_name_required' })
 
-  const { data: session, error: sessionError } = await supabase
-    .from('whatsapp_sessions')
-    .select('instance_name, status, phone_number')
-    .eq('business_id', req.businessId)
-    .eq('instance_name', instanceName)
-    .eq('status', 'connected')
-    .limit(1)
+    const { data: session, error: sessionError } = await supabase
+      .from('whatsapp_sessions')
+      .select('instance_name, status, phone_number')
+      .eq('business_id', req.businessId)
+      .eq('instance_name', instanceName)
+      .eq('status', 'connected')
+      .limit(1)
 
-  if (sessionError) return res.status(500).json({ error: sessionError.message })
-  // whatsapp_sessions is the source of truth now — a connected row is
-  // trusted as-is, no extra live ping to Evolution to re-confirm it.
-  if (!session?.length) {
-    return res.status(409).json({ error: 'instance_not_connected' })
+    if (sessionError) return res.status(500).json({ error: sessionError.message })
+    // whatsapp_sessions is the source of truth now — a connected row is
+    // trusted as-is, no extra live ping to Evolution to re-confirm it.
+    if (!session?.length) {
+      return res.status(409).json({ error: 'instance_not_connected' })
+    }
   }
 
   const updates = { whatsapp_instance_name: instanceName }
@@ -79,7 +95,7 @@ campaignRouter.patch('/campaigns/:id/instance', async (req, res) => {
     .update(updates)
     .eq('id', campaign.id)
     .eq('business_id', req.businessId)
-    .select('id, business_id, status, whatsapp_instance_name, failure_reason, failed_at')
+    .select(CAMPAIGN_COLUMNS)
     .single()
 
   if (error) return res.status(500).json({ error: error.message })

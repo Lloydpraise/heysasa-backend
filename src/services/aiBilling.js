@@ -8,11 +8,14 @@
 // at the default multiplier, and show up in /admin so the multiplier can be set there.
 //
 // followup-engine/src/lib/billing.js has the same wrapper for that separate package.
+//
+// accountId: the WhatsApp account the work was for (ACCOUNTS.md "Billing"). It is recorded on the charge, and an
+// account on separate billing pays from its own wallet. Leave it out for business-wide work.
 
 const RETRIES = 3;
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-export async function billAiUsage(supabase, { businessId, runner, model, promptTokens = 0, cachedTokens = 0, completionTokens = 0, runId = null }) {
+export async function billAiUsage(supabase, { businessId, runner, model, promptTokens = 0, cachedTokens = 0, completionTokens = 0, runId = null, accountId = null }) {
     if (!businessId) {
         console.error(`[billing] AI usage with NO business_id was not billed (runner=${runner}, tokens=${promptTokens}+${completionTokens})`);
         return null;
@@ -28,6 +31,7 @@ export async function billAiUsage(supabase, { businessId, runner, model, promptT
                 p_cached_tokens: Math.round(cachedTokens || 0),
                 p_completion_tokens: Math.round(completionTokens || 0),
                 p_run_id: runId,
+                ...(accountId ? { p_account_id: accountId } : {}),
             });
             if (error) throw new Error(error.message);
             return data;

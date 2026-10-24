@@ -1,17 +1,28 @@
 import { Router } from 'express'
 import { supabase } from '../supabaseClient.js'
 import { log } from '../lib/log.js'
+import { forAccountOrShared } from './authMiddleware.js'
 
 export const materialsRouter = Router()
 
 const VALID_TYPES = ['testimonial', 'tip', 'offer', 'story', 'educational']
 
-// GET /materials — list all materials for this business
+// Materials are the business catalog (ACCOUNTS.md rule 6): business-level rows (account_id null) are shared by every
+// account; a row added while the dashboard had one account selected (X-Account-Id sent) belongs to that account.
+// Business-level rows can be changed by owners and admins; an account's rows by anyone who may open that account.
+function mayChange(scope, accountId) {
+  if (!scope) return true
+  if (!accountId) return scope.isAdmin
+  if (scope.accountId) return accountId === scope.accountId
+  return scope.isAdmin || (scope.accountIds ?? []).includes(accountId)
+}
+
+// GET /materials — the selected account's materials plus the business-level ones
 materialsRouter.get('/materials', async (req, res) => {
-  const { data, error } = await supabase
+  const { data, error } = await forAccountOrShared(supabase
     .from('followup_materials')
-    .select('id, material_type, title, content, image_url, is_active, expires_at, created_at')
-    .eq('business_id', req.businessId)
+    .select('id, account_id, material_type, title, content, image_url, is_active, expires_at, created_at')
+    .eq('business_id', req.businessId), req.scope)
     .order('created_at', { ascending: false })
 
   if (error) return res.status(500).json({ error: error.message })
@@ -32,6 +43,7 @@ materialsRouter.post('/materials', async (req, res) => {
     .from('followup_materials')
     .insert({
       business_id: req.businessId,
+      ...(req.headers?.['x-account-id'] && req.scope?.accountId ? { account_id: req.scope.accountId } : {}),
       material_type: type,
       title: title.trim(),
       content: content.trim(),
@@ -55,9 +67,9 @@ materialsRouter.put('/materials/:id', async (req, res) => {
 
   // Confirm ownership before writing
   const { data: existing, error: fetchErr } = await supabase
-    .from('followup_materials').select('business_id').eq('id', id).single()
+    .from('followup_materials').select('business_id, account_id').eq('id', id).single()
   if (fetchErr || !existing) return res.status(404).json({ error: 'not_found' })
-  if (existing.business_id !== req.businessId) return res.status(403).json({ error: 'forbidden' })
+  if (existing.business_id !== req.businessId || !mayChange(req.scope, existing.account_id)) return res.status(403).json({ error: 'forbidden' })
 
   if (type && !VALID_TYPES.includes(type)) return res.status(400).json({ error: 'invalid_type' })
 
@@ -83,9 +95,9 @@ materialsRouter.delete('/materials/:id', async (req, res) => {
   const { id } = req.params
 
   const { data: existing, error: fetchErr } = await supabase
-    .from('followup_materials').select('business_id').eq('id', id).single()
+    .from('followup_materials').select('business_id, account_id').eq('id', id).single()
   if (fetchErr || !existing) return res.status(404).json({ error: 'not_found' })
-  if (existing.business_id !== req.businessId) return res.status(403).json({ error: 'forbidden' })
+  if (existing.business_id !== req.businessId || !mayChange(req.scope, existing.account_id)) return res.status(403).json({ error: 'forbidden' })
 
   const { error } = await supabase.from('followup_materials').delete().eq('id', id)
   if (error) return res.status(500).json({ error: error.message })

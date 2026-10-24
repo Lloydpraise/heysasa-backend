@@ -1,16 +1,16 @@
 // Calls the sasa-brain edge function for one customer message.
 
 export function createBrainCaller({ url, serviceKey, fetchFn = fetch, timeoutMs = 75_000, log = () => {} }) {
-  return async function callBrain({ businessId, conversationId, contactId, message }) {
+  return async function callBrain({ businessId, accountId = null, conversationId, contactId, message }) {
     if (!url || !serviceKey) throw new Error('SUPABASE_URL or the service key is missing, so the chat AI brain cannot be called');
     const startedAt = Date.now();
-    log('info', 'Chat AI', 'Calling the chat brain (sasa-brain)', { businessId, conversationId, messageId: message.keyId || null });
+    log('info', 'Chat AI', 'Calling the chat brain (sasa-brain)', { businessId, accountId, conversationId, messageId: message.keyId || null });
     let res;
     try {
       res = await fetchFn(`${url.replace(/\/+$/, '')}/functions/v1/sasa-brain`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${serviceKey}` },
-        body: JSON.stringify({ business_id: businessId, conversation_id: conversationId, contact_id: contactId, trigger_message_id: message.keyId || null }),
+        body: JSON.stringify({ business_id: businessId, account_id: accountId || null, conversation_id: conversationId, contact_id: contactId, trigger_message_id: message.keyId || null }),
         signal: AbortSignal.timeout(timeoutMs),
       });
     } catch (e) {

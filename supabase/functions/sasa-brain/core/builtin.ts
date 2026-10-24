@@ -15,7 +15,8 @@ export type QueueResult = { ok: boolean; error?: string; settled: Promise<SendRe
 export type PendingSend = { ids: string[]; settled: Promise<SendResult> };
 
 export type TurnState = {
-  businessId: string; contactId: number | null; conversationId: string | null; currency: string | null; simulate: boolean;
+  // accountId: the WhatsApp number this chat is on. Null only for a business from before accounts.
+  businessId: string; accountId?: string | null; contactId: number | null; conversationId: string | null; currency: string | null; simulate: boolean;
   seenProducts: Map<string, ProductRow>;
   skills: Map<string, { key: string; title: string; instructions: string }>;
   skillsLoaded: Set<string>;
@@ -67,6 +68,13 @@ export function formatPrice(price: number | null | undefined, currency: string |
 }
 
 const str = (v: unknown) => (typeof v === 'string' ? v.trim() : '');
+
+// Account filters (ACCOUNTS.md rule 5). `own`: rows of this account only. `shared`: this account's rows plus the
+// business catalog (account_id null). Both leave the query alone for a business without accounts.
+// deno-lint-ignore no-explicit-any
+export const own = (q: any, accountId: string | null | undefined) => (accountId ? q.eq('account_id', accountId) : q);
+// deno-lint-ignore no-explicit-any
+export const shared = (q: any, accountId: string | null | undefined) => (accountId ? q.or(`account_id.is.null,account_id.eq.${accountId}`) : q);
 const URGENCY_RANK: Record<string, number> = { low: 0, normal: 1, high: 2 };
 
 // Records who must be told about a handoff. The backend reads these rows and sends the WhatsApp message from the
@@ -75,7 +83,7 @@ const URGENCY_RANK: Record<string, number> = { low: 0, normal: 1, high: 2 };
 export async function queueHandoffAlert(
   // deno-lint-ignore no-explicit-any
   db: any,
-  state: Pick<TurnState, 'businessId' | 'contactId' | 'conversationId' | 'handoffConfig' | 'ownerPhone' | 'simulate' | 'handoffAlert'>,
+  state: Pick<TurnState, 'businessId' | 'accountId' | 'contactId' | 'conversationId' | 'handoffConfig' | 'ownerPhone' | 'simulate' | 'handoffAlert'>,
   h: { reason: string; urgency: string; summary: string; ruleId?: string | null; source: 'ai' | 'rule' },
 ): Promise<{ urgency: string }> {
   const config = state.handoffConfig;
@@ -87,9 +95,9 @@ export async function queueHandoffAlert(
   if (state.simulate || !state.conversationId) return { urgency };
   try {
     let contact: { name?: string | null; phone?: string | null } | null = null;
-    if (state.contactId) contact = (await db.from('contacts').select('name, phone').eq('id', state.contactId).maybeSingle())?.data ?? null;
+    if (state.contactId) contact = (await own(db.from('contacts').select('name, phone').eq('id', state.contactId), state.accountId).maybeSingle())?.data ?? null;
     await db.from('handoff_events').insert({
-      business_id: state.businessId, conversation_id: state.conversationId, contact_id: state.contactId, contact_name: contact?.name ?? null,
+      business_id: state.businessId, ...(state.accountId ? { account_id: state.accountId } : {}), conversation_id: state.conversationId, contact_id: state.contactId, contact_name: contact?.name ?? null,
       contact_phone: normalizeDigits(contact?.phone), reason: h.reason, urgency, summary: h.summary, rule_id: rule?.id ?? null, rule_label: rule?.label ?? null,
       source: h.source, recipients: whatsapp ? recipients : [], notify_status: whatsapp && recipients.length ? 'pending' : 'skipped',
     });
@@ -107,8 +115,10 @@ export const builtinHandlers: Record<string, Handler> = {
     const query = str(args.query);
     if (!query) return { error: 'query is required' };
     const embedding = await deps.embed(query);
+    // The account's own products plus the business catalog (filter_account_id, migration 20261024100230).
     const { data, error } = await deps.db.rpc('match_products_v8', {
       query_embedding: embedding, match_threshold: 0.3, match_count: 5, filter_business_id: state.businessId, query_text: query,
+      ...(state.accountId ? { filter_account_id: state.accountId } : {}),
     });
     if (error) throw new Error(`product search failed: ${error.message}`);
     const rows: ProductRow[] = data ?? [];
@@ -153,6 +163,7 @@ export const builtinHandlers: Record<string, Handler> = {
     const embedding = await deps.embed(query);
     const { data, error } = await deps.db.rpc('match_knowledge_chunks', {
       p_business_id: state.businessId, p_embedding: embedding, p_count: 5, p_threshold: 0.25, p_bot: 'chat', p_source_id: sourceId || null,
+      ...(state.accountId ? { p_account_id: state.accountId } : {}),
     });
     if (error) throw new Error(`file search failed: ${error.message}`);
     // deno-lint-ignore no-explicit-any
@@ -170,8 +181,8 @@ export const builtinHandlers: Record<string, Handler> = {
     const listed = state.knowledge.find((k) => k.id === id);
     if (!listed) return { error: `No file with id "${id}". Use an id from the BUSINESS FILES list.` };
     if (listed.file_type !== 'image') return { error: 'Only files marked image can be sent. Describe what the file says instead.' };
-    const { data: row, error } = await deps.db.from('knowledge_sources').select('storage_path, title, mime_type')
-      .eq('id', id).eq('business_id', state.businessId).eq('is_active', true).maybeSingle();
+    const { data: row, error } = await shared(deps.db.from('knowledge_sources').select('storage_path, title, mime_type')
+      .eq('id', id).eq('business_id', state.businessId).eq('is_active', true), state.accountId).maybeSingle();
     if (error || !row?.storage_path) return { error: 'That file could not be found.' };
     const signed = await deps.db.storage.from('business-knowledge').createSignedUrl(row.storage_path, 600);
     const url = signed?.data?.signedUrl;
@@ -199,16 +210,16 @@ export const builtinHandlers: Record<string, Handler> = {
     const tags = Array.isArray(args.objection_tags) ? args.objection_tags.map((t) => str(t).toLowerCase().slice(0, 30)).filter(Boolean).slice(0, 5) : [];
     if (state.simulate || !state.contactId) return { ok: true, simulated: state.simulate };
 
-    const { data: contact, error: readError } = await deps.db.from('contacts').select('notes, objection_tags').eq('id', state.contactId).maybeSingle();
+    const { data: contact, error: readError } = await own(deps.db.from('contacts').select('notes, objection_tags').eq('id', state.contactId), state.accountId).maybeSingle();
     if (readError) throw new Error(`could not read the customer file: ${readError.message}`);
     const stamp = new Date().toISOString().slice(0, 10);
     const update: Record<string, unknown> = { notes: `${contact?.notes ? `${contact.notes}\n` : ''}[${stamp} AI] ${note}`.slice(-4000) };
     if (tags.length) update.objection_tags = [...new Set([...(contact?.objection_tags ?? []), ...tags])].slice(0, 20);
-    const { error: writeError } = await deps.db.from('contacts').update(update).eq('id', state.contactId);
+    const { error: writeError } = await own(deps.db.from('contacts').update(update).eq('id', state.contactId), state.accountId);
     if (writeError) throw new Error(`could not save the note: ${writeError.message}`);
 
     const embedding = await deps.embed(note).catch(() => null);
-    await deps.db.from('customer_notes').insert({ user_id: String(state.contactId), business_id: state.businessId, note, ...(embedding ? { embedding } : {}) });
+    await deps.db.from('customer_notes').insert({ user_id: String(state.contactId), business_id: state.businessId, ...(state.accountId ? { account_id: state.accountId } : {}), note, ...(embedding ? { embedding } : {}) });
     return { ok: true };
   },
 
@@ -253,10 +264,10 @@ export const builtinHandlers: Record<string, Handler> = {
     const alert = await queueHandoffAlert(deps.db, state, { reason, urgency, summary, ruleId, source: 'ai' });
     state.handoff = { reason, urgency: alert.urgency, summary };
     if (state.simulate || !state.conversationId) return { ok: true, simulated: state.simulate, instruction: 'Now send the customer one short message saying the owner will pick up. Do not promise a time.' };
-    const { error } = await deps.db.from('conversations').update({
+    const { error } = await own(deps.db.from('conversations').update({
       handover_flag: true, handover_reason: reason, handover_urgency: alert.urgency, handover_summary: summary,
       handover_at: new Date().toISOString(), handover_source: 'ai', handover_resolved_at: null,
-    }).eq('id', state.conversationId);
+    }).eq('id', state.conversationId), state.accountId);
     if (error) throw new Error(`could not record the handoff: ${error.message}`);
     return { ok: true, instruction: 'Now send the customer one short message saying the owner will pick up. Do not promise a time.' };
   },
@@ -282,7 +293,7 @@ export async function runRegistryTool(row: ToolRow, args: Record<string, unknown
     const res = await deps.fetch(row.target, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...(deps.toolSecret ? { 'x-sasa-secret': deps.toolSecret } : {}) },
-      body: JSON.stringify({ business_id: state.businessId, contact_id: state.contactId, conversation_id: state.conversationId, args }),
+      body: JSON.stringify({ business_id: state.businessId, ...(state.accountId ? { account_id: state.accountId } : {}), contact_id: state.contactId, conversation_id: state.conversationId, args }),
       signal: AbortSignal.timeout(15_000),
     });
     if (!res.ok) throw new Error(`${row.name} returned ${res.status}`);

@@ -46,7 +46,7 @@ export async function runStageClassifier(supabase, deps, onlyConversationId = nu
   const dueBefore = new Date(Date.now() - STAGE_REVIEW_DEBOUNCE_MS).toISOString()
   let dueQuery = supabase
     .from('conversations')
-    .select('id, business_id, contact_id, lead_stage_ecom, lead_stage_service, is_business_chat, stage_review_requested_at')
+    .select('id, business_id, account_id, contact_id, lead_stage_ecom, lead_stage_service, is_business_chat, stage_review_requested_at')
     .not('stage_review_requested_at', 'is', null)
     .lte('stage_review_requested_at', dueBefore)
     .order('stage_review_requested_at', { ascending: true })
@@ -91,6 +91,7 @@ export async function runStageClassifier(supabase, deps, onlyConversationId = nu
         maxTokens: 80,
         cacheKey: `stage:${conv.business_id}`,
         businessId: conv.business_id,
+        accountId: conv.account_id ?? null,
       })
 
       if (!raw) {
@@ -126,7 +127,7 @@ export async function runStageClassifier(supabase, deps, onlyConversationId = nu
         if (!count) {
           await chargeLeadStageChange(
             supabase, conv.business_id, conv.contact_id,
-            existing, result.lead_stage, business.business_type
+            existing, result.lead_stage, business.business_type, conv.account_id ?? null
           ).catch(() => {})
         }
       }

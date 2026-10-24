@@ -12,10 +12,26 @@ export function fakeSupabase(tables = {}, { storage = {} } = {}) {
                 select(_cols, opts) { if (q.op !== 'select') q.returning = true; if (opts?.head) q.head = true; return api; },
                 eq(c, v) { q.filters.push((r) => r[c] === v); return api; },
                 is(c, v) { q.filters.push((r) => (r[c] ?? null) === v); return api; },
+                neq(c, v) { q.filters.push((r) => r[c] !== v); return api; },
+                ilike(c, v) { q.filters.push((r) => typeof r[c] === 'string' && r[c].toLowerCase() === String(v).toLowerCase()); return api; },
+                // Supports the PostgREST forms used by the account helpers: "col.eq.v", "col.is.null", "col.in.(a,b)".
+                or(expr) {
+                    const parts = String(expr).match(/[^,(]+(\([^)]*\))?/g) || [];
+                    const tests = parts.map((p) => {
+                        const [c, op, ...rest] = p.split('.'); const v = rest.join('.');
+                        if (op === 'eq') return (r) => String(r[c]) === v;
+                        if (op === 'is') return (r) => (r[c] ?? null) === null;
+                        if (op === 'in') { const list = v.replace(/[()]/g, '').split(','); return (r) => list.includes(String(r[c])); }
+                        return () => false;
+                    });
+                    q.filters.push((r) => tests.some((t) => t(r)));
+                    return api;
+                },
                 lt(c, v) { q.filters.push((r) => r[c] != null && r[c] < v); return api; },
                 gte(c, v) { q.filters.push((r) => r[c] != null && r[c] >= v); return api; },
                 not(c, op, v) { const list = String(v).replace(/[()]/g, '').split(','); q.filters.push((r) => !(op === 'in' ? list.includes(String(r[c])) : r[c] === v)); return api; },
                 in(c, vs) { q.filters.push((r) => vs.includes(r[c])); return api; },
+                overlaps(c, vs) { q.filters.push((r) => (r[c] || []).some((v) => vs.includes(v))); return api; },
                 order(c, o) { q.orders.push([c, o?.ascending !== false]); return api; },
                 limit(n) { q.limitN = n; return api; },
                 maybeSingle() { q.single = true; return api; },
@@ -42,6 +58,12 @@ export function fakeSupabase(tables = {}, { storage = {} } = {}) {
                 },
             };
             return api;
+        },
+        auth: {
+            getUser: async (token) => {
+                const user = (tables.__users || []).find((u) => u.token === token);
+                return user ? { data: { user: { id: user.id, email: user.email } }, error: null } : { data: { user: null }, error: { message: 'bad token' } };
+            },
         },
         storage: {
             from: () => ({

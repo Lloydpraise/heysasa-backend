@@ -1,5 +1,5 @@
 // Lists: see them, make them from a search, change who is in them, rename or archive, and switch the auto lists on or off.
-import { ToolError, asText, chunk, clip, fetchAll, must, plural, resolveLeadIds, uniq } from '../helpers.js';
+import { ToolError, asText, chunk, clip, fetchAll, must, plural, resolveLeadIds, ruleKey, uniq } from '../helpers.js';
 
 // The auto lists and what can be tuned on each (same as the Automations tab in the dashboard).
 export const AUTO_RULES = {
@@ -245,8 +245,8 @@ const set_auto_list = {
     const before = { exists: Boolean(current), enabled: Boolean(current?.enabled), factors: current?.factors ?? null, disabled_at: current?.disabled_at ?? null };
     if (params.enabled !== undefined) {
       const enabled = params.enabled === true;
-      must(await ctx.db.from('segmentation_rules').upsert({ business_id: ctx.businessId, rule_id: params.rule_id, enabled, disabled_at: enabled ? null : ctx.now().toISOString() }, { onConflict: 'business_id,rule_id' }), 'save rule');
-      must(await ctx.db.from('lists').upsert({ business_id: ctx.businessId, rule_id: params.rule_id, type: 'auto', archived: !enabled, disabled_at: enabled ? null : ctx.now().toISOString(), ...(enabled ? stamp(action) : {}) }, { onConflict: 'business_id,rule_id' }), 'save list');
+      must(await ctx.db.from('segmentation_rules').upsert({ business_id: ctx.businessId, rule_id: params.rule_id, enabled, disabled_at: enabled ? null : ctx.now().toISOString() }, { onConflict: ruleKey(ctx) }), 'save rule');
+      must(await ctx.db.from('lists').upsert({ business_id: ctx.businessId, rule_id: params.rule_id, type: 'auto', archived: !enabled, disabled_at: enabled ? null : ctx.now().toISOString(), ...(enabled ? stamp(action) : {}) }, { onConflict: ruleKey(ctx) }), 'save list');
     }
     if (params.factors && Object.keys(params.factors).length) {
       const merged = { ...(current?.factors ?? {}), ...params.factors };

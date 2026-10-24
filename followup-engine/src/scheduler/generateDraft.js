@@ -26,13 +26,13 @@ function formatThread(messages) {
 const SUMMARY_CACHE_MAX = 500
 const summaryCache = new Map() // `${conversationId}:${lastMessageAt}` -> summary
 
-async function summariseThread(supabase, conv, messages, businessId, skipBilling = false) {
+async function summariseThread(supabase, conv, messages, businessId, skipBilling = false, accountId = null) {
   const thread = formatThread(messages)
   const key = conv?.id ? `${conv.id}:${messages.at(-1)?.created_at ?? ''}` : null
   if (key && summaryCache.has(key)) return summaryCache.get(key)
 
   const summary = await callBot(supabase, 'conversation_summariser', thread, SUMMARISER_FALLBACK, {
-    temperature: 0.2, maxTokens: 300, cacheKey: `summary:${businessId}`, businessId, skipBilling
+    temperature: 0.2, maxTokens: 300, cacheKey: `summary:${businessId}`, businessId, accountId, skipBilling
   })
   if (!summary) return thread // AI unavailable: fall back to the raw thread, and do not cache it
 
@@ -50,9 +50,11 @@ async function summariseThread(supabase, conv, messages, businessId, skipBilling
 // callers own that, since regenerate shouldn't re-run eligibility
 // checks on a row the scheduler already accepted.
 export async function generateFollowupDraft(supabase, item, contact, business, pack, conv) {
+  // AI work is billed to the row's account (its own wallet on separate billing).
+  const accountId = item.account_id ?? contact.account_id ?? null
   const [messages, materials, previousFollowups] = await Promise.all([
     conv ? getMessages(supabase, conv.id, { limit: THREAD_MESSAGES }) : Promise.resolve([]),
-    getMaterialsForTouchpoint(supabase, item.business_id, item.touchpoint_type ?? 'product_reminder'),
+    getMaterialsForTouchpoint(supabase, item.business_id, item.touchpoint_type ?? 'product_reminder', accountId),
     getLastSentFollowups(supabase, item.contact_id, 3)
   ])
 
@@ -71,7 +73,7 @@ export async function generateFollowupDraft(supabase, item, contact, business, p
   } else if (messages.length <= 8) {
     convSummary = formatThread(messages)
   } else {
-    convSummary = await summariseThread(supabase, conv, messages, item.business_id)
+    convSummary = await summariseThread(supabase, conv, messages, item.business_id, false, accountId)
   }
 
   const isEcom = business.business_type === 'ecommerce'
@@ -89,7 +91,7 @@ export async function generateFollowupDraft(supabase, item, contact, business, p
   const adBlock = formatAdContext(await getAdContext(supabase, contact))
 
   // Files the owner uploaded for follow-ups (their procedures, price lists...), matched to where this lead is now.
-  const knowledge = await loadFollowupKnowledge(supabase, { businessId: item.business_id, queryText: [convSummary, `Stage: ${leadStage}`, promptHint].filter(Boolean).join('\n') })
+  const knowledge = await loadFollowupKnowledge(supabase, { businessId: item.business_id, accountId, queryText: [convSummary, `Stage: ${leadStage}`, promptHint].filter(Boolean).join('\n') })
 
   const userContent = [
     `PERSONA:\n${JSON.stringify(pack.persona ?? {})}`,
@@ -109,10 +111,10 @@ export async function generateFollowupDraft(supabase, item, contact, business, p
     materialsBlock
   ].filter(Boolean).join('\n\n')
 
-  const draft = await callBot(supabase, 'follow_up_generator', userContent, FOLLOWUP_FALLBACK, { cacheKey: `draft:${item.business_id}`, businessId: item.business_id })
+  const draft = await callBot(supabase, 'follow_up_generator', userContent, FOLLOWUP_FALLBACK, { cacheKey: `draft:${item.business_id}`, businessId: item.business_id, accountId })
   if (!draft) return { ok: false, reason: 'generation_failed' }
 
-  const qc = await runQC(supabase, draft, pack, previousFollowups, { businessId: item.business_id })
+  const qc = await runQC(supabase, draft, pack, previousFollowups, { businessId: item.business_id, accountId })
   if (!qc.passed && qc.attempts >= 2) {
     return { ok: false, reason: 'qc_failed', issues: qc.issues, draft }
   }
@@ -137,7 +139,7 @@ export async function rewriteSuggestedMessage(supabase, suggestion, contact, bus
   if (messages.length) {
     convSummary = messages.length <= 8
       ? formatThread(messages)
-      : await summariseThread(supabase, conv, messages, contact.business_id, extra.skipBilling === true)
+      : await summariseThread(supabase, conv, messages, contact.business_id, extra.skipBilling === true, contact.account_id ?? null)
   }
 
   const parts = [
@@ -157,11 +159,11 @@ export async function rewriteSuggestedMessage(supabase, suggestion, contact, bus
   }
   const userContent = parts.join('\n\n')
 
-  const draft = await callBot(supabase, 'suggestion_rewriter', userContent, SUGGESTION_REWRITE_FALLBACK, { cacheKey: `rewrite:${contact.business_id}`, businessId: contact.business_id, skipBilling: extra.skipBilling === true })
+  const draft = await callBot(supabase, 'suggestion_rewriter', userContent, SUGGESTION_REWRITE_FALLBACK, { cacheKey: `rewrite:${contact.business_id}`, businessId: contact.business_id, accountId: contact.account_id ?? null, skipBilling: extra.skipBilling === true })
   if (!draft) return { ok: false, reason: 'generation_failed' }
 
   const previousFollowups = await getLastSentFollowups(supabase, contact.id, 3)
-  const qc = await runQC(supabase, draft, pack, previousFollowups, { businessId: contact.business_id, skipBilling: extra.skipBilling === true })
+  const qc = await runQC(supabase, draft, pack, previousFollowups, { businessId: contact.business_id, accountId: contact.account_id ?? null, skipBilling: extra.skipBilling === true })
   if (!qc.passed && qc.attempts >= 2) {
     return { ok: false, reason: 'qc_failed', issues: qc.issues, draft }
   }

@@ -30,13 +30,13 @@ serve(async (req: Request) => {
   if (req.method === 'OPTIONS') return new Response('ok', { headers: corsHeaders })
 
   try {
-    const { leadId, text, businessId } = await req.json()
+    const { leadId, text, businessId, accountId } = await req.json()
     const supabase = createClient(Deno.env.get('SUPABASE_URL')!, Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!)
 
     // 1. Get the customer's address
     const { data: contact } = await supabase
       .from('contacts')
-      .select('phone, social_id')
+      .select('phone, social_id, account_id')
       .eq('id', leadId)
       .eq('business_id', businessId)
       .single()
@@ -45,8 +45,23 @@ serve(async (req: Request) => {
     const number = resolveTarget(contact)
     if (!number) throw new Error("This contact has no phone number or WhatsApp ID to send to")
 
-    // 2. Call Evolution API
-    const instanceName = `heysasa_${businessId}`
+    // 2. Which WhatsApp number it goes out on: the contact's account (one account = one number, see ACCOUNTS.md),
+    //    through the instance serving that account now. Only a contact without an account (a business from before
+    //    accounts) falls back to the old business-level instance name.
+    let instanceName = `heysasa_${businessId}`
+    if (contact.account_id) {
+      if (accountId && accountId !== contact.account_id) throw new Error("This contact belongs to another WhatsApp number")
+      const [{ data: account }, { data: canOperate }] = await Promise.all([
+        supabase.from('accounts').select('instance_name, status, business_id').eq('id', contact.account_id).maybeSingle(),
+        supabase.rpc('account_can_operate', { p_account_id: contact.account_id }),
+      ])
+      if (!account || account.business_id !== businessId) throw new Error("WhatsApp number not found for this business")
+      if (canOperate === false) throw new Error("This WhatsApp number is suspended, so nothing can be sent from it")
+      if (account.status !== 'connected' || !account.instance_name) throw new Error("This WhatsApp number is not connected")
+      instanceName = account.instance_name
+    }
+
+    // 3. Call Evolution API
     const response = await fetch(`${Deno.env.get('EVOLUTION_API_URL')}/message/sendText/${instanceName}`, {
       method: 'POST',
       headers: {

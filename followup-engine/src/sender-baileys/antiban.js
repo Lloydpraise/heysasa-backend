@@ -5,7 +5,8 @@ import {
   ANTIBAN_WINDOW_MS,
 } from '../config.js'
 
-// Per-business in-memory state. It used to start empty after every deploy,
+// Per-number in-memory state, keyed by lane (lib/accounts.js laneKey: the account, or the business for rows
+// from before accounts existed; plain business ids still work). It used to start empty after every deploy,
 // which let a number send a second full hour's worth right after a restart.
 // primeAntiban() below reloads the last hour of sends from the database the
 // first time a business is seen, so a restart no longer resets the count.
@@ -26,14 +27,17 @@ const RATE_LIMITED_COOL_MS = 60 * 60_000
 // Reads this business's sends from the last hour (and the time of the very last one)
 // back into memory. Runs once per business per process start; if the read fails it
 // tries again on the next poll instead of sending unprimed.
-export async function primeAntiban(supabase, businessId) {
+// lane: { businessId, accountId } — which sends count (the account's, or the business's). Defaults to the key
+// as a business id.
+export async function primeAntiban(supabase, businessId, lane = null) {
   if (primed.has(businessId)) return
   primed.add(businessId)
   const since = new Date(Date.now() - ANTIBAN_WINDOW_MS).toISOString()
-  const { data, error } = await supabase
+  let query = supabase
     .from('follow_up_queue')
     .select('processed_at')
-    .eq('business_id', businessId)
+  query = lane?.accountId ? query.eq('account_id', lane.accountId) : query.eq('business_id', lane?.businessId ?? businessId)
+  const { data, error } = await query
     .eq('status', 'sent')
     .gte('processed_at', since)
     .order('processed_at', { ascending: true })

@@ -15,7 +15,7 @@ export function createAssistantRouter({ store, notes, handleChat, skillsForBusin
   router.use(auth);
 
   const tokenOf = (req) => (req.headers.authorization?.startsWith('Bearer ') ? req.headers.authorization.slice(7).trim() : null);
-  const ctxFor = (req) => agent.makeCtx({ businessId: req.businessId, userId: req.userId, token: tokenOf(req) });
+  const ctxFor = (req) => agent.makeCtx({ businessId: req.businessId, accountId: req.accountId ?? null, scope: req.scope ?? null, userId: req.userId, token: tokenOf(req) });
 
   const logUnexpectedError = (message, error, metadata = {}) => {
     const errorMessage = error instanceof Error ? error.message : String(error);
@@ -68,7 +68,7 @@ export function createAssistantRouter({ store, notes, handleChat, skillsForBusin
 
     try {
       await handleChat({
-        businessId: req.businessId, userId: req.userId, conversationId: body.conversation_id || null,
+        businessId: req.businessId, accountId: req.accountId ?? null, scope: req.scope ?? null, userId: req.userId, conversationId: body.conversation_id || null,
         surface: body.surface, contextKey: body.context_key, context: body.context, message: body.message,
         currentText: body.current_text, retry: body.retry === true, token: tokenOf(req),
       }, send);

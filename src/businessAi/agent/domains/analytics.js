@@ -3,6 +3,7 @@
 // comparable earlier period. The change is left out when there is no earlier data, because "no change" beats a misleading one.
 import { ToolError, asText, clip, daysSince, fetchAll, isCustomerLead, isWaiting, must, money, plural, round1, topCounts } from '../helpers.js';
 import { isOptedOut, loadLeads } from './leads.js';
+import { settingsResult } from './settings.js';
 
 // The meaning of every number. The assistant explains these in its own words; it never invents reasons.
 export const GLOSSARY = {
@@ -98,7 +99,7 @@ function change(current, previous) {
 }
 
 async function loadBusiness(ctx) {
-  const biz = must(await ctx.db.from('businesses').select('*').eq('business_id', ctx.businessId).maybeSingle(), 'business') ?? {};
+  const biz = must(await settingsResult(ctx), 'business') ?? {};   // the account's view of the settings
   let zone = biz.timezone || 'Africa/Nairobi';
   try { new Intl.DateTimeFormat('en-GB', { timeZone: zone }); } catch { zone = 'Africa/Nairobi'; }
   return { biz, zone, currency: biz.currency || 'KES' };

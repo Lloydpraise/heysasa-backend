@@ -3,7 +3,7 @@
 // to approve; nothing is live until followup_ai_activate_playbook() runs.
 
 import { callBot } from '../lib/ai.js'
-import { getBusiness, getPersonaPack } from '../lib/db.js'
+import { getBusinessForAccount, getPersonaPack } from '../lib/db.js'
 import { checkAiBalance } from '../lib/billing.js'
 import { DEFAULT_MAX_PER_LEAD } from '../config.js'
 import { AI_PROMPT_CATALOG } from '../../../src/aiPromptCatalog.js'
@@ -18,13 +18,14 @@ import { logTurn } from './turns.js'
 const AUTHOR_PROMPT = AI_PROMPT_CATALOG.followup_ai_author.prompt
 const QC_CONCURRENCY = 3
 
-async function loadMaterials(supabase, businessId) {
+// Materials are business catalog rows: the account's own plus the business-level ones (account_id null).
+async function loadMaterials(supabase, businessId, accountId = null) {
   const { data } = await supabase.from('followup_materials')
-    .select('id, material_type, title, content, image_url')
+    .select('id, material_type, title, content, image_url, account_id')
     .eq('business_id', businessId).eq('is_active', true)
     .or('expires_at.is.null,expires_at.gt.' + new Date().toISOString())
-    .order('created_at', { ascending: false }).limit(20)
-  return data ?? []
+    .order('created_at', { ascending: false }).limit(accountId ? 60 : 20)
+  return (data ?? []).filter(m => !accountId || !m.account_id || m.account_id === accountId).slice(0, 20)
 }
 
 async function inBatches(items, size, fn) {
@@ -67,7 +68,9 @@ export async function generatePlaybook(supabase, playbookId) {
   let pb = loaded
   const seenRegenerate = pb.regenerate_requested_at
 
-  const business = await getBusiness(supabase, pb.business_id)
+  // The playbook belongs to one WhatsApp account: its settings, wallet, persona pack, materials and skills.
+  const accountId = pb.account_id ?? null
+  const business = await getBusinessForAccount(supabase, pb.business_id, accountId)
   if (!business) return { ok: false, reason: 'business_not_found' }
 
   // 1. is the ad data good enough?
@@ -79,20 +82,20 @@ export async function generatePlaybook(supabase, playbookId) {
   const quality = stored.expired && assessed.quality === 'good' ? 'weak' : assessed.quality
   if (!assessed.canGenerate) {
     await supabase.from('ad_playbooks').update({ status: 'needs_data', data_quality: quality, data_issues: issues, last_error: null }).eq('id', pb.id)
-    await logTurn(supabase, { businessId: pb.business_id, kind: 'author', decision: 'needs_data', reason: issues.join(', '), details: { adId: pb.ad_id } })
+    await logTurn(supabase, { businessId: pb.business_id, accountId, kind: 'author', decision: 'needs_data', reason: issues.join(', '), details: { adId: pb.ad_id } })
     return { ok: false, reason: 'needs_data', issues }
   }
 
   // 2. can the business pay for the AI? (leave it pending; nothing is lost)
-  if (!(await checkAiBalance(supabase, pb.business_id))) return { ok: false, reason: 'insufficient_balance' }
+  if (!(await checkAiBalance(supabase, pb.business_id, accountId))) return { ok: false, reason: 'insufficient_balance' }
 
   await supabase.from('ad_playbooks').update({ status: 'generating' }).eq('id', pb.id)
 
   // 3. context
   const [pack, materials, skills] = await Promise.all([
-    getPersonaPack(supabase, pb.business_id),
-    loadMaterials(supabase, pb.business_id),
-    loadSkills(supabase, pb.business_id, 'author'),
+    getPersonaPack(supabase, pb.business_id, accountId),
+    loadMaterials(supabase, pb.business_id, accountId),
+    loadSkills(supabase, pb.business_id, 'author', accountId),
   ])
   const budget = stepBudget(business.followup_max_per_lead ?? DEFAULT_MAX_PER_LEAD)
   const minGap = business.followup_min_gap_hours ?? 20
@@ -117,7 +120,7 @@ export async function generatePlaybook(supabase, playbookId) {
 
   const run = async () => {
     const raw = await callBot(supabase, BOTS.author, userContent, AUTHOR_PROMPT, {
-      json: true, temperature: 0.7, maxTokens: 4000, businessId: pb.business_id, cacheKey: `fuaiauth:${pb.business_id}`,
+      json: true, temperature: 0.7, maxTokens: 4000, businessId: pb.business_id, accountId, cacheKey: `fuaiauth:${pb.business_id}`,
       images: hasImage ? [ad.imageUrl] : undefined,
     })
     if (!raw) return { unavailable: true }
@@ -136,7 +139,7 @@ export async function generatePlaybook(supabase, playbookId) {
   const built = validatePlaybook(result.parsed, rules)
   if (!built.ok || built.steps.length < Math.min(3, budget.min)) {
     await markPlaybookFailed(supabase, pb.id, { last_error: built.problems.join(', ') || 'unreadable_answer', data_quality: quality, data_issues: issues })
-    await logTurn(supabase, { businessId: pb.business_id, kind: 'author', decision: 'failed', reason: built.problems.join(', ') || 'unreadable_answer', details: { adId: pb.ad_id } })
+    await logTurn(supabase, { businessId: pb.business_id, accountId, kind: 'author', decision: 'failed', reason: built.problems.join(', ') || 'unreadable_answer', details: { adId: pb.ad_id } })
     return { ok: false, reason: 'invalid_playbook', problems: built.problems }
   }
 
@@ -154,7 +157,7 @@ export async function generatePlaybook(supabase, playbookId) {
 
   const contextText = [ad.headline, ad.body, JSON.stringify(pack?.business_context ?? {}), ...materials.map(m => `${m.title} ${m.content}`)].join('\n')
   const reviewed = await inBatches(steps, QC_CONCURRENCY, (s) => qcMessage(supabase, s.content, {
-    businessId: pb.business_id, pack, contextText, previousMessages: [],
+    businessId: pb.business_id, accountId, pack, contextText, previousMessages: [],
   }))
 
   // 5. write: old drafts out of the way (live steps stay `applied` until the new ones are activated)
@@ -165,7 +168,7 @@ export async function generatePlaybook(supabase, playbookId) {
   // A bulk insert sends NULL (not the column default) for any key a row leaves out, and several columns are NOT NULL
   // (skill_keys, delay_hours, edited_by_owner, ...). So every row carries EVERY key, with the same set on both kinds.
   const baseRow = {
-    playbook_id: pb.id, business_id: pb.business_id, version, edited_by_owner: false,
+    playbook_id: pb.id, business_id: pb.business_id, ...(accountId ? { account_id: accountId } : {}), version, edited_by_owner: false,
     klt_phase: null, touchpoint_type: null, title: null, goal: null, skill_keys: [],
     media: null, media_source: null, qc_passed: null, qc_notes: null, rationale: null,
   }
@@ -200,7 +203,7 @@ export async function generatePlaybook(supabase, playbookId) {
   const failed = reviewed.filter(r => !r.passed).length
   const waiting = steps.filter(s => s.status === 'needs_media').length
   await logTurn(supabase, {
-    businessId: pb.business_id, kind: 'author', decision: 'authored',
+    businessId: pb.business_id, accountId, kind: 'author', decision: 'authored',
     reason: `${steps.length} steps${failed ? `, ${failed} failed quality control` : ''}${waiting ? `, ${waiting} waiting for media` : ''}`,
     details: { adId: pb.ad_id, version, steps: steps.length, qcFailed: failed, needsMedia: waiting, otherMaterials: otherMaterials.length },
   })
