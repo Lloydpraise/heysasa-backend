@@ -179,11 +179,12 @@ export async function getMaterialsForTouchpoint(s, businessId, touchpointType) {
 }
 
 // ── Bot config ────────────────────────────────────────────────
+// maybeSingle: a bot with no override row is normal (the built-in prompt is used), not a database error.
 export async function getBotConfig(s, botId) {
   try {
     const { data } = await s.from('ai_bots_config')
       .select('prompt, model, temperature, max_tokens')
-      .eq('bot_id', botId).eq('is_active', true).single()
+      .eq('bot_id', botId).eq('is_active', true).maybeSingle()
     return data
   } catch { return null }
 }
@@ -200,7 +201,7 @@ export async function getGlobalConfig(s, key, fallback) {
 export async function getBillingConfig(s, key, fallback) {
   try {
     const { data } = await s.from('followup_billing_config')
-      .select('value').eq('key', key).single()
+      .select('value').eq('key', key).maybeSingle()
     return data ? parseFloat(data.value) : fallback
   } catch { return fallback }
 }
@@ -209,7 +210,7 @@ export async function getStageWeight(s, stage, businessType) {
   try {
     const type = businessType === 'ecommerce' ? 'ecom' : 'service'
     const { data } = await s.from('followup_billing_stage_weights')
-      .select('weight').eq('stage', stage).eq('business_type', type).single()
+      .select('weight').eq('stage', stage).eq('business_type', type).maybeSingle()
     return data ? parseFloat(String(data.weight)) : 0.1
   } catch { return 0.1 }
 }

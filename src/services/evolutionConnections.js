@@ -5,7 +5,7 @@ function endpoint(path) {
     return `${EVOLUTION_URL.replace(/\/$/, '')}${path}`;
 }
 
-async function evolutionRequest(path, options = {}) {
+export async function evolutionRequest(path, options = {}) {
     const response = await fetch(endpoint(path), {
         ...options,
         headers: {

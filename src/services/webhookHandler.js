@@ -113,6 +113,8 @@ export async function processConnectionUpdate(payload, businessId) {
         .limit(1)
         .maybeSingle();
     if (findError) throw findError;
+    // The owner's name for this connection is saved by the dashboard and must survive status updates.
+    if (existing?.session_data?.label) values.session_data.label = existing.session_data.label;
 
     // A bare "connecting" update carries no pairing code or QR. Keep the ones
     // already stored instead of overwriting them with null while the user is

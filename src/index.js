@@ -43,6 +43,13 @@ import followupSettingsRoutes from './followupSettingsRoutes.js';
 import { createAssistantRouterForApp } from './businessAi/index.js';
 import { createKnowledgeForApp } from './knowledge/index.js';
 import { createHandoffForApp } from './handoff/index.js';
+import { createWhatsAppProxyRouter } from './whatsapp/proxyRoutes.js';
+import { createLeadDraftRouter } from './leads/draftRoute.js';
+import { callOpenAI } from '../followup-engine/src/lib/ai.js';
+import { checkAiBalance } from '../followup-engine/src/lib/billing.js';
+import { checkServiceStandard } from '../followup-engine/src/followupAi/serviceStandard.js';
+import { requireBusinessAuth } from './middleware/businessAuth.js';
+import { evolutionRequest } from './services/evolutionConnections.js';
 
 dotenv.config();
 
@@ -659,6 +666,22 @@ app.use('/knowledge', knowledge.router);
 // Handoffs: who is told when the chat AI hands a customer over, and the WhatsApp alert itself.
 const handoff = createHandoffForApp();
 app.use('/handoff', handoff.router);
+// "Let HeySasa do it" on a lead: the next message for that lead, written for the owner to review. Billed like a follow-up.
+app.use(createLeadDraftRouter({
+    auth: requireBusinessAuth,
+    supabase,
+    callModel: ({ systemPrompt, userContent, businessId }) => callOpenAI({ systemPrompt, userContent, businessId, purpose: 'follow_up_generator', maxTokens: 300, cacheKey: `lead-draft:${businessId}` }),
+    canAfford: (businessId) => checkAiBalance(supabase, businessId),
+    check: (text, ctx) => checkServiceStandard(text, ctx),
+    log: (level, event, details = {}) => logEvent({ level, area: 'leads', event, message: event, business_id: details.businessId ?? null, contact_id: details.leadId ?? null, details }),
+}));
+// WhatsApp (Evolution) calls from the dashboard. The Evolution key stays on the server; owners only reach their own instances.
+app.use('/wa', createWhatsAppProxyRouter({
+    auth: requireBusinessAuth,
+    supabase,
+    evolution: evolutionRequest,
+    log: (level, event, details = {}) => logEvent({ level, area: 'connection', event, message: event, business_id: details.businessId ?? null, entity_id: details.instance ?? null, details }),
+}));
 
 app.get('/debug/events', requireDebugToken, (req, res) => {
     // CHANGED: added no-transform (some proxies still buffer without it),
@@ -798,7 +821,18 @@ app.get('/debug/evolution', requireDebugToken, async (_req, res) => {
 });
 
 app.post('/webhook/evolution', async (req, res) => {
-    // Optional Webhook Security Check: Header validation if API key set
+    // Shared secret for the webhook. Evolution does not send our API key on webhooks, so a missing key used to be let
+    // through and anyone could post fake customer messages. Set EVOLUTION_WEBHOOK_SECRET and add it to the webhook URL
+    // registered in Evolution (…/webhook/evolution?token=SECRET); from then on calls without it are refused.
+    const webhookSecret = process.env.EVOLUTION_WEBHOOK_SECRET;
+    if (webhookSecret) {
+        const given = req.query?.token || req.headers['x-webhook-token'];
+        if (given !== webhookSecret) {
+            res.status(401).json({ ok: false, error: 'Unauthorized webhook payload' });
+            return;
+        }
+    }
+    // A wrong API key is always refused.
     if (EVOLUTION_API_KEY) {
         const reqApiKey = req.headers['apikey'] || req.headers['authorization'];
         if (reqApiKey && reqApiKey !== EVOLUTION_API_KEY && reqApiKey !== `Bearer ${EVOLUTION_API_KEY}`) {

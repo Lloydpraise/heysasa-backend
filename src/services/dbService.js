@@ -65,6 +65,21 @@ async function findExistingContact(businessId, ids, phone) {
             .limit(2);
         if (phoneError) throw phoneError;
         if (byPhone?.length === 1) return byPhone[0]; // ambiguous matches are never guessed
+
+        // A contact the owner added or imported by hand (no WhatsApp identity yet) with the same number. Adopting it
+        // keeps one person as one contact, so replies land on the lead that is in the list or campaign.
+        const key = String(phone).replace(/\D/g, '').slice(-9);
+        if (key.length === 9) {
+            const { data: imported, error: importedError } = await supabase
+                .from('contacts')
+                .select(`${CONTACT_COLS}, social_id, phone`)
+                .eq('business_id', businessId)
+                .eq('phone_key', key)
+                .is('social_id', null)
+                .limit(2);
+            if (importedError) throw importedError;
+            if (imported?.length === 1) return { ...imported[0], adopt: true };
+        }
     }
     return null;
 }
@@ -85,7 +100,8 @@ export async function getOrCreateContact(businessId, jid, pushName, altJid = nul
         const existing = await findExistingContact(businessId, ids, phone);
         if (existing) {
             const patch = { last_seen: now };
-            if (name) patch.name = name;
+            if (existing.adopt) Object.assign(patch, { social_platform: 'whatsapp', social_id: lidJid || jid });
+            if (name && (!existing.adopt || !existing.name || existing.name === 'New Lead')) patch.name = name;
             // Fill the phone in when we learn it - and replace the old bug where a
             // LID's digits were stored as the phone. Never overwrite a real number.
             const phoneIsLidDigits = existing.phone

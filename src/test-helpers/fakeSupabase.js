@@ -9,10 +9,12 @@ export function fakeSupabase(tables = {}, { storage = {} } = {}) {
             const q = { filters: [], op: 'select', payload: null, single: false, limitN: null, returning: false, orders: [] };
             const match = () => tables[name].filter((r) => q.filters.every((f) => f(r)));
             const api = {
-                select() { if (q.op !== 'select') q.returning = true; return api; },
+                select(_cols, opts) { if (q.op !== 'select') q.returning = true; if (opts?.head) q.head = true; return api; },
                 eq(c, v) { q.filters.push((r) => r[c] === v); return api; },
                 is(c, v) { q.filters.push((r) => (r[c] ?? null) === v); return api; },
-                lt(c, v) { q.filters.push((r) => r[c] < v); return api; },
+                lt(c, v) { q.filters.push((r) => r[c] != null && r[c] < v); return api; },
+                gte(c, v) { q.filters.push((r) => r[c] != null && r[c] >= v); return api; },
+                not(c, op, v) { const list = String(v).replace(/[()]/g, '').split(','); q.filters.push((r) => !(op === 'in' ? list.includes(String(r[c])) : r[c] === v)); return api; },
                 in(c, vs) { q.filters.push((r) => vs.includes(r[c])); return api; },
                 order(c, o) { q.orders.push([c, o?.ascending !== false]); return api; },
                 limit(n) { q.limitN = n; return api; },
@@ -30,6 +32,7 @@ export function fakeSupabase(tables = {}, { storage = {} } = {}) {
                         }
                         if (q.op === 'update') { const hit = match(); hit.forEach((r) => Object.assign(r, q.payload)); return { data: q.returning ? hit : null, error: null }; }
                         if (q.op === 'delete') { const hit = match(); tables[name] = tables[name].filter((r) => !hit.includes(r)); return { data: null, error: null }; }
+                        if (q.head) return { data: null, count: match().length, error: null };
                         let out = match();
                         for (const [c, asc] of [...q.orders].reverse()) out = [...out].sort((a, b) => (a[c] > b[c] ? 1 : a[c] < b[c] ? -1 : 0) * (asc ? 1 : -1));
                         if (q.limitN) out = out.slice(0, q.limitN);
