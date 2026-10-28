@@ -29,10 +29,17 @@ const QUIET_MS = 150
 const HEAVY_QUIET_MS = 30_000
 const LEAD_COLD_MS = 5 * 24 * 60 * 60_000
 const STAGE_RETRY_MS = 3 * 60 * 60_000
+// A temperature backlog the last run could not shrink is retried hourly, not every minute.
+const TEMPERATURE_IDLE_RETRY_MS = 60 * 60_000
+// Due work the last runs could not move (paused campaigns, a disconnected number) is retried every 15 min, not every
+// minute: their stale enrollments kept the minute retry firing forever. Realtime events still wake the jobs at once.
+const DUE_IDLE_RETRY_MS = 15 * 60_000
 const timers = new Map()
 const runs = new Map()
 const pending = new Map()
 let dueTimer
+let temperatureProgress = true
+const dueProgress = { Scheduler: true, CampaignScheduler: true }
 let dueAt = 0
 
 async function runCustomerProfileSync(sb) {
@@ -120,7 +127,11 @@ function invoke(name, fn, args = []) {
       const counts = result && typeof result === 'object' ? result : {}
       const total = Object.values(counts).reduce((sum, value) => sum + (typeof value === 'number' ? value : 0), 0)
       if (total > 0) log('info', 'engine', 'engine.event_job', `${name}: ${JSON.stringify(counts)}`, { details: { job: name, ...counts } })
-      if (name === 'Scheduler' || name === 'CampaignScheduler') await armDueWork()
+      if (name === 'Scheduler' || name === 'CampaignScheduler') {
+        dueProgress[name] = total > 0
+        await armDueWork()
+      }
+      if (name.startsWith('LeadTemperatureReview')) temperatureProgress = (counts.updated ?? 0) > 0
       return result
     } catch (e) {
       log('error', 'engine', 'engine.event_job_failed', `${name} failed: ${e.message}`, { details: { job: name, error: { name: e.name, message: e.message } } })
@@ -179,7 +190,8 @@ async function armDueWork() {
     dueAt = 0
   }
   if ((dueQueue.count ?? 0) > 0 || (dueEnrollments.count ?? 0) > 0) {
-    scheduleAt('due-retry', Date.now() + RETRY_MS, () => {
+    const progressing = dueProgress.Scheduler || dueProgress.CampaignScheduler
+    scheduleAt('due-retry', Date.now() + (progressing ? RETRY_MS : DUE_IDLE_RETRY_MS), () => {
       void invoke('Scheduler', runScheduler)
       void invoke('CampaignScheduler', runCampaignScheduler, [{ seed: false }])
     })
@@ -204,7 +216,7 @@ async function armTemperatureDue() {
   ])
   if (old.error || upcoming.error) throw old.error || upcoming.error
   if ((old.count ?? 0) > 0) {
-    scheduleAt('lead-temperature-backlog', now + RETRY_MS, () => {
+    scheduleAt('lead-temperature-backlog', now + (temperatureProgress ? RETRY_MS : TEMPERATURE_IDLE_RETRY_MS), () => {
       void invoke('LeadTemperatureReview', runLeadTemperatureReview)
     })
   } else {
