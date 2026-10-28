@@ -1,4 +1,4 @@
-import { getConversation, getMessages } from '../lib/db.js'
+import { getConversationsByContactIds } from '../lib/db.js'
 import { log } from '../lib/log.js'
 
 const THREE_DAYS_MS = 3 * 24 * 60 * 60_000
@@ -32,6 +32,10 @@ export async function runLeadTemperatureReview(supabase, onlyContactId = null) {
   const contacts = [...new Map([...(warmResult.data ?? []), ...(coldResult.data ?? [])].map(c => [c.id, c])).values()]
   if (!contacts?.length) return { updated: 0 }
 
+  // One batched conversation lookup per run, not one request per contact: with ~900 imported contacts that never
+  // chatted, the per-contact lookups ran back to back every minute (over half a million requests a day).
+  const conversations = await getConversationsByContactIds(supabase, contacts.map(c => c.id))
+
   let updated = 0
   for (const contact of contacts) {
     const lastSeen = new Date(contact.last_seen).getTime()
@@ -41,10 +45,15 @@ export async function runLeadTemperatureReview(supabase, onlyContactId = null) {
     if (CLOSED_STATES.has(contact.lead_state)) continue
 
     try {
-      const conversation = await getConversation(supabase, contact.id, contact.business_id)
-      if (!conversation) continue
-      const messages = await getMessages(supabase, conversation.id, { limit: 5 })
-      const latestAt = messages.at(-1)?.created_at
+      // The latest message decides; a contact with no conversation or no messages (an imported list) goes by
+      // last_seen. Skipping those used to leave them candidates forever, so the backlog timer re-ran this every minute.
+      let latestAt = contact.last_seen
+      const conversation = conversations.get(`${contact.business_id}|${contact.id}`)
+      if (conversation) {
+        const { data: latest } = await supabase.from('messages').select('created_at')
+          .eq('conversation_id', conversation.id).order('created_at', { ascending: false }).limit(1).maybeSingle()
+        if (latest?.created_at) latestAt = latest.created_at
+      }
       if (!latestAt) continue
 
       const ageMs = now - new Date(latestAt).getTime()

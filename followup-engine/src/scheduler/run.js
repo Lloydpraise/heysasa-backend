@@ -29,10 +29,13 @@ const QUIET_MS = 150
 const HEAVY_QUIET_MS = 30_000
 const LEAD_COLD_MS = 5 * 24 * 60 * 60_000
 const STAGE_RETRY_MS = 3 * 60 * 60_000
+// A temperature backlog the last run could not shrink is retried hourly, not every minute.
+const TEMPERATURE_IDLE_RETRY_MS = 60 * 60_000
 const timers = new Map()
 const runs = new Map()
 const pending = new Map()
 let dueTimer
+let temperatureProgress = true
 let dueAt = 0
 
 async function runCustomerProfileSync(sb) {
@@ -121,6 +124,7 @@ function invoke(name, fn, args = []) {
       const total = Object.values(counts).reduce((sum, value) => sum + (typeof value === 'number' ? value : 0), 0)
       if (total > 0) log('info', 'engine', 'engine.event_job', `${name}: ${JSON.stringify(counts)}`, { details: { job: name, ...counts } })
       if (name === 'Scheduler' || name === 'CampaignScheduler') await armDueWork()
+      if (name.startsWith('LeadTemperatureReview')) temperatureProgress = (counts.updated ?? 0) > 0
       return result
     } catch (e) {
       log('error', 'engine', 'engine.event_job_failed', `${name} failed: ${e.message}`, { details: { job: name, error: { name: e.name, message: e.message } } })
@@ -204,7 +208,7 @@ async function armTemperatureDue() {
   ])
   if (old.error || upcoming.error) throw old.error || upcoming.error
   if ((old.count ?? 0) > 0) {
-    scheduleAt('lead-temperature-backlog', now + RETRY_MS, () => {
+    scheduleAt('lead-temperature-backlog', now + (temperatureProgress ? RETRY_MS : TEMPERATURE_IDLE_RETRY_MS), () => {
       void invoke('LeadTemperatureReview', runLeadTemperatureReview)
     })
   } else {
