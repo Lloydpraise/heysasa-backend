@@ -57,7 +57,7 @@ export function createHandoffNotifier({ supabase, send, appUrl = '', log = () =>
         return handled;
     }
 
-    function start(intervalMs = 8_000) {
+    function start(intervalMs = 30_000) {
         const timer = setInterval(() => checkOnce().catch((e) => log('warn', 'handoff.poll_failed', { error: String(e?.message || e) })), intervalMs);
         timer.unref?.();
         return timer;
