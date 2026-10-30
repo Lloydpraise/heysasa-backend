@@ -43,7 +43,14 @@ export async function primeAntiban(supabase, businessId, lane = null) {
     .order('processed_at', { ascending: true })
     .limit(200)
   if (error) { primed.delete(businessId); return }
-  const fromDb = (data ?? []).map(r => new Date(r.processed_at).getTime()).filter(Number.isFinite)
+  // Messages from the Events API (website events) go out on the same number, so they count too.
+  let events = supabase.from('business_events').select('sent_at')
+  events = lane?.accountId ? events.eq('account_id', lane.accountId) : events.eq('business_id', lane?.businessId ?? businessId)
+  const { data: eventRows } = await events.eq('status', 'sent').gte('sent_at', since).limit(200)
+  const fromDb = [
+    ...(data ?? []).map(r => new Date(r.processed_at).getTime()),
+    ...(eventRows ?? []).map(r => new Date(r.sent_at).getTime()),
+  ].filter(Number.isFinite)
   const merged = [...new Set([...(sentTimestamps.get(businessId) ?? []), ...fromDb])].sort((a, b) => a - b)
   sentTimestamps.set(businessId, merged)
   if (merged.length) lastSentAt.set(businessId, Math.max(lastSentAt.get(businessId) ?? 0, merged[merged.length - 1]))
@@ -92,6 +99,12 @@ export function checkAntiban(businessId, dailyCap) {
   }
 
   return { allowed: true }
+}
+
+// Takes the gap right before a send starts, so another sender in this process (follow-ups and website events share a
+// number) sees it closed while this send is still in flight. recordSend / recordFailedAttempt then set the real time.
+export function reserveSend(businessId) {
+  lastSentAt.set(businessId, Date.now())
 }
 
 // Call this immediately after a successful send to record it
