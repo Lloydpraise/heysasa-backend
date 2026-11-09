@@ -92,7 +92,7 @@ test('a follow-up just sent on the same number closes the gap for events too', a
   recordSend('acct:a1')
   const res = await processEventBatch(t.deps)
   assert.equal(t.sends.length, 0)
-  assert.ok(res.wakeAt > Date.now())
+  assert.ok(res.wakeAt > NOW)   // the antiban gap is on the real clock, the wake on the test clock
 })
 
 test('different numbers send side by side in one pass', async () => {
@@ -172,4 +172,18 @@ test('the next delayed event sets the wake-up time', async () => {
   const res = await processEventBatch(t.deps)
   assert.equal(t.sends.length, 0)
   assert.ok(res.wakeAt >= NOW + 3_600_000 && res.wakeAt < NOW + 3_601_000)
+})
+
+test('a Messages API video goes out as media with the text as caption, saved with its type', async () => {
+  const t = setup([event({ event_type: 'message', message: 'Day 2', media: { type: 'video', url: 'https://cdn.example/v.mp4' } })])
+  await processEventBatch(t.deps)
+  assert.deepEqual(t.sends[0].content, { text: 'Day 2', media: { type: 'video', url: 'https://cdn.example/v.mp4', caption: 'Day 2' } })
+  assert.equal(t.state.messages[0].type, 'video')
+  assert.equal(t.state.messages[0].content.media_url, 'https://cdn.example/v.mp4')
+})
+
+test('a message timed for later is not expired by its age since it was received', async () => {
+  const t = setup([event({ event_type: 'message', created_at: iso(NOW - 3 * 86_400_000), payload: { requested_at: iso(NOW - 60_000) } })])
+  const res = await processEventBatch(t.deps)
+  assert.equal(res.sent, 1)
 })

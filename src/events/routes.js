@@ -21,6 +21,7 @@ import {
     DEFAULT_TEMPLATES, EVENT_TYPE_RE, MERGE_FIELDS, PURCHASE_EVENTS, REMINDER_EVENTS,
     normalizePhone, renderTemplate, resolveTemplate,
 } from './templates.js';
+import { mountMessageRoutes, generateWebhookSecret } from './messages.js';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const KEY_RE = /^hs_live_[A-Za-z0-9_-]{20,80}$/;
@@ -187,18 +188,26 @@ export function createEventsRouter({ db, scope, admin, contacts, apiBaseUrl = ''
         if (!data) throw httpError(404, 'not_found', 'No such event.');
         return publicEvent(data);
     }));
+    // Messages API (the caller writes the message): POST/GET/DELETE /v1/messages, see messages.js
+    mountMessageRoutes(router, { db, contacts, apiKeyAuth, accountFor, wrap, log, now });
     router.use('/v1', keyError);
 
     // ── dashboard ──────────────────────────────────────────────────────────────────────────────────
     router.get('/integrations/website', scope, wrap(async (req) => {
         const [keys, saved, events] = await Promise.all([
             req.scope.isAdmin
-                ? db.from('api_keys').select('id, label, key_prefix, account_id, created_at, last_used_at').eq('business_id', req.businessId).is('revoked_at', null).order('created_at', { ascending: false })
+                ? db.from('api_keys').select('id, label, key_prefix, account_id, created_at, last_used_at, webhook_url').eq('business_id', req.businessId).is('revoked_at', null).order('created_at', { ascending: false })
                 : Promise.resolve({ data: [] }),
             db.from('event_templates').select('*').eq('business_id', req.businessId),
             db.from('business_events').select(EVENT_FIELDS).eq('business_id', req.businessId).order('created_at', { ascending: false }).limit(20),
         ]);
         for (const r of [keys, saved, events]) if (r.error) throw r.error;
+        const keyIds = (keys.data ?? []).map((k) => k.id);
+        const deliveries = keyIds.length
+            ? await db.from('webhook_deliveries').select('id, api_key_id, kind, status, attempts, response_status, last_error, created_at, delivered_at')
+                .in('api_key_id', keyIds).order('created_at', { ascending: false }).limit(20)
+            : { data: [] };
+        if (deliveries.error) throw deliveries.error;
         const savedByType = new Map((saved.data ?? []).map((t) => [t.event_type, t]));
         const types = [...new Set([...Object.keys(DEFAULT_TEMPLATES), ...savedByType.keys()])];
         const templates = types.map((type) => {
@@ -223,6 +232,7 @@ export function createEventsRouter({ db, scope, admin, contacts, apiBaseUrl = ''
             templates,
             mergeFields: MERGE_FIELDS.map(([field, meaning]) => ({ field, meaning })),
             events: events.data ?? [],
+            webhookDeliveries: deliveries.data ?? [],
         };
     }));
 
@@ -251,6 +261,43 @@ export function createEventsRouter({ db, scope, admin, contacts, apiBaseUrl = ''
         if (!data) throw httpError(404, 'not_found');
         log('info', 'events.key_revoked', { businessId: req.businessId, keyId: data.id });
         return { revoked: data.id };
+    }));
+
+    // Where HeySasa reports back (sent, delivered, read, failed, replied, opted out). The secret signs every call;
+    // it is shown when first made and when rotated, never again.
+    router.put('/integrations/api-keys/:id/webhook', admin, wrap(async (req) => {
+        if (!UUID.test(String(req.params.id))) throw httpError(404, 'not_found');
+        const raw = String(req.body?.url ?? '').trim();
+        let url = null;
+        if (raw) {
+            try { url = new URL(raw); } catch { url = null; }
+            if (!url || url.protocol !== 'https:') throw httpError(400, 'invalid_webhook_url', 'The webhook address must start with https://');
+            url = url.toString();
+        }
+        const { data: key, error: keyError2 } = await db.from('api_keys').select('id, webhook_secret')
+            .eq('id', req.params.id).eq('business_id', req.businessId).is('revoked_at', null).maybeSingle();
+        if (keyError2) throw keyError2;
+        if (!key) throw httpError(404, 'not_found');
+        const newSecret = url && (!key.webhook_secret || req.body?.rotateSecret === true) ? generateWebhookSecret() : null;
+        const { error } = await db.from('api_keys').update({ webhook_url: url, ...(newSecret ? { webhook_secret: newSecret } : {}) }).eq('id', key.id);
+        if (error) throw error;
+        log('info', 'events.webhook_set', { businessId: req.businessId, keyId: key.id, on: !!url });
+        return { webhookUrl: url, secret: newSecret };
+    }));
+
+    router.post('/integrations/api-keys/:id/webhook-test', admin, wrap(async (req, res) => {
+        if (!UUID.test(String(req.params.id))) throw httpError(404, 'not_found');
+        const { data: key, error } = await db.from('api_keys').select('id, webhook_url')
+            .eq('id', req.params.id).eq('business_id', req.businessId).is('revoked_at', null).maybeSingle();
+        if (error) throw error;
+        if (!key?.webhook_url) throw httpError(400, 'no_webhook', 'Save a webhook address first.');
+        const { data, error: insError } = await db.from('webhook_deliveries').insert({
+            business_id: req.businessId, api_key_id: key.id, kind: 'ping',
+            payload: { type: 'ping', created_at: new Date(now()).toISOString(), data: { message: 'HeySasa webhook test' } },
+        }).select('id, status, created_at').single();
+        if (insError) throw insError;
+        res.status(202);
+        return { delivery: data };
     }));
 
     router.put('/integrations/event-templates/:type', admin, wrap(async (req) => {

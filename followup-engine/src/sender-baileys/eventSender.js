@@ -40,6 +40,22 @@ export const eventLaneKey = (row) => row.account_id ? `acct:${row.account_id}` :
 
 export function resetEventSenderState() { lastSweepAt = 0 }
 
+// A message the caller timed for later (Messages API send_at) is "late" from that time, not from when it was received.
+export function eventAgeBase(row) {
+  const requested = Date.parse(row.payload?.requested_at ?? '')
+  const created = Date.parse(row.created_at)
+  return Number.isFinite(requested) ? Math.max(requested, created) : created
+}
+
+// What goes to Evolution: plain text, or a picture / video / document with the words as its caption.
+export function eventContent(row) {
+  if (!row.media?.url) return { text: row.message }
+  const media = { type: row.media.type, url: row.media.url, caption: row.message || row.media.caption || '' }
+  if (row.media.file_name) media.file_name = row.media.file_name
+  if (row.media.mime_type) media.mime_type = row.media.mime_type
+  return { text: row.message, media }
+}
+
 export async function processEventBatch(deps = {}) {
   const s = deps.supabase ?? defaultSupabase
   const send = deps.send ?? sendContentViaEvolution
@@ -81,7 +97,7 @@ export async function processEventBatch(deps = {}) {
 
   // 'next' = look at the following row of this number; 'stop' = this number is done for this pass.
   async function processRow(row) {
-    if (clock() - Date.parse(row.created_at) > MAX_AGE_MS) { await finish(row, 'failed', 'expired'); return 'next' }
+    if (clock() - eventAgeBase(row) > MAX_AGE_MS) { await finish(row, 'failed', 'expired'); return 'next' }
 
     const contact = row.contact_id ? await loadContact(s, row.contact_id) : null
     if (!contact || String(contact.business_id) !== String(row.business_id)) { await finish(row, 'failed', 'contact_not_found'); return 'next' }
@@ -134,7 +150,7 @@ export async function processEventBatch(deps = {}) {
     if (!claimed) return 'next'   // cancelled by a purchase, or taken by another pass
 
     reserveSend(key)
-    const sent = await send(instance, target.number, { text: row.message }, contact.country_code)
+    const sent = await send(instance, target.number, eventContent(row), contact.country_code)
     const attempts = (row.attempts ?? 0) + 1
 
     if (!sent?.ok) {
@@ -165,7 +181,11 @@ export async function processEventBatch(deps = {}) {
         ? s.from('messages').upsert({
             business_id: row.business_id, ...withAccount, conversation_id: row.conversation_id, contact_id: row.contact_id,
             whatsapp_message_id: sent.messageId, direction: 'out', role: 'ai', agent_role: 'events_api',
-            type: 'text', content: { text: row.message, type: 'text', event_type: row.event_type }, status: 'sent', created_at: sentAt,
+            type: row.media?.type ?? 'text',
+            content: row.media
+              ? { text: row.message, type: row.media.type, media_url: row.media.url, event_type: row.event_type }
+              : { text: row.message, type: 'text', event_type: row.event_type },
+            status: 'sent', created_at: sentAt,
           }, { onConflict: 'whatsapp_message_id', ignoreDuplicates: false })
         : Promise.resolve({ error: null }),
       bill(s, row.business_id, { reason: `event_${row.event_type}`, runner: 'event_send', accountId: row.account_id ?? null }),

@@ -212,3 +212,97 @@ test('GET /v1/events/:id only shows the key\'s own business', async () => {
         assert.equal((await t.call(`/v1/events/${made.json.id}`)).status, 404);
     } finally { t.close(); }
 });
+
+// ── Messages API (the caller writes the message) ─────────────────────────────────────────────────────
+import { parseMessageBody, publicMessage, signWebhook } from './messages.js';
+
+test('parseMessageBody: text, image with caption, video, and the plain errors', () => {
+    const now = Date.parse('2026-11-09T09:00:00Z');
+    const t = parseMessageBody({ phone: '0712345678', text: ' Hi there ' }, now);
+    assert.equal(t.phone, '254712345678');
+    assert.equal(t.message, 'Hi there');
+    assert.equal(t.media, null);
+    const img = parseMessageBody({ phone: '+254712345678', media: { type: 'image', url: 'https://cdn.example/a.jpg', caption: 'Look' } }, now);
+    assert.equal(img.message, 'Look');
+    assert.deepEqual(img.media, { type: 'image', url: 'https://cdn.example/a.jpg', caption: 'Look' });
+    const vid = parseMessageBody({ phone: '254712345678', text: 'Watch this', media: { type: 'VIDEO', url: 'https://cdn.example/v.mp4' } }, now);
+    assert.equal(vid.media.type, 'video');
+    assert.equal(vid.message, 'Watch this');
+    const later = parseMessageBody({ phone: '0712345678', text: 'x', send_at: '2026-11-10T09:00:00+03:00' }, now);
+    assert.equal(later.sendAt, '2026-11-10T06:00:00.000Z');
+    const past = parseMessageBody({ phone: '0712345678', text: 'x', send_at: '2026-01-01T00:00:00Z' }, now);
+    assert.equal(past.sendAt, new Date(now).toISOString());
+    const codeOf = (body) => { try { parseMessageBody(body, now); return null; } catch (e) { return e.code; } };
+    assert.equal(codeOf({ phone: '0712345678' }), 'empty_message');
+    assert.equal(codeOf({ text: 'hi' }), 'invalid_phone');
+    assert.equal(codeOf({ phone: '0712345678', media: { type: 'image', url: 'http://insecure/a.jpg' } }), 'invalid_media');
+    assert.equal(codeOf({ phone: '0712345678', media: { type: 'sticker', url: 'https://a/b' } }), 'invalid_media');
+    assert.equal(codeOf({ phone: '0712345678', text: 'x', send_at: '2026-12-30T00:00:00Z' }), 'invalid_send_at');
+    assert.equal(codeOf({ phone: '0712345678', text: 'x', metadata: [1] }), 'invalid_metadata');
+});
+
+test('POST /v1/messages schedules the caller\'s own message with media and metadata; same external_id twice is one', async () => {
+    const t = await setup();
+    try {
+        const body = { phone: '0712345678', name: 'Amina', text: 'Day 2: see how we do classic sets', media: { type: 'video', url: 'https://cdn.example/day2.mp4' }, external_id: 'enr1:step2', metadata: { enrollment_id: 'enr1', step: 2 } };
+        const a = await t.call('/v1/messages', { method: 'POST', body });
+        assert.equal(a.status, 202);
+        assert.equal(a.json.status, 'scheduled');
+        assert.equal(a.json.phone, '+254712345678');
+        assert.deepEqual(a.json.metadata, { enrollment_id: 'enr1', step: 2 });
+        const row = t.state.business_events[0];
+        assert.equal(row.event_type, 'message');
+        assert.equal(row.api_key_id, 'k1');
+        assert.equal(row.account_id, 'a1');
+        assert.equal(row.message, 'Day 2: see how we do classic sets');
+        assert.deepEqual(row.media, { type: 'video', url: 'https://cdn.example/day2.mp4' });
+        const b = await t.call('/v1/messages', { method: 'POST', body });
+        assert.equal(b.status, 200);
+        assert.equal(b.json.duplicate, true);
+        assert.equal(t.state.business_events.length, 1);
+        const got = await t.call('/v1/messages/enr1:step2');
+        assert.equal(got.json.id, a.json.id);
+        const cancelled = await t.call(`/v1/messages/${a.json.id}`, { method: 'DELETE' });
+        assert.equal(cancelled.json.status, 'cancelled');
+        const again = await t.call(`/v1/messages/${a.json.id}`, { method: 'DELETE' });
+        assert.equal(again.status, 409);
+    } finally { t.close(); }
+});
+
+test('POST /v1/messages refuses someone who wrote STOP', async () => {
+    const t = await setup();
+    t.state.contacts = [{ id: 42, do_not_contact: true }];
+    try {
+        const res = await t.call('/v1/messages', { method: 'POST', body: { phone: '0712345678', text: 'Hi' } });
+        assert.equal(res.status, 409);
+        assert.equal(res.json.error, 'opted_out');
+        assert.equal(t.state.business_events.length, 0);
+    } finally { t.close(); }
+});
+
+test('webhook settings: https only, the secret is made once and shown only then', async () => {
+    const t = await setup();
+    try {
+        const bad = await t.call('/integrations/api-keys/00000000-0000-4000-8000-000000000001/webhook', { method: 'PUT', body: { url: 'https://x' } });
+        assert.equal(bad.status, 404);
+        t.state.api_keys[0].id = '00000000-0000-4000-8000-0000000000aa';
+        const path = '/integrations/api-keys/00000000-0000-4000-8000-0000000000aa/webhook';
+        assert.equal((await t.call(path, { method: 'PUT', body: { url: 'http://insecure.example/hook' } })).status, 400);
+        const first = await t.call(path, { method: 'PUT', body: { url: 'https://lashtribe.example/functions/v1/heysasa-webhook' } });
+        assert.match(first.json.secret, /^whsec_/);
+        const second = await t.call(path, { method: 'PUT', body: { url: 'https://lashtribe.example/functions/v1/heysasa-webhook' } });
+        assert.equal(second.json.secret, null);
+        assert.equal(t.state.api_keys[0].webhook_secret, first.json.secret);
+        const ping = await t.call('/integrations/api-keys/00000000-0000-4000-8000-0000000000aa/webhook-test', { method: 'POST' });
+        assert.equal(ping.status, 202);
+        assert.equal(t.state.webhook_deliveries[0].kind, 'ping');
+    } finally { t.close(); }
+});
+
+test('signWebhook and publicMessage', () => {
+    assert.equal(signWebhook('whsec_x', 1700000000, '{"a":1}'), signWebhook('whsec_x', 1700000000, '{"a":1}'));
+    assert.notEqual(signWebhook('whsec_x', 1700000000, '{"a":1}'), signWebhook('whsec_y', 1700000000, '{"a":1}'));
+    const p = publicMessage({ id: 'm', phone: '254712345678', status: 'failed', last_error: 'number_not_on_whatsapp', payload: { metadata: { s: 1 } } });
+    assert.equal(p.error, 'number_not_on_whatsapp');
+    assert.deepEqual(p.metadata, { s: 1 });
+});

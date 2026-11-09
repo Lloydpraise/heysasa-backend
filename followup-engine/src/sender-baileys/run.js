@@ -1,6 +1,7 @@
 import { processBaileysBatch, recoverStaleClaims } from './worker.js'
 import { processChatAiOutbox } from './chatAiOutbox.js'
 import { processEventBatch } from './eventSender.js'
+import { processWebhookBatch } from './webhookDispatcher.js'
 import { log } from '../lib/log.js'
 import { supabase } from '../supabaseClient.js'
 import { isAnalysisActive, onAnalysisFinished, deferUntilAnalysisEnds } from '../lib/analysisGate.js'
@@ -108,6 +109,7 @@ setInterval(() => {
     try { await recoverStaleClaims() } catch { /* logged inside */ }
     void wakeSender()
     void wakeEventSender()
+    void wakeWebhooks()
   })()
 }, HEARTBEAT_MS).unref()
 
@@ -159,6 +161,56 @@ const eventChannel = supabase
       log('info', 'sender', 'events.realtime_connected', 'Website event sender listening for new events')
     } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
       log('error', 'sender', 'events.realtime_disconnected', `Website event notifications unavailable: ${status}`, { details: { error: error?.message ?? null } })
+    }
+  })
+
+// Messages API callbacks (webhook_deliveries, see webhookDispatcher.js): realtime INSERT + one timer for the next retry.
+let hookDrain
+let hookWakePending = false
+let hookTimer = null
+let hookTimerAt = 0
+function scheduleHookWake(at) {
+  if (!Number.isFinite(at)) return
+  if (hookTimer && at >= hookTimerAt) return
+  clearTimeout(hookTimer)
+  hookTimerAt = at
+  hookTimer = setTimeout(() => {
+    hookTimer = null
+    hookTimerAt = 0
+    void wakeWebhooks()
+  }, Math.max(0, at - Date.now()))
+}
+function wakeWebhooks() {
+  hookWakePending = true
+  if (hookDrain) return hookDrain
+  hookDrain = (async () => {
+    try {
+      let result
+      do {
+        hookWakePending = false
+        result = await processWebhookBatch()
+      } while (hookWakePending)
+      if (result?.wakeAt) scheduleHookWake(result.wakeAt)
+    } catch (e) {
+      log('error', 'sender', 'webhooks.tick_error', `Webhook dispatcher failed: ${e.message}`, { details: { error: { name: e.name, message: e.message } } })
+      scheduleHookWake(Date.now() + RETRY_WHEN_BLOCKED_MS)
+    } finally {
+      hookDrain = null
+      if (hookWakePending) void wakeWebhooks()
+    }
+  })()
+  return hookDrain
+}
+
+const hookChannel = supabase
+  .channel('webhook-dispatcher')
+  .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'webhook_deliveries' }, () => { void wakeWebhooks() })
+  .subscribe((status, error) => {
+    if (status === 'SUBSCRIBED') {
+      void wakeWebhooks()
+      log('info', 'sender', 'webhooks.realtime_connected', 'Webhook dispatcher listening for new callbacks')
+    } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
+      log('error', 'sender', 'webhooks.realtime_disconnected', `Webhook notifications unavailable: ${status}`, { details: { error: error?.message ?? null } })
     }
   })
 
