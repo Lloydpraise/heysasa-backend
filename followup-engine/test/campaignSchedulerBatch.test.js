@@ -149,3 +149,19 @@ test('an account that is disconnected or suspended (access fee unpaid) queues no
   assert.equal((await runCampaignScheduler(fakeDb(t2), { seed: false })).queued, 0)
   assert.equal(t2.campaigns[0].status, 'active', 'nothing pauses or fails the campaign')
 })
+
+test('due enrollments of a paused campaign do not starve an active one', async () => {
+  const tables = scenario({ contacts: 0 })
+  tables.campaigns.push({ id: 'paused', business_id: 'biz', status: 'paused', whatsapp_instance_name: 'inst' })
+  for (let i = 1; i <= 600; i++) {
+    tables.contacts.push({ id: i, business_id: 'biz', name: `P${i}`, phone: `+2547100${i}`, wa_exists: true, lead_type: 'business' })
+    tables.campaign_enrollments.push({ id: `p${i}`, campaign_id: 'paused', lead_id: i, current_step: 0, status: 'active', next_send_at: '2000-01-01T00:00:00Z' })
+  }
+  for (let i = 601; i <= 614; i++) {
+    tables.contacts.push({ id: i, business_id: 'biz', name: `A${i}`, phone: `+2547200${i}`, wa_exists: true, lead_type: 'business' })
+    tables.campaign_enrollments.push({ id: `a${i}`, campaign_id: 'camp', lead_id: i, current_step: 0, status: 'active', next_send_at: '2000-01-01T00:00:00Z' })
+  }
+  const result = await runCampaignScheduler(fakeDb(tables), { seed: false })
+  assert.equal(result.queued, 14)
+  assert.ok(tables.follow_up_queue.every(r => r.campaign_id === 'camp'))
+})

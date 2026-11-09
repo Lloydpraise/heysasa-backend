@@ -257,19 +257,28 @@ export async function runCampaignScheduler(supabase, { seed = true } = {}) {
   // Not one unordered query: with hundreds of enrollments already waiting in the queue (active, nothing new to do for
   // them), a plain limit kept returning the same ones and new or due-for-step-2 enrollments starved. New (pending) ones
   // go first, then active ones whose next step is due, then active ones with no time set; each page is ordered by id.
+  // Only enrollments of active campaigns: a paused campaign's enrollments stay "due" forever, and when they sort first
+  // by id they filled the whole batch every cycle, so a new campaign's enrollments never got a turn (Pilates, Nov 2026:
+  // 1,714 due rows of two paused campaigns ahead of it, its first row at position 596 of a 500 batch).
   const dueCols = 'id, campaign_id, lead_id, current_step, status, step_order, schedule_reason'
   const due = []
   let error = null
+  const { data: activeRows, error: activeError } = await supabase.from('campaigns').select('id').eq('status', 'active')
+  if (activeError) error = activeError
+  const activeIds = (activeRows ?? []).map(r => r.id)
   const pages = [
-    () => supabase.from('campaign_enrollments').select(dueCols).eq('status', 'pending').or(`next_send_at.is.null,next_send_at.lte.${now}`),
-    () => supabase.from('campaign_enrollments').select(dueCols).eq('status', 'active').lte('next_send_at', now),
-    () => supabase.from('campaign_enrollments').select(dueCols).eq('status', 'active').is('next_send_at', null),
+    (ids) => supabase.from('campaign_enrollments').select(dueCols).in('campaign_id', ids).eq('status', 'pending').or(`next_send_at.is.null,next_send_at.lte.${now}`),
+    (ids) => supabase.from('campaign_enrollments').select(dueCols).in('campaign_id', ids).eq('status', 'active').lte('next_send_at', now),
+    (ids) => supabase.from('campaign_enrollments').select(dueCols).in('campaign_id', ids).eq('status', 'active').is('next_send_at', null),
   ]
-  for (const page of pages) {
-    if (due.length >= BATCH_SIZE) break
-    const res = await page().order('id', { ascending: true }).limit(BATCH_SIZE - due.length)
-    if (res.error) { error = res.error; break }
-    due.push(...(res.data ?? []))
+  outer:
+  for (const page of error ? [] : pages) {
+    for (const ids of chunked(activeIds, IN_CHUNK)) {
+      if (due.length >= BATCH_SIZE) break outer
+      const res = await page(ids).order('id', { ascending: true }).limit(BATCH_SIZE - due.length)
+      if (res.error) { error = res.error; break outer }
+      due.push(...(res.data ?? []))
+    }
   }
 
   if (error) {
