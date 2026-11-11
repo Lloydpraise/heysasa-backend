@@ -3,7 +3,7 @@ import { getBusinessForAccount, getContact, getConversation } from '../lib/db.js
 import { loadAccounts, accountCanOperate, laneKey } from '../lib/accounts.js'
 import { sendContentViaEvolution } from './evolutionSender.js'
 import { resolveSendTarget } from '../lib/sendTarget.js'
-import { checkAntiban, recordSend, recordFailedAttempt, primeAntiban } from './antiban.js'
+import { checkAntiban, recordSend, recordFailedAttempt, primeAntiban, reserveSend } from './antiban.js'
 import { effectiveDailyCap, sentTodayCount, noteSent, logWarmupHold } from '../lib/warmup.js'
 import { recordSuccessfulSend, recordFailedDispatch } from './postSend.js'
 import { ensureNumberOnWhatsApp, needsNumberLookup } from '../lib/numberCheck.js'
@@ -337,6 +337,7 @@ async function processItem(item, { business, lane, ctx, lookupWaitCampaigns }) {
   }
   if (!claimedItem) return 'skipped'
 
+  reserveSend(lane.key)   // website events share this number's gap (see eventSender.js)
   const sendStartedAt = Date.now()
   const result = await sendContentViaEvolution(activeSession.instance_name, target.number, {
     text: item.final_message,

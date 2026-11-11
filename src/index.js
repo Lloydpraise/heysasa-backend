@@ -53,6 +53,8 @@ import { requireBusinessAuth } from './middleware/businessAuth.js';
 import { requireScope, requireBusinessAdmin, scopeOrRespond, forAccount } from './middleware/accessScope.js';
 import { scopeOrDebug } from './utils/requestScope.js';
 import { createAccountsRouter } from './accounts/routes.js';
+import { createEventsRouter } from './events/routes.js';
+import { getOrCreateContact, getOrCreateConversation } from './services/dbService.js';
 import * as accountsService from './services/accounts.js';
 import { evolutionRequest } from './services/evolutionConnections.js';
 
@@ -640,6 +642,16 @@ app.use(createAccountsRouter({
     accounts: accountsService,
     appUrl: process.env.APP_URL || '',
     log: (level, event, details = {}) => logEvent({ level, area: 'accounts', event, message: event, business_id: details.businessId ?? null, entity_id: details.accountId ?? null, details }),
+}));
+// Events API: client websites send events (abandoned cart, paid order) and HeySasa sends the WhatsApp message.
+// /v1/* uses the website's API key; /integrations/* is the dashboard's Website card. See EVENTS_API.md.
+app.use(createEventsRouter({
+    db: supabase,
+    scope: requireScope,
+    admin: requireBusinessAdmin,
+    contacts: { getOrCreateContact, getOrCreateConversation },
+    apiBaseUrl: process.env.PUBLIC_API_URL || 'https://api.heysasa.co.ke',
+    log: (level, event, details = {}) => logEvent({ level, area: 'events', event, message: event, business_id: details.businessId ?? null, entity_id: details.eventId ?? details.keyId ?? null, details }),
 }));
 // WhatsApp (Evolution) calls from the dashboard. The Evolution key stays on the server; owners only reach their own instances.
 app.use('/wa', createWhatsAppProxyRouter({

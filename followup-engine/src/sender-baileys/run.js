@@ -1,5 +1,7 @@
 import { processBaileysBatch, recoverStaleClaims } from './worker.js'
 import { processChatAiOutbox } from './chatAiOutbox.js'
+import { processEventBatch } from './eventSender.js'
+import { processWebhookBatch } from './webhookDispatcher.js'
 import { log } from '../lib/log.js'
 import { supabase } from '../supabaseClient.js'
 import { isAnalysisActive, onAnalysisFinished, deferUntilAnalysisEnds } from '../lib/analysisGate.js'
@@ -106,8 +108,111 @@ setInterval(() => {
   void (async () => {
     try { await recoverStaleClaims() } catch { /* logged inside */ }
     void wakeSender()
+    void wakeEventSender()
+    void wakeWebhooks()
   })()
 }, HEARTBEAT_MS).unref()
+
+// Website events (business_events, see eventSender.js). Woken by a realtime INSERT and by one timer for the moment the
+// next thing becomes possible (antiban gap over, the next delayed event), never by polling.
+let eventDrain
+let eventWakePending = false
+let eventTimer = null
+let eventTimerAt = 0
+function scheduleEventWake(at) {
+  if (!Number.isFinite(at)) return
+  if (eventTimer && at >= eventTimerAt) return
+  clearTimeout(eventTimer)
+  eventTimerAt = at
+  eventTimer = setTimeout(() => {
+    eventTimer = null
+    eventTimerAt = 0
+    void wakeEventSender()
+  }, Math.max(0, at - Date.now()))
+}
+function wakeEventSender() {
+  eventWakePending = true
+  if (eventDrain) return eventDrain
+  eventDrain = (async () => {
+    try {
+      let result
+      do {
+        eventWakePending = false
+        result = await processEventBatch()
+      } while (eventWakePending)
+      if (result?.wakeAt) scheduleEventWake(result.wakeAt)
+    } catch (e) {
+      log('error', 'sender', 'events.tick_error', `Website event sender failed: ${e.message}`, { details: { error: { name: e.name, message: e.message } } })
+      scheduleEventWake(Date.now() + RETRY_WHEN_BLOCKED_MS)
+    } finally {
+      eventDrain = null
+      if (eventWakePending) void wakeEventSender()
+    }
+  })()
+  return eventDrain
+}
+
+const eventChannel = supabase
+  .channel('website-event-sender')
+  .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'business_events' }, () => { void wakeEventSender() })
+  .subscribe((status, error) => {
+    if (status === 'SUBSCRIBED') {
+      void wakeEventSender()
+      log('info', 'sender', 'events.realtime_connected', 'Website event sender listening for new events')
+    } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
+      log('error', 'sender', 'events.realtime_disconnected', `Website event notifications unavailable: ${status}`, { details: { error: error?.message ?? null } })
+    }
+  })
+
+// Messages API callbacks (webhook_deliveries, see webhookDispatcher.js): realtime INSERT + one timer for the next retry.
+let hookDrain
+let hookWakePending = false
+let hookTimer = null
+let hookTimerAt = 0
+function scheduleHookWake(at) {
+  if (!Number.isFinite(at)) return
+  if (hookTimer && at >= hookTimerAt) return
+  clearTimeout(hookTimer)
+  hookTimerAt = at
+  hookTimer = setTimeout(() => {
+    hookTimer = null
+    hookTimerAt = 0
+    void wakeWebhooks()
+  }, Math.max(0, at - Date.now()))
+}
+function wakeWebhooks() {
+  hookWakePending = true
+  if (hookDrain) return hookDrain
+  hookDrain = (async () => {
+    try {
+      let result
+      do {
+        hookWakePending = false
+        result = await processWebhookBatch()
+      } while (hookWakePending)
+      if (result?.wakeAt) scheduleHookWake(result.wakeAt)
+    } catch (e) {
+      log('error', 'sender', 'webhooks.tick_error', `Webhook dispatcher failed: ${e.message}`, { details: { error: { name: e.name, message: e.message } } })
+      scheduleHookWake(Date.now() + RETRY_WHEN_BLOCKED_MS)
+    } finally {
+      hookDrain = null
+      if (hookWakePending) void wakeWebhooks()
+    }
+  })()
+  return hookDrain
+}
+
+const hookChannel = supabase
+  .channel('webhook-dispatcher')
+  .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'webhook_deliveries' }, () => { void wakeWebhooks() })
+  .subscribe((status, error) => {
+    if (status === 'SUBSCRIBED') {
+      void wakeWebhooks()
+      log('info', 'sender', 'webhooks.realtime_connected', 'Webhook dispatcher listening for new callbacks')
+    } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
+      log('error', 'sender', 'webhooks.realtime_disconnected', `Webhook notifications unavailable: ${status}`, { details: { error: error?.message ?? null } })
+    }
+  })
 
 log('info', 'sender', 'sender.started', 'Follow-up sender listening for queue and eligibility changes')
 
